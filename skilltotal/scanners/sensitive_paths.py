@@ -35,8 +35,12 @@ CATEGORY = "sensitive_path"
 # Strong, path-like credential locations. These are unambiguous enough to flag in any
 # file type, including documentation.
 _STRONG_PATHS = alternation(
-    r"~/\.ssh",
-    r"\.ssh/",
+    # ~/.ssh but NOT `~/.ssh/known_hosts` (public host keys, never a credential — pyzmq reads it
+    # for its SSH tunnel). `~/.ssh/config` DOES stay flagged: writing it is a real SSH-config
+    # injection vector; a legitimate reader (dulwich's git-over-ssh) is cleared by the provider
+    # credential-domain match in scoring, not by dropping detection. Private keys still match.
+    r"~/\.ssh(?!/known_hosts\b)",
+    r"\.ssh/(?!known_hosts\b)",
     r"~/\.aws",
     r"\.aws/credentials",
     r"~/\.kube",
@@ -77,6 +81,124 @@ def _suppresses_env(relpath: str) -> bool:
     return suffix in _DOC_SUFFIXES
 
 
+# A guardrail/denylist that PROTECTS a credential location is the opposite of accessing it: a
+# security tool's policy listing `id_rsa`/`.ssh` as paths to deny is a defensive artifact, not an
+# exfiltration precursor. Such matches are routed to needs_review so they neither score nor feed
+# the credential-exfiltration combo. Real access (a path passed to open()/readFileSync()) is a
+# function argument — not a guard segment, keyword, or bare list element — so it still fires.
+_GUARD_PATH_SEGMENTS = frozenset(
+    {
+        "policy",
+        "policies",
+        "guard",
+        "guards",
+        "denylist",
+        "allowlist",
+        "blocklist",
+        "blocklists",
+        "sandbox",
+        "permission",
+        "permissions",
+        "security",
+        "acl",
+    }
+)
+_GUARD_KEYWORDS = re.compile(
+    r"(?i)\b(?:deny|denied|denylist|block|blocked|blocklist|forbid|forbidden|exclude|excluded|"
+    r"reject|protect|protected|sensitive|redact|sanitize|allowlist)\b"
+)
+# A bare string-literal list element: only a quoted string + optional `.to_string()`/`.into()`
+# and a trailing comma (e.g. `"id_rsa".to_string(),`, `"**/.ssh/*",`). Declarative data, not a call.
+_BARE_LIST_ELEMENT = re.compile(r"""^\s*["'][^"']*["']\s*(?:\.\w+\(\))?\s*,?\s*$""")
+# A bare regex-literal list element: a slash-delimited regex (optional flags) on its own line,
+# e.g. `/id_rsa/,`, `/credentials/i,`, `/\.pem$/,`. A regex literal is a PATTERN that matches
+# against paths, never a path being accessed — so a credential token inside one is a detector's
+# denylist entry (as in a `SENSITIVE_PATHS = [ /id_rsa/, ... ]` array), not exfiltration.
+_BARE_REGEX_ELEMENT = re.compile(r"^\s*/(?:[^/\\\n]|\\.)+/[gimsuvy]*\s*,?\s*$")
+
+
+def _guard_segment(relpath: str) -> bool:
+    # Tokenize each path segment on `._-` so guard code is recognized whether it's a directory
+    # (policies/) or a filename (net_guard.rs, path_guard.rs, denylist.go).
+    for part in relpath.lower().split("/"):
+        if any(tok in _GUARD_PATH_SEGMENTS for tok in re.split(r"[._-]", part)):
+            return True
+    return False
+
+
+def _is_guardlist_context(relpath: str, line_text: str) -> bool:
+    """True if a sensitive-path match is a defensive denylist/guardrail mention, not access."""
+    return (
+        _guard_segment(relpath)
+        or bool(_GUARD_KEYWORDS.search(line_text))
+        or bool(_BARE_LIST_ELEMENT.match(line_text))
+        or bool(_BARE_REGEX_ELEMENT.match(line_text))
+    )
+
+
+# Markdown files where an inline-code span (`...`) is a *cited example*, not path access. A security
+# guide that lists `write to ~/.ssh` / `store credentials` as patterns to detect is describing the
+# threat, not performing it. Scoped to markdown ONLY — in code, a backtick is a JS template literal
+# (`~/.ssh/${x}`) which IS real path usage, so it must still fire there.
+_MD_SUFFIXES = frozenset({".md", ".mdx", ".markdown"})
+
+
+def _cited_in_markdown_code(relpath: str, line_text: str, matched: str) -> bool:
+    """True if ``matched`` falls inside a markdown inline-code span on this line. Splitting on the
+    backtick delimiter, odd-indexed segments are inside `` `...` `` spans."""
+    name = relpath.lower().rsplit("/", 1)[-1]
+    dot = name.rfind(".")
+    if (name[dot:] if dot > 0 else "") not in _MD_SUFFIXES:
+        return False
+    segments = line_text.split("`")
+    return any(matched in segments[i] for i in range(1, len(segments), 2))
+
+
+# A dotenv file that ships INSIDE a released package. `.env` is where a project keeps its
+# environment secrets, so in a working tree it is normal and gitignored — but a published
+# artifact has no reason to carry one, and it gets there the same way the MCP publisher's
+# tokens do: the packer captured the project root. Documentation variants are excluded;
+# `.env.example` exists in order to be shipped.
+_ENV_FILE_RE = re.compile(r"^\.env(\.[A-Za-z0-9_-]+)?$")
+_ENV_TEMPLATE_RE = re.compile(
+    r"^\.env\.(example|sample|template|dist|defaults?|tpl|schema)$", re.IGNORECASE
+)
+_ENV_ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+# Below this the file holds nothing worth calling a shipped configuration.
+_MIN_ENV_BYTES = 8
+_ENV_KEYS_SHOWN = 8
+
+
+def _env_evidence(f) -> Evidence | None:
+    """Evidence for a shipped dotenv: the variable NAMES, never their values.
+
+    The values are the entire reason this is a finding, so putting them in the snippet would make
+    the report the leak. The names alone are what a reader needs — they say which credentials to
+    go and rotate.
+    """
+    assignments: list[str] = []
+    first_line = 1
+    for n, raw in enumerate(f.text.splitlines(), start=1):
+        m = _ENV_ASSIGNMENT_RE.match(raw)
+        if not m or not m.group(2).strip():
+            continue
+        if not assignments:
+            first_line = n
+        assignments.append(m.group(1))
+    if not assignments:
+        return None
+    shown = ", ".join(f"{k}=…" for k in assignments[:_ENV_KEYS_SHOWN])
+    more = len(assignments) - _ENV_KEYS_SHOWN
+    if more > 0:
+        shown += f", and {more} more"
+    return Evidence(
+        file=f.relpath,
+        line_start=first_line,
+        line_end=first_line,
+        snippet=f"{len(assignments)} variable(s), values withheld: {shown}",
+    )
+
+
 _WEAK = re.compile(r"\b(?:credentials|secrets)\b", re.IGNORECASE)
 _SENS_WORD_EXAMPLES = 8
 
@@ -105,6 +227,24 @@ class SensitivePathScanner(Scanner):
             code_context="strings_and_comments",
             pattern=_STRONG_PATHS,
         ),
+        RuleSpec(
+            id="ST-ENV-SHIPPED",
+            category=CATEGORY,
+            severity=Severity.HIGH,
+            title="Environment file shipped in the released package",
+            description=(
+                "The published artifact contains a .env file. That is where a project keeps its "
+                "environment secrets; it reaches a release when the packer captures the project "
+                "root, the same way publisher credentials do."
+            ),
+            recommendation=(
+                "Treat every value in it as exposed and rotate it, then exclude the file from the "
+                "release (a `files` allowlist or .npmignore for npm, MANIFEST.in for a Python "
+                "sdist — .gitignore alone excludes it from neither)."
+            ),
+            capability=None,
+            threat_class=ThreatClass.RISKY_CONSTRUCT,
+        ),
         # Listed for `rules list`; bare secret words are routed to needs_review.
         RuleSpec(
             id="ST-SENS-WORD",
@@ -127,13 +267,61 @@ class SensitivePathScanner(Scanner):
         # web app as a credential-exfiltration path. It is surfaced for review instead.
         seen_ev: set[tuple[str, int, int]] = set()
         evidence: list[Evidence] = []
-        for _f, _m, ev in index.search(_STRONG_PATHS):
+        guard_files: list[str] = []
+        cited_files: list[str] = []
+        for f, _m, ev in index.search(_STRONG_PATHS):
             key = (ev.file, ev.line_start, ev.line_end)
-            if key not in seen_ev:
-                seen_ev.add(key)
-                evidence.append(ev)
+            if key in seen_ev:
+                continue
+            seen_ev.add(key)
+            line_text = f.line_text(ev.line_start)
+            if _is_guardlist_context(ev.file, line_text):
+                if ev.file not in guard_files:
+                    guard_files.append(ev.file)
+                continue
+            if _cited_in_markdown_code(ev.file, line_text, _m.group(0)):
+                if ev.file not in cited_files:
+                    cited_files.append(ev.file)
+                continue
+            evidence.append(ev)
             if len(evidence) >= MAX_EVIDENCE_PER_FINDING:
                 break
+
+        if guard_files:
+            shown = ", ".join(guard_files[:_SENS_WORD_EXAMPLES])
+            more = len(guard_files) - _SENS_WORD_EXAMPLES
+            if more > 0:
+                shown += f", and {more} more"
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Credential path in a denylist/guardrail ({len(guard_files)})",
+                    reason=(
+                        f"A credential location is referenced in a denylist/guardrail context "
+                        f"in {len(guard_files)} file(s) (a policy that PROTECTS the path, not "
+                        f"access to it); flagged for review, not scored: {shown}."
+                    ),
+                    file=guard_files[0],
+                )
+            )
+
+        if cited_files:
+            shown = ", ".join(cited_files[:_SENS_WORD_EXAMPLES])
+            more = len(cited_files) - _SENS_WORD_EXAMPLES
+            if more > 0:
+                shown += f", and {more} more"
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Credential path cited in markdown example ({len(cited_files)})",
+                    reason=(
+                        f"A credential location appears inside a markdown inline-code example in "
+                        f"{len(cited_files)} file(s) (a security doc describing the path, not "
+                        f"accessing it); flagged for review, not scored: {shown}."
+                    ),
+                    file=cited_files[0],
+                )
+            )
 
         env_files: list[str] = []
         env_seen: set[str] = set()
@@ -160,14 +348,23 @@ class SensitivePathScanner(Scanner):
                 )
             )
 
+        env_shipped: list[Evidence] = []
+        for f in index.files:
+            name = f.relpath.rsplit("/", 1)[-1]
+            if not _ENV_FILE_RE.match(name) or _ENV_TEMPLATE_RE.match(name):
+                continue
+            if len(f.text.strip()) < _MIN_ENV_BYTES:
+                continue
+            ev = _env_evidence(f)
+            if ev is not None:
+                env_shipped.append(ev)
+
         evidence = evidence[:MAX_EVIDENCE_PER_FINDING]
         findings: list[Finding] = []
         if evidence:
             description = strong_rule.description
             if len(evidence) > 1:
-                description = (
-                    f"{description} ({len(evidence)} occurrence(s) shown as evidence)."
-                )
+                description = f"{description} ({len(evidence)} occurrence(s) shown as evidence)."
             findings.append(
                 Finding(
                     id=strong_rule.id,
@@ -177,6 +374,21 @@ class SensitivePathScanner(Scanner):
                     description=description,
                     evidence=evidence,
                     recommendation=strong_rule.recommendation,
+                )
+            )
+
+        if env_shipped:
+            env_rule = next(r for r in self.rules if r.id == "ST-ENV-SHIPPED")
+            findings.append(
+                Finding(
+                    id=env_rule.id,
+                    severity=env_rule.severity,
+                    category=env_rule.category,
+                    title=env_rule.title,
+                    description=env_rule.description,
+                    evidence=env_shipped[:MAX_EVIDENCE_PER_FINDING],
+                    recommendation=env_rule.recommendation,
+                    threat_class=env_rule.threat_class,
                 )
             )
 

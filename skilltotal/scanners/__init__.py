@@ -17,10 +17,12 @@ from skilltotal.scanners.install_scripts import InstallScriptsScanner
 from skilltotal.scanners.invisible_unicode import InvisibleUnicodeScanner
 from skilltotal.scanners.mcp import McpScanner
 from skilltotal.scanners.network import NetworkScanner
+from skilltotal.scanners.oauth_auth import OAuthAuthScanner
 from skilltotal.scanners.obfuscation import ObfuscationScanner
 from skilltotal.scanners.prompt_surface import PromptSurfaceScanner
 from skilltotal.scanners.pth_exec import PthExecScanner
 from skilltotal.scanners.python_ast import PythonAstScanner
+from skilltotal.scanners.scoped_identity import ScopedIdentityScanner
 from skilltotal.scanners.secrets import SecretsScanner
 from skilltotal.scanners.sensitive_paths import SensitivePathScanner
 from skilltotal.scanners.shell_evasion import ShellEvasionScanner
@@ -35,6 +37,8 @@ SCANNERS: list[Scanner] = [
     FilesystemScanner(),
     SensitivePathScanner(),
     NetworkScanner(),
+    OAuthAuthScanner(),
+    ScopedIdentityScanner(),
     InstallScriptsScanner(),
     DynamicCodeScanner(),
     ObfuscationScanner(),

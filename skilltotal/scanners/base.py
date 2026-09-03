@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 from skilltotal.file_index import FileIndex, IndexedFile
 from skilltotal.models import Capability, Evidence, Finding, NeedsReview, Severity, ThreatClass
-from skilltotal.text_normalize import normalize_with_map, original_span
+from skilltotal.text_normalize import original_span
 
 # Cap evidence kept per finding so a noisy file cannot bloat the report.
 MAX_EVIDENCE_PER_FINDING = 25
@@ -36,9 +36,10 @@ def deobfuscated_spans(
     and builds evidence via ``file.evidence_for_span``.
     """
     for f in index.select():
-        norm, idx = normalize_with_map(f.text)
-        if not norm or norm == f.text:
+        folded = f.normalized_or_none()  # cached; None = identity (incl. pure-ASCII fast path)
+        if folded is None:
             continue
+        norm, idx = folded
         for m in pattern.finditer(norm):
             start, end = original_span(idx, m.start(), m.end())
             yield f, start, end
@@ -66,7 +67,14 @@ class RuleSpec:
     #   "comments"             - demote matches inside Python comments only (real positives are
     #                            value-strings, e.g. ST-EXPOSE-* `host="0.0.0.0"`).
     #   "strings_and_comments" - demote matches inside Python string literals OR comments (real
-    #                            positives are never a plain .py value-string).
+    #                            positives are never a plain .py value-string). C-family string
+    #                            literals are NOT demoted (a credential path in a JS string is
+    #                            real access); only C-family comments are.
+    #   "strings_and_comments_all" - as above, PLUS demote matches inside C-family (.go/.js/.ts/.rs/
+    #                            …) string literals. Used by ST-PROMPT-INJECTION: an injection
+    #                            phrase held in a value-string (e.g. a security tool's own pattern
+    #                            definition ``Description: "ignore previous instructions"``) is data
+    #                            describing an attack, not a live directive.
     code_context: str = "any"
 
     def to_dict(self) -> dict[str, str]:

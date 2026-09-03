@@ -17,6 +17,19 @@ _spec.loader.exec_module(dm)
 # --- normalize_entry -------------------------------------------------------------------------
 
 
+def test_hygiene_rejects_traversal_shaped_identifiers():
+    """`.` and `/` are legal in scoped npm names, so the pattern alone let `..` through.
+
+    Not exploitable (collector.npm_package_spec refuses traversal, so the candidate never
+    resolves), but this gate advertises that it stops local paths, and no real npm/PyPI/GitHub
+    name contains `..`.
+    """
+    for bad in ("npm:../../etc/passwd", "pypi:../x", "https://github.com/o/../../etc"):
+        assert not dm.hygiene_ok(dm.Candidate(bad, "npm", "mcp", "x")), bad
+    for good in ("npm:@scope/pkg-mcp", "pypi:mcp-srv", "https://github.com/owner/repo"):
+        assert dm.hygiene_ok(dm.Candidate(good, "npm", "mcp", "x")), good
+
+
 def test_normalize_prefers_npm_package():
     item = {
         "server": {
@@ -220,3 +233,9 @@ def test_main_exit_zero_on_fetch_failure(tmp_path, monkeypatch):
     rc = dm.main(["--manifest", str(p)])
     assert rc == 0
     assert dm.count_rows(p) == 1  # nothing added, no crash
+
+
+def test_default_manifest_does_not_depend_on_cwd(tmp_path, monkeypatch):
+    """Same regression as corpus_report: the scheduled run executes from an arbitrary CWD."""
+    monkeypatch.chdir(tmp_path)
+    assert Path(dm.MANIFEST_DEFAULT).is_file()

@@ -15,8 +15,11 @@ painted as an exfiltration path.
 
 from __future__ import annotations
 
+import re
+
 from skilltotal.models import (
     Capability,
+    Component,
     Evidence,
     Finding,
     RiskLevel,
@@ -25,6 +28,16 @@ from skilltotal.models import (
 )
 
 SCORE_CAP = 100
+
+# Cloud instance-metadata endpoints. Reaching one IS itself a network call (a token is fetched
+# over HTTP), not a local credential-file read — and it is the legitimate managed-identity auth
+# path used by Azure/AWS/GCP SDKs. So a metadata-endpoint reference must NOT be counted as the
+# "read a secret from disk" side of the exfiltration combo (that double-counts one fetch and
+# mislabels normal cloud auth as a credential-exfiltration path). It still fires as its own
+# sensitive-path finding (an SSRF / token-theft surface worth reviewing).
+_CLOUD_METADATA_RE = re.compile(
+    r"169\.254\.169\.254|metadata\.google\.internal|metadata\.google\b", re.IGNORECASE
+)
 
 # Only these threat classes contribute to the risk score; CAPABILITY is informational.
 _SCORED_CLASSES = frozenset({ThreatClass.MALICIOUS_INDICATOR, ThreatClass.RISKY_CONSTRUCT})
@@ -47,6 +60,79 @@ _DROPPER_PAYLOAD_IDS = frozenset(
 _SENSITIVE_DATA_IDS = frozenset({"ST-SENS-PATH", "ST-SENS-PATH-PY", "ST-SECRET-EMBEDDED"})
 # A confirmed untrusted-instruction surface (the "untrusted content" axis of the trifecta).
 _UNTRUSTED_CONTENT_IDS = frozenset({"ST-PROMPT-INJECTION"})
+
+# Credential-location DOMAINS: which provider a sensitive-path reference belongs to. A package
+# whose own identity IS that provider reads that provider's credentials as its documented function
+# (botocore reads ~/.aws), so that specific access is not, by itself, an exfiltration signal. This
+# is matched against the evidence snippet (the sensitive_paths scanner's own path alternation).
+_CREDENTIAL_DOMAINS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)~/\.aws|\.aws/credentials"), "aws"),
+    (re.compile(r"(?i)\.docker/config\.json"), "docker"),
+    (re.compile(r"(?i)~/\.config/gcloud|application_default_credentials\.json"), "gcp"),
+    (re.compile(r"(?i)~/\.azure"), "azure"),
+    (re.compile(r"(?i)~/\.kube"), "kube"),
+    (re.compile(r"(?i)\.git-credentials"), "git"),
+    (re.compile(r"(?i)~/\.ssh|\bid_rsa\b"), "ssh"),
+)
+
+# Known official SDK / client packages mapped to the credential domain(s) they exist to use.
+# A CURATED allowlist keyed on the EXACT package name (never a substring — "python-aws-post"
+# contains "aws" but is NOT the AWS SDK, so it must still fire). Reading its OWN provider's
+# credentials is the package's documented purpose; off-domain access (an AWS SDK reading ~/.ssh)
+# and embedded secrets are unaffected and still synthesize the exfil combo.
+_SDK_PROVIDER_DOMAINS: dict[str, frozenset[str]] = {
+    "botocore": frozenset({"aws"}), "boto3": frozenset({"aws"}), "boto": frozenset({"aws"}),
+    # awscli's `eks update-kubeconfig` writes ~/.kube/config.
+    "awscli": frozenset({"aws", "kube"}), "aiobotocore": frozenset({"aws"}),
+    "aioboto3": frozenset({"aws"}), "s3transfer": frozenset({"aws"}),
+    # docker's SSH transport (docker-over-ssh) reads ~/.ssh/config.
+    "docker": frozenset({"docker", "ssh"}),
+    "gcsfs": frozenset({"gcp"}), "google-cloud-storage": frozenset({"gcp"}),
+    "google-auth": frozenset({"gcp"}), "google-cloud-core": frozenset({"gcp"}),
+    "snowflake-connector-python": frozenset({"snowflake"}),
+    "kubernetes": frozenset({"kube"}), "kubernetes-asyncio": frozenset({"kube"}),
+    "paramiko": frozenset({"ssh"}), "asyncssh": frozenset({"ssh"}), "fabric": frozenset({"ssh"}),
+    # git implementations legitimately read ~/.git-credentials AND ~/.ssh/config (git-over-ssh).
+    "dulwich": frozenset({"git", "ssh"}), "gitpython": frozenset({"git", "ssh"}),
+    "pygit2": frozenset({"git", "ssh"}),
+    # Data / IO libraries with a first-class cloud-filesystem layer legitimately read cloud creds
+    # (pyarrow.fs S3/GCS filesystems; s3fs/adlfs are the fsspec cloud backends).
+    "pyarrow": frozenset({"aws", "gcp"}), "s3fs": frozenset({"aws"}),
+    "adlfs": frozenset({"azure"}), "fsspec": frozenset({"aws", "gcp", "azure"}),
+}
+_AZURE_SDK_PREFIX = "azure-"  # the azure-* SDK family (azure-identity, azure-storage-blob, …)
+
+
+def _credential_domain(snippet: str) -> str | None:
+    """The provider domain a sensitive-path evidence snippet refers to, or None."""
+    for pat, dom in _CREDENTIAL_DOMAINS:
+        if pat.search(snippet):
+            return dom
+    return None
+
+
+def _package_base_name(component: Component) -> str:
+    """The base package name, without a version suffix. A PyPI sdist's ``Component.name`` is the
+    ``package-version`` dir (``botocore-1.43.42``), so match on the clean source spec
+    (``pypi:botocore``) when present, else strip a trailing ``-<version>`` from the name."""
+    src = (component.source or "").strip().lower()
+    for prefix in ("pypi:", "npm:"):
+        if src.startswith(prefix):
+            return re.split(r"[@=]", src[len(prefix):], maxsplit=1)[0].strip()
+    name = (component.name or "").strip().lower()
+    return re.sub(r"-\d+(?:\.\d+)*.*$", "", name)
+
+
+def _package_provider_domains(component: Component | None) -> frozenset[str]:
+    """Credential domains this package legitimately accesses as its own documented function."""
+    if component is None:
+        return frozenset()
+    name = _package_base_name(component)
+    if name in _SDK_PROVIDER_DOMAINS:
+        return _SDK_PROVIDER_DOMAINS[name]
+    if name.startswith(_AZURE_SDK_PREFIX):
+        return frozenset({"azure"})
+    return frozenset()
 
 
 def _dedupe(evidence: list[Evidence]) -> list[Evidence]:
@@ -77,6 +163,7 @@ def risk_level(score: int) -> RiskLevel:
 def exfiltration_finding(
     findings: list[Finding],
     capabilities: dict[Capability, list[Evidence]],
+    component: Component | None = None,
 ) -> Finding | None:
     """Synthesize a critical risky-construct finding for a credential-exfiltration path.
 
@@ -85,9 +172,26 @@ def exfiltration_finding(
     genuinely risky combination (read a secret, send it off-host); plain filesystem + network is
     a neutral capability and is intentionally not flagged here. Evidence is drawn from the
     contributing findings/capabilities so the "no finding without evidence" invariant holds.
+
+    A provider SDK reading its OWN provider's credentials (``botocore`` -> ``~/.aws``) is that
+    package's documented function, not exfiltration, so a sensitive-path evidence whose domain
+    matches the package's provider (``component`` identity, see ``_SDK_PROVIDER_DOMAINS``) is
+    excluded. Off-domain access (an AWS SDK reading ``~/.ssh``), a non-SDK package reading any
+    credential path, and embedded secrets (``ST-SECRET-EMBEDDED`` has no path domain) all keep
+    firing, so recall for a genuine credential-stealer is preserved.
     """
+    provider_domains = _package_provider_domains(component)
     sens_evidence: list[Evidence] = [
-        e for f in findings if f.id in _SENSITIVE_DATA_IDS for e in f.evidence
+        e
+        for f in findings
+        if f.id in _SENSITIVE_DATA_IDS
+        for e in f.evidence
+        if not _CLOUD_METADATA_RE.search(e.snippet)  # metadata fetch is network, not a secret read
+        and not (
+            provider_domains
+            and f.id in ("ST-SENS-PATH", "ST-SENS-PATH-PY")
+            and _credential_domain(e.snippet) in provider_domains
+        )
     ]
     net_evidence = capabilities.get(Capability.NETWORK_EGRESS, [])
 

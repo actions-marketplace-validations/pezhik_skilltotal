@@ -8,16 +8,27 @@ Commands:
         <source>: a local directory, a project archive (.zip/.tar.gz/.tgz/.tar) or a single
         file, a git URL, or an npm:<name> / pypi:<name> package spec.
         Optional project config: .skilltotal.toml (fail_on, fail_on_score, exclude, ignore,
-        baseline). CLI flags override config. Inline `# skilltotal:ignore[ST-ID]` suppresses a
-        finding on its line.
+        baseline, and a per-rule [policy] table with block/warn/ignore actions). CLI flags
+        override config. Inline `# skilltotal:ignore[ST-ID]` suppresses a finding on its line.
+    skilltotal diff <old> <new> [--json] [--output FILE] [--fail-on-new LEVEL]
+        compare two versions of a component: each side is any scannable source (as in
+        `scan`) or a previously saved JSON report. Reports new/resolved findings,
+        evidence-level changes, and capability changes.
+    skilltotal guard <source> [--block-on malicious|high|medium] [--json]
+    skilltotal guard --installed [--project DIR] [--block-on ...] [--json]
+        pre-install allow/block decision (exit 2 on block): malicious indicators always
+        block; scored risk at/above the block level blocks; capabilities alone never do.
     skilltotal inventory [--json] [--no-scan] [--project DIR]
         discover AI components installed on this machine (agent configs / MCP servers), then scan.
     skilltotal rules list [--json]
+    skilltotal mcp
+        run SkillTotal as an MCP server on stdio, so agents can scan components before
+        installing them (register: {"command": "skilltotal", "args": ["mcp"]}).
 
 Exit codes:
     0  success
     1  usage / collection error
-    2  --fail-on-high set and a finding of severity >= high was produced
+    2  a configured gate tripped (scan --fail-on* / diff --fail-on-new)
 """
 
 from __future__ import annotations
@@ -31,10 +42,16 @@ from skilltotal import __version__
 from skilltotal.baseline import build_baseline, load_baseline
 from skilltotal.collector import CollectionError
 from skilltotal.config import Config, find_config, load_config
+from skilltotal.diff import diff_reports, max_new_severity
 from skilltotal.engine import analyze
+from skilltotal.guard import BLOCK_LEVELS, DEFAULT_BLOCK_LEVEL, evaluate
 from skilltotal.inventory import discover
 from skilltotal.models import Severity
 from skilltotal.report import (
+    render_diff_json,
+    render_diff_text,
+    render_guard_json,
+    render_guard_text,
     render_inventory_json,
     render_inventory_text,
     render_json,
@@ -119,12 +136,107 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="Path to a .skilltotal.toml config (default: auto-discover in the current dir).",
     )
+    scan.add_argument(
+        "--provenance",
+        action="store_true",
+        help=(
+            "Also fetch registry metadata for npm:/pypi: sources and report provenance "
+            "signals (recently published, deprecated/yanked, no recent releases, no "
+            "repository link) as needs_review entries. Opt-in; never affects the score."
+        ),
+    )
+
+    diff = sub.add_parser(
+        "diff",
+        help=(
+            "Compare two versions of a component (any two scan sources, or previously "
+            "saved JSON reports)."
+        ),
+    )
+    diff.add_argument(
+        "old",
+        help="Old side: any scannable source (as in `scan`) or a saved JSON report file.",
+    )
+    diff.add_argument(
+        "new",
+        help="New side: any scannable source (as in `scan`) or a saved JSON report file.",
+    )
+    diff.add_argument("--json", action="store_true", help="Emit JSON to stdout.")
+    diff.add_argument(
+        "--output",
+        metavar="FILE",
+        help="Write the diff report to FILE as JSON.",
+    )
+    diff.add_argument(
+        "--fail-on-new",
+        metavar="LEVEL",
+        choices=["low", "medium", "high", "critical"],
+        help=(
+            "Exit with code 2 if the new version introduces a finding (or new evidence "
+            "on an existing finding) at or above LEVEL severity."
+        ),
+    )
+    diff.add_argument(
+        "--exclude",
+        metavar="GLOB",
+        action="append",
+        default=[],
+        help="Skip files matching GLOB on both sides (repeatable).",
+    )
+    diff.add_argument(
+        "--config",
+        metavar="FILE",
+        help="Path to a .skilltotal.toml config (default: auto-discover in the current dir).",
+    )
+
+    guard = sub.add_parser(
+        "guard",
+        help=(
+            "Pre-install check: allow/block decision for a component "
+            "(chain it before installing, e.g. `skilltotal guard npm:x && ...`)."
+        ),
+    )
+    guard.add_argument(
+        "source",
+        nargs="?",
+        help="Component to check (same sources as `scan`). Omit with --installed.",
+    )
+    guard.add_argument(
+        "--installed",
+        action="store_true",
+        help="Check every AI component installed on this machine instead of one source.",
+    )
+    guard.add_argument(
+        "--project",
+        metavar="DIR",
+        help="With --installed: also check project-local agent configs in DIR.",
+    )
+    guard.add_argument(
+        "--block-on",
+        metavar="LEVEL",
+        choices=list(BLOCK_LEVELS),
+        default=DEFAULT_BLOCK_LEVEL,
+        help=(
+            "What blocks (exit 2): 'malicious' = only malicious indicators; "
+            "'high' (default) = also risk level high/critical; 'medium' = also medium. "
+            "Capabilities alone never block."
+        ),
+    )
+    guard.add_argument("--json", action="store_true", help="Emit JSON to stdout.")
 
     inv = sub.add_parser(
         "inventory",
         help="Discover AI components installed on this machine and scan them.",
     )
     inv.add_argument("--json", action="store_true", help="Emit JSON to stdout.")
+    inv.add_argument(
+        "--sbom",
+        action="store_true",
+        help=(
+            "Emit the inventory as a CycloneDX 1.6 AI-BOM (JSON) with the scan verdict "
+            "attached as component properties."
+        ),
+    )
     inv.add_argument(
         "--no-scan", action="store_true", help="Only list discovered components, do not scan."
     )
@@ -137,6 +249,14 @@ def build_parser() -> argparse.ArgumentParser:
     rules_list = rules_sub.add_parser("list", help="List all detection rules.")
     rules_list.add_argument("--json", action="store_true", help="Emit JSON to stdout.")
 
+    sub.add_parser(
+        "mcp",
+        help=(
+            "Run SkillTotal as an MCP server on stdio (tools: scan_component, "
+            "diff_components, list_rules)."
+        ),
+    )
+
     return parser
 
 
@@ -146,10 +266,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "scan":
         return _cmd_scan(args)
+    if args.command == "diff":
+        return _cmd_diff(args)
+    if args.command == "guard":
+        return _cmd_guard(args)
     if args.command == "inventory":
         return _cmd_inventory(args)
     if args.command == "rules":
         return _cmd_rules(args)
+    if args.command == "mcp":
+        return _cmd_mcp()
     parser.error("unknown command")  # pragma: no cover
     return EXIT_ERROR
 
@@ -169,11 +295,29 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     exclude = [*config.exclude, *args.exclude]
     try:
         report = analyze(
-            args.source, suppress=suppress, ignore_rules=config.ignore, exclude=exclude
+            args.source, suppress=suppress, ignore_rules=config.ignored_rules(), exclude=exclude
         )
     except CollectionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
+
+    if args.provenance:
+        # Provenance is deliberately a CLI-layer add-on: the engine stays component-only,
+        # and registry metadata lands in needs_review, which never affects the score.
+        from skilltotal.provenance import ProvenanceError, collect_provenance
+
+        try:
+            signals = collect_provenance(args.source)
+        except ProvenanceError as exc:
+            print(f"warning: {exc}", file=sys.stderr)
+        else:
+            report.needs_review.extend(signals)
+            report.metadata["provenance_checked"] = True
+            if not signals and not args.source.strip().lower().startswith(("npm:", "pypi:")):
+                print(
+                    "warning: --provenance only applies to npm:/pypi: sources",
+                    file=sys.stderr,
+                )
 
     if args.write_baseline:
         doc = build_baseline(report.findings)
@@ -203,9 +347,118 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
     level = args.fail_on or ("high" if args.fail_on_high else None) or config.fail_on
     score = args.fail_on_score if args.fail_on_score is not None else config.fail_on_score
-    if _fails_gate(report, level, score):
+    if _fails_gate(report, level, score, config.policy):
         return EXIT_FAIL_ON_HIGH
     return EXIT_OK
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    exclude = [*config.exclude, *args.exclude]
+
+    try:
+        old_report = _resolve_diff_side(args.old, config, exclude)
+        new_report = _resolve_diff_side(args.new, config, exclude)
+    except CollectionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: cannot read report: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    diff = diff_reports(old_report, new_report)
+
+    if args.json:
+        print(render_diff_json(diff))
+    else:
+        print(render_diff_text(diff))
+
+    if args.output:
+        Path(args.output).write_text(render_diff_json(diff), encoding="utf-8")
+        print(f"Diff report written to {args.output}", file=sys.stderr)
+
+    if args.fail_on_new:
+        worst = max_new_severity(diff)
+        if worst is not None and worst.rank >= Severity[args.fail_on_new.upper()].rank:
+            return EXIT_FAIL_ON_HIGH
+    return EXIT_OK
+
+
+def _resolve_diff_side(source: str, config: Config, exclude: list[str]) -> dict:
+    """Resolve one diff side: a saved JSON report is loaded, anything else is scanned."""
+    path = Path(source)
+    if path.is_file() and path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and {"component", "risk_score", "findings"} <= data.keys():
+            return data
+        # A .json file that is not a saved report (e.g. a bare package.json) is scanned
+        # like any other single-file source.
+    report = analyze(source, ignore_rules=config.ignored_rules(), exclude=exclude)
+    return report.to_dict()
+
+
+def _cmd_guard(args: argparse.Namespace) -> int:
+    if args.installed == bool(args.source):
+        print("error: pass a source to check, or --installed (not both)", file=sys.stderr)
+        return EXIT_ERROR
+    if args.installed:
+        return _guard_installed(args)
+
+    try:
+        report = analyze(args.source).to_dict()
+    except CollectionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    decision = evaluate(report, args.block_on)
+    if args.json:
+        print(render_guard_json(args.source, report, decision))
+    else:
+        print(render_guard_text(args.source, report, decision))
+    return EXIT_OK if decision.allow else EXIT_FAIL_ON_HIGH
+
+
+def _guard_installed(args: argparse.Namespace) -> int:
+    """Guard every installed AI component; block if any of them blocks."""
+    components = discover(project=Path(args.project) if args.project else None)
+    items: list[dict] = []
+    blocked: list[str] = []
+    for c in components:
+        item: dict = {"host": c.host, "name": c.name, "kind": c.kind, "source": c.source}
+        if not (c.scannable and c.source):
+            item["decision"] = "not scanned"
+            item["note"] = c.note
+            items.append(item)
+            continue
+        try:
+            report = analyze(c.source).to_dict()
+        except Exception as exc:  # noqa: BLE001 - one bad item must not abort the sweep
+            item["decision"] = "error"
+            item["note"] = str(exc)
+            items.append(item)
+            continue
+        decision = evaluate(report, args.block_on)
+        item["decision"] = "allow" if decision.allow else "block"
+        item["risk_level"] = report.get("risk_level", "")
+        item["reasons"] = decision.reasons
+        if not decision.allow:
+            blocked.append(c.name)
+        items.append(item)
+
+    if args.json:
+        print(render_inventory_json(items))
+    else:
+        for it in items:
+            marker = {"allow": "ok", "block": "BLOCK"}.get(it["decision"], it["decision"])
+            risk = f"  risk={it['risk_level']}" if it.get("risk_level") else ""
+            print(f"[{marker}] {it['name']} ({it['host']}, {it['kind']}){risk}")
+            for reason in it.get("reasons", []):
+                print(f"      - {reason}")
+        print()
+        if blocked:
+            print(f"BLOCK: {len(blocked)} component(s) failed the guard: {', '.join(blocked)}")
+        else:
+            print(f"ALLOW: all {len(items)} component(s) passed the guard.")
+    return EXIT_FAIL_ON_HIGH if blocked else EXIT_OK
 
 
 def _cmd_inventory(args: argparse.Namespace) -> int:
@@ -232,10 +485,28 @@ def _cmd_inventory(args: argparse.Namespace) -> int:
                 item["error"] = f"scan failed: {exc}"
         items.append(item)
 
-    if args.json:
+    if args.sbom:
+        from skilltotal.sbom import build_aibom
+
+        print(json.dumps(build_aibom(items), indent=2, ensure_ascii=False))
+    elif args.json:
         print(render_inventory_json(items))
     else:
         print(render_inventory_text(items))
+    return EXIT_OK
+
+
+def _cmd_mcp() -> int:
+    from skilltotal.mcp_server import serve
+
+    # The MCP stdio transport is UTF-8, but Windows consoles default to a legacy codepage
+    # (e.g. cp1251), which would mojibake any non-ASCII snippet in a report and crash the
+    # client's decoder. newline="\n" keeps the transport's one-message-per-LF framing free
+    # of CRLF translation.
+    if hasattr(sys.stdin, "reconfigure"):  # real stdio; absent on injected test streams
+        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    serve(sys.stdin, sys.stdout)
     return EXIT_OK
 
 
@@ -262,11 +533,25 @@ def _load_config(args: argparse.Namespace) -> Config:
         return Config()
 
 
-def _fails_gate(report, level: str | None, score: int | None) -> bool:
-    """True if the report trips the configured CI gate (severity level and/or risk score)."""
+def _fails_gate(
+    report, level: str | None, score: int | None, policy: dict[str, str] | None = None
+) -> bool:
+    """True if the report trips the configured CI gate (severity level and/or risk score).
+
+    Per-rule policy actions refine the severity gate: a `block` rule trips it whenever it
+    fires (even with no `fail_on` configured); a `warn` rule is exempt from the severity
+    threshold (explicit accept-but-show). The aggregate `fail_on_score` gate is unaffected —
+    warn findings still count toward the risk score.
+    """
+    policy = policy or {}
+    if any(policy.get(f.id) == "block" for f in report.findings):
+        return True
     if level:
         threshold = Severity[level.upper()].rank
-        if any(f.severity.rank >= threshold for f in report.findings):
+        if any(
+            f.severity.rank >= threshold and policy.get(f.id) != "warn"
+            for f in report.findings
+        ):
             return True
     if score is not None and report.risk_score >= score:
         return True

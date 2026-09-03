@@ -1,31 +1,31 @@
 {
   "provenance": {
-    "engine_version": "0.17.0",
-    "ruleset_version": 18,
-    "report_schema_version": "1.4",
-    "generated_at": "2026-06-19",
-    "manifest_sha256": "206779188897f83706423fea7eb19141ddf6bb3b7488696bc51c8be5a7b8c2a2",
-    "components_total": 32,
-    "scanned": 32,
+    "engine_version": "0.43.0",
+    "ruleset_version": 47,
+    "report_schema_version": "1.5",
+    "generated_at": "2026-08-31",
+    "manifest_sha256": "259703def233c6754dcaff6d7b9979c7430b63cb457e1ca0f88cde9a16837f7e",
+    "components_total": 57,
+    "scanned": 57,
     "skipped": 0,
     "errors": 0
   },
   "risk_distribution": {
     "low": {
-      "count": 30,
-      "pct": 93.8
+      "count": 56,
+      "pct": 98.2
     },
     "medium": {
       "count": 0,
       "pct": 0.0
     },
     "high": {
-      "count": 2,
-      "pct": 6.2
-    },
-    "critical": {
       "count": 0,
       "pct": 0.0
+    },
+    "critical": {
+      "count": 1,
+      "pct": 1.8
     }
   },
   "malicious_indicators": {
@@ -35,23 +35,23 @@
   "owasp": {
     "AST01": {
       "count": 2,
-      "pct": 6.2
+      "pct": 3.5
     },
     "AST02": {
-      "count": 7,
-      "pct": 21.9
+      "count": 10,
+      "pct": 17.5
     },
     "AST03": {
-      "count": 4,
-      "pct": 12.5
+      "count": 6,
+      "pct": 10.5
     },
     "AST04": {
       "count": 0,
       "pct": 0.0
     },
     "AST05": {
-      "count": 1,
-      "pct": 3.1
+      "count": 2,
+      "pct": 3.5
     },
     "AST06": {
       "count": 0,
@@ -75,114 +75,122 @@
     }
   },
   "capabilities": {
+    "delegated_authentication": {
+      "count": 14,
+      "pct": 24.6
+    },
     "dynamic_code_execution": {
-      "count": 2,
-      "pct": 6.2
+      "count": 5,
+      "pct": 8.8
     },
     "filesystem_read": {
-      "count": 13,
-      "pct": 40.6
+      "count": 23,
+      "pct": 40.4
     },
     "filesystem_write": {
-      "count": 9,
-      "pct": 28.1
+      "count": 19,
+      "pct": 33.3
     },
     "install_time_execution": {
-      "count": 7,
-      "pct": 21.9
+      "count": 10,
+      "pct": 17.5
     },
     "mcp_tools_detected": {
-      "count": 10,
-      "pct": 31.2
+      "count": 33,
+      "pct": 57.9
     },
     "network_egress": {
-      "count": 16,
-      "pct": 50.0
+      "count": 31,
+      "pct": 54.4
+    },
+    "scoped_identity": {
+      "count": 5,
+      "pct": 8.8
     },
     "shell_execution": {
-      "count": 8,
-      "pct": 25.0
+      "count": 21,
+      "pct": 36.8
     }
   },
   "top_rules": [
     {
       "id": "ST-MCP-DETECTED",
-      "count": 10
+      "count": 33
     },
     {
       "id": "ST-NET-PY",
-      "count": 10
-    },
-    {
-      "id": "ST-FS-PY-READ",
-      "count": 8
+      "count": 17
     },
     {
       "id": "ST-NET-NODE",
-      "count": 6
-    },
-    {
-      "id": "ST-FS-PY-WRITE",
-      "count": 6
-    },
-    {
-      "id": "ST-FS-NODE-READ",
-      "count": 5
-    },
-    {
-      "id": "ST-INSTALL-NPM-PREPARE",
-      "count": 5
-    },
-    {
-      "id": "ST-MCP-DANGEROUS-TOOL",
-      "count": 4
-    },
-    {
-      "id": "ST-SHELL-PY",
-      "count": 4
+      "count": 15
     },
     {
       "id": "ST-SHELL-NODE",
-      "count": 4
+      "count": 14
+    },
+    {
+      "id": "ST-AUTH-DELEGATED",
+      "count": 14
+    },
+    {
+      "id": "ST-FS-PY-READ",
+      "count": 14
+    },
+    {
+      "id": "ST-FS-PY-WRITE",
+      "count": 12
+    },
+    {
+      "id": "ST-FS-NODE-READ",
+      "count": 11
+    },
+    {
+      "id": "ST-SHELL-PY",
+      "count": 10
+    },
+    {
+      "id": "ST-INSTALL-NPM-PREPARE",
+      "count": 8
     },
     {
       "id": "ST-FS-NODE-WRITE",
-      "count": 3
+      "count": 8
     },
     {
       "id": "ST-EXPOSE-BIND",
-      "count": 2
+      "count": 6
     },
     {
-      "id": "ST-COMBO-EXFIL",
-      "count": 2
+      "id": "ST-AUTH-SCOPED",
+      "count": 5
     },
     {
-      "id": "ST-DYN-PY",
-      "count": 2
+      "id": "ST-MCP-SERVER-EXEC",
+      "count": 4
     },
     {
-      "id": "ST-INSTALL-NPM",
-      "count": 1
+      "id": "ST-DYN-NODE",
+      "count": 3
     }
   ],
   "by_type": {
     "mcp": {
-      "low": 17,
+      "low": 41,
+      "medium": 0,
+      "high": 0,
+      "critical": 1
+    },
+    "npm": {
+      "low": 7,
       "medium": 0,
       "high": 0,
       "critical": 0
     },
-    "npm": {
-      "low": 6,
-      "medium": 0,
-      "high": 1,
-      "critical": 0
-    },
     "pypi": {
-      "low": 7,
+      "low": 8,
       "medium": 0,
-      "high": 1,
+      "high": 0,
       "critical": 0
     }
   },
@@ -192,627 +200,399 @@
       "type": "mcp",
       "name": "mcp-filesystem",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.6.3",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST02",
-        "AST03"
-      ],
-      "capabilities": [
-        "filesystem_read",
-        "install_time_execution",
-        "mcp_tools_detected"
-      ],
-      "rule_ids": [
-        "ST-MCP-DANGEROUS-TOOL",
-        "ST-FS-NODE-READ",
-        "ST-INSTALL-NPM-PREPARE",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
       "type": "mcp",
       "name": "mcp-git",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.6.2",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
       "type": "mcp",
       "name": "mcp-fetch",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.6.3",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-NET-PY"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
       "type": "mcp",
       "name": "mcp-memory",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.6.3",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST02"
-      ],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "install_time_execution",
-        "mcp_tools_detected"
-      ],
-      "rule_ids": [
-        "ST-FS-NODE-READ",
-        "ST-FS-NODE-WRITE",
-        "ST-INSTALL-NPM-PREPARE",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/everything",
       "type": "mcp",
       "name": "mcp-everything",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2.0.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST02"
-      ],
-      "capabilities": [
-        "install_time_execution",
-        "mcp_tools_detected",
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-INSTALL-NPM-PREPARE",
-        "ST-NET-NODE",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
       "type": "mcp",
       "name": "mcp-sequentialthinking",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.6.2",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST02"
-      ],
-      "capabilities": [
-        "install_time_execution",
-        "mcp_tools_detected"
-      ],
-      "rule_ids": [
-        "ST-INSTALL-NPM-PREPARE",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
       "type": "mcp",
       "name": "mcp-time",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.6.2",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "npm:@modelcontextprotocol/server-everything",
       "type": "mcp",
       "name": "server-everything",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2026.1.26",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST02"
-      ],
-      "capabilities": [
-        "install_time_execution"
-      ],
-      "rule_ids": [
-        "ST-INSTALL-NPM-PREPARE"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:mcp-remote",
       "type": "mcp",
       "name": "mcp-remote",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.1.38",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "npm:@playwright/mcp",
       "type": "mcp",
       "name": "playwright-mcp",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.0.76",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:mcp-server-fetch",
       "type": "mcp",
       "name": "mcp-server-fetch",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2026.6.4",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-NET-PY"
-      ]
+      "detail": ""
     },
     {
       "source": "pypi:mcp-server-git",
       "type": "mcp",
       "name": "mcp-server-git",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2026.6.16",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:mcp-server-time",
       "type": "mcp",
       "name": "mcp-server-time",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2026.6.4",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:fastmcp",
       "type": "mcp",
       "name": "fastmcp",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "3.4.2",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST03"
-      ],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "mcp_tools_detected",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-MCP-DANGEROUS-TOOL",
-        "ST-SHELL-PY",
-        "ST-EXPOSE-BIND",
-        "ST-FS-PY-READ",
-        "ST-FS-PY-WRITE",
-        "ST-NET-PY",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/github/github-mcp-server",
       "type": "mcp",
       "name": "github-mcp-server",
       "status": "ok",
-      "detail": "",
-      "resolved_version": null,
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "mcp_tools_detected"
-      ],
-      "rule_ids": [
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/cloudflare/mcp-server-cloudflare",
       "type": "mcp",
       "name": "mcp-server-cloudflare",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "1.0.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST02",
-        "AST03"
-      ],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "install_time_execution",
-        "mcp_tools_detected",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-INSTALL-NPM",
-        "ST-MCP-DANGEROUS-TOOL",
-        "ST-SHELL-NODE",
-        "ST-FS-NODE-READ",
-        "ST-FS-NODE-WRITE",
-        "ST-NET-NODE",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "https://github.com/tumf/mcp-shell-server",
       "type": "mcp",
       "name": "mcp-shell-server",
       "status": "ok",
-      "detail": "",
-      "resolved_version": null,
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "filesystem_read"
-      ],
-      "rule_ids": [
-        "ST-FS-PY-READ"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:@modelcontextprotocol/sdk",
       "type": "npm",
       "name": "mcp-sdk-js",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "1.29.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:mcp",
       "type": "pypi",
       "name": "mcp-sdk-py",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "1.28.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [
-        "AST03"
-      ],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "mcp_tools_detected",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-CMDI-PY",
-        "ST-MCP-DANGEROUS-TOOL",
-        "ST-MCP-SERVER-EXEC",
-        "ST-SHELL-PY",
-        "ST-FS-PY-READ",
-        "ST-FS-PY-WRITE",
-        "ST-NET-PY",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:openai",
       "type": "npm",
       "name": "openai-js",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "6.44.0",
-      "risk_level": "high",
-      "has_malicious": false,
-      "owasp": [
-        "AST01"
-      ],
-      "capabilities": [
-        "filesystem_read",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-COMBO-EXFIL",
-        "ST-SENS-PATH",
-        "ST-SHELL-NODE",
-        "ST-FS-NODE-READ",
-        "ST-NET-NODE"
-      ]
+      "detail": ""
     },
     {
       "source": "pypi:openai",
       "type": "pypi",
       "name": "openai-py",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2.43.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-FS-PY-READ",
-        "ST-FS-PY-WRITE",
-        "ST-NET-PY"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:@anthropic-ai/sdk",
       "type": "npm",
       "name": "anthropic-sdk-js",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.105.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-SHELL-NODE",
-        "ST-FS-NODE-READ",
-        "ST-FS-NODE-WRITE",
-        "ST-NET-NODE"
-      ]
+      "detail": ""
     },
     {
       "source": "pypi:anthropic",
       "type": "pypi",
       "name": "anthropic-py",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.111.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "filesystem_read",
-        "filesystem_write",
-        "mcp_tools_detected",
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-FS-PY-READ",
-        "ST-FS-PY-WRITE",
-        "ST-NET-PY",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:ai",
       "type": "npm",
       "name": "vercel-ai-sdk",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "6.0.208",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-SHELL-NODE",
-        "ST-NET-NODE"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:langchain",
       "type": "npm",
       "name": "langchain-js",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "1.5.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:langchain",
       "type": "pypi",
       "name": "langchain-py",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "1.3.10",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "filesystem_read",
-        "mcp_tools_detected",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-SHELL-PY",
-        "ST-FS-PY-READ",
-        "ST-NET-PY",
-        "ST-MCP-DETECTED"
-      ]
+      "detail": ""
     },
     {
       "source": "pypi:llama-index",
       "type": "pypi",
       "name": "llama-index",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "0.14.22",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:transformers",
       "type": "pypi",
       "name": "transformers",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "5.12.1",
-      "risk_level": "high",
-      "has_malicious": false,
-      "owasp": [
-        "AST01",
-        "AST02",
-        "AST05"
-      ],
-      "capabilities": [
-        "dynamic_code_execution",
-        "filesystem_read",
-        "filesystem_write",
-        "install_time_execution",
-        "network_egress",
-        "shell_execution"
-      ],
-      "rule_ids": [
-        "ST-COMBO-EXFIL",
-        "ST-DESERIALIZE-PY",
-        "ST-DYN-PY",
-        "ST-INSTALL-PY",
-        "ST-SECRET-EMBEDDED",
-        "ST-SHELL-PY",
-        "ST-FS-PY-READ",
-        "ST-FS-PY-WRITE",
-        "ST-NET-PY"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:express",
       "type": "npm",
       "name": "express",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "5.2.1",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-NET-NODE"
-      ]
+      "detail": ""
     },
     {
       "source": "npm:left-pad",
       "type": "npm",
       "name": "left-pad",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "1.3.0",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [],
-      "rule_ids": []
+      "detail": ""
     },
     {
       "source": "pypi:requests",
       "type": "pypi",
       "name": "requests",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "2.34.2",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "filesystem_write",
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-FS-PY-WRITE",
-        "ST-NET-PY"
-      ]
+      "detail": ""
     },
     {
       "source": "pypi:flask",
       "type": "pypi",
       "name": "flask",
       "status": "ok",
-      "detail": "",
-      "resolved_version": "3.1.3",
-      "risk_level": "low",
-      "has_malicious": false,
-      "owasp": [],
-      "capabilities": [
-        "dynamic_code_execution",
-        "filesystem_read",
-        "network_egress"
-      ],
-      "rule_ids": [
-        "ST-DYN-PY",
-        "ST-EXPOSE-BIND",
-        "ST-FS-PY-READ",
-        "ST-NET-PY"
-      ]
+      "detail": ""
+    },
+    {
+      "source": "pypi:adeu",
+      "type": "mcp",
+      "name": "adeu",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "npm:@adeu/mcp-server",
+      "type": "mcp",
+      "name": "adeu",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "npm:affiliate-networks-mcp",
+      "type": "mcp",
+      "name": "affiliate-networks-mcp",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/MarketTrace/markettrace-agent-feed",
+      "type": "mcp",
+      "name": "agent-feed",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/kernora-ai/agent-sec",
+      "type": "mcp",
+      "name": "agent-sec",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/AInoAKARI/AInoAKARI",
+      "type": "mcp",
+      "name": "agent-trust-receipt",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/matebenyovszky/agentplaybooks",
+      "type": "mcp",
+      "name": "agentplaybooks",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/embeddedlayers/mcp-analytics",
+      "type": "mcp",
+      "name": "analytics",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "npm:@ankimcp/anki-mcp-server",
+      "type": "mcp",
+      "name": "anki-mcp-server",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/ankimcp/anki-mcp-server-addon",
+      "type": "mcp",
+      "name": "anki-mcp-server-addon",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "pypi:armor-mcp",
+      "type": "mcp",
+      "name": "armor-mcp",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/arpi-ai/arpi-mcp",
+      "type": "mcp",
+      "name": "arpi-mcp",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/auralogs-ai/auralogs-mcp",
+      "type": "mcp",
+      "name": "auralogs",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/kevinfee3/authoryze-mcp",
+      "type": "mcp",
+      "name": "authoryze",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/Samp2Alex/auxen-mcp",
+      "type": "mcp",
+      "name": "auxen",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/auxen-ai/auxen-mcp",
+      "type": "mcp",
+      "name": "auxen",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/BackEngine-ai/backengine-mcp",
+      "type": "mcp",
+      "name": "backengine-mcp",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "pypi:mainbook-mcp",
+      "type": "mcp",
+      "name": "bank-statement-converter",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/gih2yun/bareun-mcp",
+      "type": "mcp",
+      "name": "bareun",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/navbuildz/basethread-mcp",
+      "type": "mcp",
+      "name": "basethread",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/breverdbidder/cli-anything-biddeed",
+      "type": "mcp",
+      "name": "biddeed-mcp",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/TechDocsStudio/biel-mcp",
+      "type": "mcp",
+      "name": "biel-ai",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/bitroadai/bitroad-mcp",
+      "type": "mcp",
+      "name": "bitroad",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "https://github.com/bittlebitsai/bittlebits-plugin",
+      "type": "mcp",
+      "name": "bittlebits",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "source": "npm:bizmuse-mcp",
+      "type": "mcp",
+      "name": "bizmuse",
+      "status": "ok",
+      "detail": ""
     }
   ]
 }

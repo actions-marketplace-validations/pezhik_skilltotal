@@ -130,9 +130,20 @@ def _iter_scope_values(data: object):
 
 
 def _is_broad_scope(value: object) -> bool:
-    """True if a scope value (string or list of strings) is a wildcard / over-broad grant."""
+    """True if a scope value (string or list of strings) is a wildcard / over-broad grant.
+
+    A file-PATH glob (contains a ``/`` separator or a ``**`` glob — e.g. ``.github/workflows/**``,
+    ``**/*.ts``) is a build/tooling file scope, NOT a permission wildcard, so it is excluded:
+    otherwise a linter/build config's ``"scope"`` field reads as an over-broad MCP grant
+    (FP: ECC's greptile.json, packmind's angular.json).
+    """
     items = value if isinstance(value, list) else [value]
-    return any(isinstance(s, str) and bool(_BROAD_SCOPE.search(s)) for s in items)
+    for s in items:
+        if not isinstance(s, str) or "/" in s or "**" in s:
+            continue
+        if _BROAD_SCOPE.search(s):
+            return True
+    return False
 
 # Source-level signals that an MCP tool surface exists.
 _CODE_SURFACE = re.compile(
@@ -437,12 +448,17 @@ class McpScanner(Scanner):
         if not isinstance(data, dict):
             return
 
-        # Over-broad permission/scope declarations anywhere in the manifest.
-        for key, value in _iter_scope_values(data):
-            if _is_broad_scope(value) and len(overbroad_scope) < MAX_EVIDENCE_PER_FINDING:
-                ev = _evidence_for(f, f'"{key}"')
-                if ev:
-                    overbroad_scope.append(ev)
+        # An over-broad scope is only meaningful in an actual MCP manifest — otherwise a build/
+        # tooling config that happens to have a "scope"/"permissions" key (angular.json,
+        # greptile.json) reads as an MCP grant. Gate the scope check on real MCP context: a
+        # manifest filename, or an mcpServers/tools declaration in this file.
+        is_mcp_context = is_manifest_name or "mcpServers" in data or "tools" in data
+        if is_mcp_context:
+            for key, value in _iter_scope_values(data):
+                if _is_broad_scope(value) and len(overbroad_scope) < MAX_EVIDENCE_PER_FINDING:
+                    ev = _evidence_for(f, f'"{key}"')
+                    if ev:
+                        overbroad_scope.append(ev)
 
         servers = data.get("mcpServers")
         if isinstance(servers, dict):
@@ -553,8 +569,9 @@ class McpScanner(Scanner):
             if not _CODE_SURFACE.search(f.text):
                 continue
             spans = [(m.start(), m.end()) for m in pattern.finditer(f.text)]
-            norm, idx = normalize_with_map(f.text)
-            if norm and norm != f.text:
+            folded = f.normalized_or_none()  # cached; None = identity (pure-ASCII fast path)
+            if folded is not None:
+                norm, idx = folded
                 spans += [original_span(idx, m.start(), m.end()) for m in pattern.finditer(norm)]
             for start, end in spans:
                 if start >= end:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 
 from skilltotal.file_index import FileIndex
-from skilltotal.models import Evidence, Finding, Severity, ThreatClass
+from skilltotal.models import Evidence, Finding, NeedsReview, Severity, ThreatClass
 from skilltotal.scanners.base import MAX_EVIDENCE_PER_FINDING, RuleSpec, Scanner, ScanResult
 
 CATEGORY = "secret_exposure"
@@ -24,13 +24,37 @@ _KNOWN: list[tuple[str, re.Pattern[str], int]] = [
     ("GitHub fine-grained PAT", re.compile(r"\b(github_pat_[A-Za-z0-9_]{60,})\b"), 1),
     ("GitLab token", re.compile(r"\b(glpat-[A-Za-z0-9_\-]{20,})\b"), 1),
     ("Anthropic API key", re.compile(r"\b(sk-ant-[A-Za-z0-9_\-]{20,})\b"), 1),
-    ("OpenAI API key", re.compile(r"\b(sk-(?:proj-)?[A-Za-z0-9_\-]{20,})\b"), 1),
+    # Real OpenAI keys are a legacy `sk-` + long base62 body, or a prefixed
+    # (`sk-proj-` / `sk-svcacct-` / `sk-admin-`) key with a long body. Short `sk-…`
+    # tokens are NOT OpenAI secrets: litellm proxy virtual keys (`sk-P1zJMds…`, ~20
+    # chars), `sk-1234` doc examples, and `org/sk-model-name` Hugging Face model ids
+    # all share the `sk-` prefix. Requiring the real length + prefix shape drops those
+    # FPs while the 48-char legacy and long project-key forms still match. An
+    # `api_key = "sk-short"` assignment remains covered by the generic rule below.
+    (
+        "OpenAI API key",
+        re.compile(r"\b(sk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{40,}|sk-[A-Za-z0-9]{40,})\b"),
+        1,
+    ),
     ("Slack token", re.compile(r"\b(xox[baprs]-[A-Za-z0-9\-]{10,})\b"), 1),
     ("Google API key", re.compile(r"\b(AIza[0-9A-Za-z_\-]{35})\b"), 1),
+    # Hugging Face access tokens gate model/dataset downloads and (for write tokens) pushes to
+    # the Hub — a live one shipped in a component is a real leak (Lasso found 1,500+ exposed).
+    # The `hf_` / `api_org_` prefix plus a fixed-length base62 body is highly specific (low FP).
+    ("Hugging Face user token", re.compile(r"\b(hf_[A-Za-z0-9]{34,40})\b"), 1),
+    ("Hugging Face org token", re.compile(r"\b(api_org_[A-Za-z0-9]{34})\b"), 1),
     ("Stripe live key", re.compile(r"\b([sr]k_live_[A-Za-z0-9]{24,})\b"), 1),
     (
+        # Require actual key MATERIAL after the marker, not the bare header. A lone
+        # `-----BEGIN PRIVATE KEY-----` string constant is a PEM *format marker* used by auth code
+        # to assemble/parse a key (e.g. `const pemHeader = '-----BEGIN PRIVATE KEY-----'`), not a
+        # leaked key — the secret is the base64 body. Up to 8 non-base64 chars (newline, quote,
+        # `\n` escape) may separate the marker from the body.
         "Private key block",
-        re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+        re.compile(
+            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"
+            r"[^A-Za-z0-9+/]{0,8}[A-Za-z0-9+/]{40,}"
+        ),
         0,
     ),
 ]
@@ -38,8 +62,14 @@ _KNOWN: list[tuple[str, re.Pattern[str], int]] = [
 # Generic: a secret-named variable assigned a long opaque string.
 _GENERIC = re.compile(
     r"(?i)(?:api[_-]?key|secret|token|password|passwd|access[_-]?key|auth[_-]?token|"
-    r"client[_-]?secret)\s*[:=]\s*['\"]([A-Za-z0-9+/_\-]{20,})['\"]"
+    r"client[_-]?secret|private[_-]?key)\s*[:=]\s*['\"]([A-Za-z0-9+/_\-]{20,})['\"]"
 )
+
+# A 0x-prefixed 40-hex value is an EVM account/contract address — published on-chain and safe to
+# ship. It reaches this rule only because web3 code says `token = "0x…"`, where "token" names an
+# asset rather than a credential. The 64-hex private-key form is a different shape and still
+# matches, so this exclusion cannot hide a real key.
+_PUBLIC_CHAIN_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # Substrings that mark a value as a placeholder / example, not a real secret. Kept to
 # unambiguous placeholder words — NOT generic hex/alpha runs, which occur in real tokens.
@@ -49,23 +79,165 @@ _PLACEHOLDER = re.compile(
 )
 
 
-def _looks_like_placeholder(value: str) -> bool:
+def _is_non_credential_value(value: str) -> bool:
+    """True when the matched value cannot be a live credential.
+
+    Two distinct reasons, both meaning "do not report": it is a placeholder/example, or it is a
+    PUBLISHED identifier that only looks secret — an EVM address is on-chain and public, and
+    reaches this rule solely because web3 code writes `token = "0x…"`.
+    """
+    if _PUBLIC_CHAIN_ADDRESS.match(value):
+        return True
     if _PLACEHOLDER.search(value):
         return True
     # Single repeated character (xxxxxxxx, 00000000) or too few distinct chars.
     return len(set(value)) <= 4
 
 
+# Algolia DocSearch search-only keys are public by design (shipped in client-side docs search)
+# and are not a leak. They are 32 lowercase-hex chars and always sit next to an Algolia app id /
+# index name. Recognising that shape avoids flagging every docs site as carrying an embedded secret.
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+_DOCSEARCH_CTX = re.compile(r"(?i)algolia|docsearch|app[_-]?id|index[_-]?name")
+
+
+def _is_public_docsearch_key(value: str, context: str) -> bool:
+    """True if ``value`` is a public Algolia DocSearch search key (read-only, safe to embed)."""
+    return bool(_HEX32.match(value)) and bool(_DOCSEARCH_CTX.search(context))
+
+
+# Google OAuth client secrets ("GOCSPX-…") are NOT confidential for INSTALLED apps (desktop /
+# CLI / native): Google's own docs say the secret "is obviously not treated as a secret" in that
+# flow, and Google ships one inside gcloud. The same value shape IS sensitive for a web app, so
+# demotion requires installed-app flow markers in the SAME file: the loopback redirect, the
+# legacy oob URN, the device-code flow, PKCE, or a client_secrets.json "installed" key. A
+# GOCSPX secret without those markers stays a scored finding (a leaked web-app secret).
+_GOOGLE_OAUTH_PREFIX = "GOCSPX-"
+_INSTALLED_APP_CTX = re.compile(
+    r"(?i)urn:ietf:wg:oauth:2\.0:oob|device[_/]code|code_verifier|code_challenge|"
+    r"http://(?:localhost|127\.0\.0\.1)|loopback|[\"']installed[\"']\s*[:=]"
+)
+
+
+def _is_installed_app_oauth_secret(value: str, file_text: str) -> bool:
+    """True if ``value`` is a Google OAuth client secret in an installed-app (native) flow."""
+    return value.startswith(_GOOGLE_OAUTH_PREFIX) and bool(_INSTALLED_APP_CTX.search(file_text))
+
+
+# Client-side TELEMETRY ingestion keys are publishable by design (like a Sentry DSN, Algolia search
+# key, or GA measurement id): they are embedded in an open-source client to POST usage/crash
+# telemetry to the vendor's ingestion endpoint, and can only write to that firehose. Recognising the
+# adjacent telemetry-ingestion URL avoids flagging them as a leaked secret. FP:
+# snowflake-connector-python ships SFCTEST/SFCDEV/PROD keys next to a
+# `*.client-telemetry.<vendor>/enqueue` URL.
+_TELEMETRY_INGEST_CTX = re.compile(
+    r"(?i)client-telemetry|telemetry[\w.-]*\.[\w.-]+/(?:enqueue|ingest)|/telemetry/(?:enqueue|ingest)"
+)
+
+
+def _is_public_telemetry_key(context: str) -> bool:
+    """True if a secret sits next to a client-telemetry ingestion endpoint (a publishable key)."""
+    return bool(_TELEMETRY_INGEST_CTX.search(context))
+
+
+# PostHog project API keys carry the `phc_` prefix and are documented as safe to expose in client
+# code — they can only write events into that project's firehose. The private personal API key
+# uses a different prefix, so keying on `phc_` cannot hide a real one. Without this, any project
+# shipping product analytics reads as leaking a credential (FPs: browser-use, zeta-chain/cli).
+_POSTHOG_PUBLIC_PREFIX = "phc_"
+
+
+def _is_public_analytics_key(value: str) -> bool:
+    """True for a vendor key that is published by design rather than kept secret."""
+    return value.startswith(_POSTHOG_PUBLIC_PREFIX)
+
+
+# Solana account/program addresses are base58 public keys, at most 44 characters — on-chain data
+# anyone can read, and typically a fixed constant (the SPL Token program id, a mint). A SECRET
+# there is a keypair, which is roughly twice as long, so bounding the length keeps real key
+# material in scope. The adjacent naming requirement keeps ordinary base58 blobs out.
+_BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+_CHAIN_ADDRESS_CTX = re.compile(
+    r"(?i)solana|spl[_-]?token|program[_-]?id|mint|pubkey|public[_-]?key|wallet|address"
+)
+
+
+def _is_public_chain_address(value: str, context: str) -> bool:
+    """True for a base58 on-chain address (public identifier), not a keypair."""
+    return bool(_BASE58.match(value)) and bool(_CHAIN_ADDRESS_CTX.search(context))
+
+
+# Test TLS/certificate fixtures: packages ship throwaway dummy certificate + private-key pairs to
+# drive their OWN test HTTPS servers (urllib3 `dummyserver/certs/*.key`, grpcio
+# `src/core/tsi/test_creds/*.key`). Those PEM blocks are real key MATERIAL but are disposable test
+# certificates, never a shipped production secret — the directory path (a test/dummy/fixture marker
+# next to a cert/cred/tls/ssl/pki marker) says so. Such a private-key block is routed to
+# needs_review, not scored. A private key on a normal path (`id_rsa`, `deploy/prod.pem`) has no test
+# marker and still scores, so a genuine leaked key is unaffected.
+_TEST_CERT_TESTISH = ("test", "dummy", "fixture", "mock", "example", "sample")
+_TEST_CERT_CERTISH = ("cert", "cred", "tls", "ssl", "pki")
+
+
+def _is_test_certificate(relpath: str) -> bool:
+    """True if ``relpath`` is a disposable test-certificate fixture (test-server key material)."""
+    dirs = "/".join(relpath.lower().replace("\\", "/").split("/")[:-1])
+    return any(t in dirs for t in _TEST_CERT_TESTISH) and any(c in dirs for c in _TEST_CERT_CERTISH)
+
+
 def _has_mixed_charset(value: str) -> bool:
     return any(c.isdigit() for c in value) and any(c.isalpha() for c in value)
 
 
+# Files whose *entire content* is a credential. They are not configuration that happens to
+# contain a token — they exist only as a login artifact, so any non-placeholder content in one
+# is a live credential shipped to everyone who installs the package. `mcp-publisher login`
+# writes both of these into its working directory; publishing from that directory packs them
+# into the tarball. The registry token is the more dangerous of the two: it grants the right to
+# republish this server in the MCP registry, i.e. supply-chain takeover of the component.
+#
+# The key/value patterns below cannot catch these: the file holds a bare token with no
+# assignment to anchor on, and an opaque JWT has no vendor prefix.
+_CREDENTIAL_FILES = frozenset(
+    {
+        ".mcpregistry_github_token",
+        ".mcpregistry_registry_token",
+    }
+)
+
+# Short enough to admit real tokens, long enough that an empty stub or a "TODO" is not a leak.
+_MIN_CREDENTIAL_FILE_LEN = 16
+
+
+# Below this length a "prefix of the secret" is not secret material, and blanking it would
+# mangle unrelated text that merely starts with the same characters.
+_MIN_REDACTABLE_PREFIX = 8
+
+
 def _redact(snippet: str, value: str) -> str:
-    """Replace the secret value in the snippet with a non-recoverable marker."""
+    """Replace the secret value in the snippet with a non-recoverable marker.
+
+    The snippet is built (and truncated to ``MAX_SNIPPET_CHARS``) before it reaches us, so a
+    long secret — a JWT, a PEM body, a token on a minified line — may survive only as a
+    *prefix*. A plain ``replace`` would then silently do nothing and the report would carry
+    most of a live credential. Redact the longest prefix that is actually present instead: a
+    security report must never re-publish what it found.
+    """
     if not value:
         return snippet
-    shown = value[:4]
-    return snippet.replace(value, f"{shown}…[redacted, {len(value)} chars]")
+    marker = f"{value[:4]}…[redacted, {len(value)} chars]"
+    if value in snippet:
+        return snippet.replace(value, marker)
+    # "value[:k] is in snippet" is monotone in k, so binary-search the longest such prefix.
+    lo, hi = _MIN_REDACTABLE_PREFIX, len(value)
+    if value[:lo] not in snippet:
+        return snippet
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if value[:mid] in snippet:
+            lo = mid
+        else:
+            hi = mid - 1
+    return snippet.replace(value[:lo], marker)
 
 
 class SecretsScanner(Scanner):
@@ -87,23 +259,57 @@ class SecretsScanner(Scanner):
             ),
             capability=None,
             threat_class=ThreatClass.RISKY_CONSTRUCT,
+            # A secret inside a comment is commented-out example code, not a live shipped
+            # credential (e.g. ragflow's `#     OAuthConfig(client_secret="…")`). Real embedded
+            # secrets are in code / value-strings, which are NOT demoted, so recall is preserved.
+            code_context="comments",
         ),
     ]
 
     def scan(self, index: FileIndex) -> ScanResult:
         evidence: list[Evidence] = []
         seen: set[tuple[str, int]] = set()
+        docsearch_files: list[str] = []
+        installed_oauth_files: list[str] = []
+        telemetry_files: list[str] = []
+        test_cert_files: list[str] = []
 
         for f in index.files:
-            for _label, pattern, grp in _KNOWN:
+            if f.name.lower() in _CREDENTIAL_FILES:
+                self._add_credential_file(f, evidence, seen)
+                # The whole file is one credential; the key/value patterns below have nothing
+                # left to find in it and would only produce a duplicate span.
+                continue
+            for label, pattern, grp in _KNOWN:
                 for m in pattern.finditer(f.text):
                     value = m.group(grp)
-                    if grp != 0 and _looks_like_placeholder(value):
+                    if grp != 0 and _is_non_credential_value(value):
+                        continue
+                    if label == "Private key block" and _is_test_certificate(f.relpath):
+                        if f.relpath not in test_cert_files:
+                            test_cert_files.append(f.relpath)
                         continue
                     self._add(f, m, value, evidence, seen)
             for m in _GENERIC.finditer(f.text):
                 value = m.group(1)
-                if _looks_like_placeholder(value) or not _has_mixed_charset(value):
+                if _is_non_credential_value(value) or not _has_mixed_charset(value):
+                    continue
+                window = f.text[max(0, m.start() - 200) : m.end() + 200]
+                if _is_public_docsearch_key(value, window):
+                    if f.relpath not in docsearch_files:
+                        docsearch_files.append(f.relpath)
+                    continue
+                if _is_public_telemetry_key(window) or _is_public_analytics_key(value):
+                    if f.relpath not in telemetry_files:
+                        telemetry_files.append(f.relpath)
+                    continue
+                if _is_public_chain_address(value, window):
+                    if f.relpath not in telemetry_files:
+                        telemetry_files.append(f.relpath)
+                    continue
+                if _is_installed_app_oauth_secret(value, f.text):
+                    if f.relpath not in installed_oauth_files:
+                        installed_oauth_files.append(f.relpath)
                     continue
                 self._add(f, m, value, evidence, seen)
 
@@ -122,11 +328,92 @@ class SecretsScanner(Scanner):
                     threat_class=rule.threat_class,
                 )
             )
-        return ScanResult(findings=findings)
+
+        needs_review: list[NeedsReview] = []
+        if test_cert_files:
+            shown = ", ".join(test_cert_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Test-certificate private key ({len(test_cert_files)})",
+                    reason=(
+                        "A PEM private-key block in a test-certificate fixture path (a "
+                        "test/dummy/fixture directory next to a cert/cred/tls/ssl marker, e.g. "
+                        "urllib3 dummyserver/certs, grpcio test_creds). These are disposable test "
+                        "certificates for the package's own test server, not a shipped production "
+                        f"secret; flagged for review, not scored: {shown}."
+                    ),
+                    file=test_cert_files[0],
+                )
+            )
+        if installed_oauth_files:
+            shown = ", ".join(installed_oauth_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=(
+                        f"Installed-app Google OAuth client secret ({len(installed_oauth_files)})"
+                    ),
+                    reason=(
+                        "A GOCSPX- Google OAuth client secret in a file with installed-app flow "
+                        "markers (loopback redirect / device code / PKCE / oob). For native "
+                        "apps Google documents this value as not confidential (gcloud ships "
+                        "one), so it is flagged for review, not scored — verify it is not a "
+                        f"web-application secret: {shown}."
+                    ),
+                    file=installed_oauth_files[0],
+                )
+            )
+        if telemetry_files:
+            shown = ", ".join(telemetry_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Public telemetry ingestion key ({len(telemetry_files)})",
+                    reason=(
+                        "A secret next to a client-telemetry ingestion endpoint "
+                        "(e.g. *.client-telemetry.<vendor>/enqueue). Client-side telemetry keys "
+                        "are publishable by design (like a Sentry DSN) — they can only write to "
+                        "the vendor's telemetry firehose — so it is flagged for review, not "
+                        f"scored: {shown}."
+                    ),
+                    file=telemetry_files[0],
+                )
+            )
+        if docsearch_files:
+            shown = ", ".join(docsearch_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Public DocSearch search key ({len(docsearch_files)})",
+                    reason=(
+                        "A 32-hex key next to an Algolia app id / index name is a public "
+                        "DocSearch search-only key (read-only, safe to embed), not a leaked "
+                        f"secret; flagged for review, not scored: {shown}."
+                    ),
+                    file=docsearch_files[0],
+                )
+            )
+        return ScanResult(findings=findings, needs_review=needs_review)
+
+    @classmethod
+    def _add_credential_file(cls, f, evidence: list[Evidence], seen: set[tuple[str, int]]) -> None:
+        """Emit the whole content of a credential-only file as one redacted secret."""
+        value = f.text.strip()
+        if len(value) < _MIN_CREDENTIAL_FILE_LEN or _is_non_credential_value(value):
+            return
+        start = f.text.find(value)
+        cls._add_span(f, start, start + len(value), value, evidence, seen)
+
+    @classmethod
+    def _add(cls, f, m, value, evidence: list[Evidence], seen: set[tuple[str, int]]) -> None:
+        cls._add_span(f, m.start(), m.end(), value, evidence, seen)
 
     @staticmethod
-    def _add(f, m, value, evidence: list[Evidence], seen: set[tuple[str, int]]) -> None:
-        ev = f.evidence_for_span(m.start(), m.end())
+    def _add_span(
+        f, start: int, end: int, value, evidence: list[Evidence], seen: set[tuple[str, int]]
+    ) -> None:
+        ev = f.evidence_for_span(start, end)
         key = (ev.file, ev.line_start)
         if key in seen:
             return
@@ -137,5 +424,8 @@ class SecretsScanner(Scanner):
                 line_start=ev.line_start,
                 line_end=ev.line_end,
                 snippet=_redact(ev.snippet, value),
+                # Preserve the match offset (only the snippet is redacted) so code-context and
+                # inline-test demotion can locate this secret within the source.
+                match_offset=ev.match_offset,
             )
         )

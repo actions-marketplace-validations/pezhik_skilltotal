@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from skilltotal.models import Evidence
+from skilltotal.text_normalize import normalize_with_map
 
 
 def _matches_any(relpath: str, patterns: tuple[str, ...]) -> bool:
@@ -33,6 +34,12 @@ SKIP_DIRS: frozenset[str] = frozenset(
         ".hg",
         ".svn",
         "node_modules",
+        # Vendored third-party dependency trees (Go modules, PHP Composer, some JS): the
+        # component's OWN authored behavior is what we analyze, not the code of its bundled
+        # dependencies — exactly the reason node_modules is skipped. Without this, a project
+        # that vendors the Go cloud SDKs (e.g. wandb: core/vendor/cloud.google.com, Azure) was
+        # scored on the SDKs' credential-path / header-name-constant code, not its own.
+        "vendor",
         "__pycache__",
         ".venv",
         "venv",
@@ -40,27 +47,198 @@ SKIP_DIRS: frozenset[str] = frozenset(
         ".tox",
         ".mypy_cache",
         ".pytest_cache",
-        "dist",
-        "build",
         ".idea",
         ".vscode",
         "site-packages",
+        # Generated coverage reports: coverage.py / nyc render the project's OWN source as HTML
+        # (double-counting every finding already scanned in the real source) plus scaffolding —
+        # a build artifact, never first-party code (gcsfs ships coverage_html_report/).
+        "htmlcov",
+        "coverage_html_report",
     }
 )
+
+
+# Build-output directories, skipped for a REPOSITORY and scanned for a PUBLISHED PACKAGE.
+#
+# In a repo these hold emitted copies of first-party source that is also checked in, so scanning
+# them double-counts every finding. A published npm tarball is the mirror image: `.npmignore` /
+# `files` keep the sources out and ship only the build output, so skipping it scanned nothing but
+# the manifest and the README. That was a silent false negative — the worst failure mode for a
+# scanner — measured across the public MCP registry at 11 of 12 sampled npm packages that reported
+# zero findings while in fact shipping shell execution, network egress or filesystem access.
+BUILD_OUTPUT_DIRS: frozenset[str] = frozenset({"dist", "build"})
+
+
+# A minified/bundled script: code suffixes only, and only when the file is both large and written
+# with almost no line breaks.
+_MINIFIABLE_SUFFIXES: frozenset[str] = frozenset({".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"})
+_MINIFIED_MIN_BYTES = 20_000
+_MINIFIED_AVG_LINE = 500
+
+
+def _is_minified(filename: str, text: str) -> bool:
+    """True for a bundled/minified script, which must not be scanned as first-party source.
+
+    Two reasons, and the first is the important one. Every confirmed finding must carry evidence
+    the reader can check — file, line and snippet. A bundle is one 400 KB line, so its "snippet"
+    is unverifiable noise and its "line 1" is meaningless; reporting findings from it would break
+    the guarantee the product is built on. Second, a bundle inlines its dependencies, so matches
+    there describe libraries rather than the component's own authored behavior — the reason
+    ``node_modules`` is skipped.
+
+    Such files are surfaced as ``needs_review`` instead of silently vanishing: "this component
+    ships a bundle we did not analyze" is itself a fact worth stating, and needs_review never
+    affects the score.
+
+    The test is deliberately narrow — a code suffix, a substantial size, and almost no newlines —
+    so ordinary long-line files (a one-line JSON fixture, a big minified stylesheet) are untouched.
+    """
+    if not filename.lower().endswith(tuple(_MINIFIABLE_SUFFIXES)):
+        return False
+    if len(text) < _MINIFIED_MIN_BYTES:
+        return False
+    return len(text) / max(1, text.count("\n") + 1) > _MINIFIED_AVG_LINE
+
+
+def is_build_output_path(relpath: str) -> bool:
+    """True when the path sits under a build-output directory (``dist/``, ``build/``)."""
+    return any(part in BUILD_OUTPUT_DIRS for part in relpath.replace("\\", "/").split("/"))
+
+
+def _is_skipped_dir(part: str, *, skip_build_output: bool = True) -> bool:
+    """True if a path segment names a directory that never holds first-party source.
+
+    Besides the exact ``SKIP_DIRS`` names, a ``vendored-*`` prefixed directory is a vendored
+    third-party tree by convention (numpy ships ``vendored-meson/`` — the meson build system,
+    complete with meson's own CI scripts), exactly the class ``vendor/`` already covers.
+
+    ``skip_build_output`` additionally skips ``BUILD_OUTPUT_DIRS``; the caller turns it off for a
+    published package artifact, where the build output IS the shipped code.
+    """
+    if skip_build_output and part in BUILD_OUTPUT_DIRS:
+        return True
+    return part in SKIP_DIRS or part.startswith("vendored-")
 
 # Directory segments and filename patterns that indicate non-shipped test code.
 _TEST_DIR_SEGMENTS: frozenset[str] = frozenset(
     {"test", "tests", "__tests__", "__mocks__", "spec", "specs", "e2e"}
 )
-_TEST_FILE_RE = re.compile(r"\.test\.|\.spec\.|^test_|_test\.|^conftest\.py$")
+# A compound segment that still names a test tree: cli-e2e-tests, integration-tests, unit_test,
+# api-spec. The `[-_]` boundary keeps ordinary words out (e.g. "latest" is not a test dir).
+_TEST_SEGMENT_RE = re.compile(r"(?:.*[-_])?(?:tests?|specs?|e2e)")
+# `^tests?\.\w+$`: a file literally named test.py / tests.py / test.ts is test scaffolding by
+# convention even outside a tests/ dir (ragflow's sdk/python/test.py carried a doc-example API
+# key that fed ST-COMBO-EXFIL). `^test(ing)?_?utils?\.`: a `testing_utils.py` / `test_utils.py`
+# module is the project's test-support helpers (transformers' src/transformers/testing_utils.py
+# ships a hardcoded CI `hf_` token). The anchors keep ordinary names (contest.py, testimonials.py,
+# attest.js) out.
+_TEST_FILE_RE = re.compile(
+    r"\.test\.|\.spec\.|^test_|_test\.|^conftest\.py$|^tests?\.\w+$|^test(?:ing)?_?utils?\."
+)
 
 
 def is_test_path(relpath: str) -> bool:
     """True if ``relpath`` looks like test code (not executed by consumers)."""
     parts = relpath.lower().split("/")
-    if any(part in _TEST_DIR_SEGMENTS for part in parts[:-1]):
-        return True
+    for part in parts[:-1]:
+        if part in _TEST_DIR_SEGMENTS or _TEST_SEGMENT_RE.fullmatch(part):
+            return True
     return bool(_TEST_FILE_RE.search(parts[-1]))
+
+
+# Data / evaluation / benchmark corpora: reference data, not the component's executed behavior
+# or its agent-instruction surface. A prompt-injection string in eval_datasets/poisoning.yaml is
+# a *test vector for a detector*, not behavior — analogous to test code, so its evidence is
+# demoted to NeedsReview. Restricted to non-code data files so a real payload dropped as code in
+# such a directory is still scanned and scored (see ``is_data_corpus_path``).
+_DATA_CORPUS_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "fixtures", "fixture", "testdata", "test-data", "test_data",
+        "eval", "evals", "eval_datasets", "eval-datasets", "evaluation", "evaluations",
+        "benchmark", "benchmarks", "datasets", "dataset",
+        "golden", "goldens", "snapshots", "__snapshots__", "corpus", "corpora",
+    }
+)
+# Executable code suffixes. Evidence in these is NEVER treated as inert corpus data, even inside
+# a corpus directory — a real payload must not hide under fixtures/ or eval_datasets/.
+_CODE_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".sh", ".bash", ".zsh",
+        ".rb", ".go", ".rs", ".java", ".php", ".pl", ".lua", ".ps1", ".bat", ".cmd",
+        ".c", ".cpp", ".cc", ".h", ".hpp",
+    }
+)
+
+
+def is_data_corpus_path(relpath: str) -> bool:
+    """True if ``relpath`` is an inert data/eval/benchmark corpus file (not executed code).
+
+    Requires BOTH a corpus directory segment AND a non-code file suffix, so reference data
+    (``.yaml``/``.json``/``.jsonl``/``.csv``/``.md`` …) is demoted while any executable code in
+    the same tree is still scanned and scored.
+    """
+    parts = relpath.lower().split("/")
+    if not any(part in _DATA_CORPUS_SEGMENTS for part in parts[:-1]):
+        return False
+    name = parts[-1]
+    dot = name.rfind(".")
+    suffix = name[dot:] if dot > 0 else ""
+    return suffix not in _CODE_SUFFIXES
+
+
+# Example / demo / benchmark scaffolding: code that ships with a component to *illustrate* or
+# *measure* it, not its primary executed behavior. Unlike data corpora (non-code only), this
+# demotes CODE too — an `examples/slack_example.py` binding 0.0.0.0, a `benchmark/test-project/`
+# with a demo API key, a `.env.example` template — so a component isn't scored on its scaffolding.
+# Like test code, the evidence is routed to needs_review (surfaced, not silenced), so a real
+# payload hidden under examples/ is still reported for a human to review, just not auto-scored.
+_EXAMPLE_DIR_SEGMENTS: frozenset[str] = frozenset(
+    {"example", "examples", "demo", "demos", "sample", "samples", "benchmark", "benchmarks"}
+)
+# .env template files (never a live secret store — they document which vars to set).
+_ENV_TEMPLATE_SUFFIXES: tuple[str, ...] = (
+    ".env.example", ".env.sample", ".env.template", ".env.dist", ".env.local.example",
+)
+
+
+def is_example_path(relpath: str) -> bool:
+    """True if ``relpath`` is example/demo/benchmark scaffolding (incl. code) or a .env template."""
+    parts = relpath.lower().split("/")
+    if any(part in _EXAMPLE_DIR_SEGMENTS for part in parts[:-1]):
+        return True
+    name = parts[-1]
+    return name.endswith(_ENV_TEMPLATE_SUFFIXES) or name == ".env.example"
+
+
+# CI/CD pipeline configuration: executes on the PROJECT'S build service (CircleCI, GitHub
+# Actions, GitLab CI, …), never on the machine of whoever installs or runs the component. A CI
+# job that writes its own ~/.ssh/config to push docs (numpy's .circleci/config.yml) is the
+# project operating its own infrastructure, not component behavior — so, like test code, its
+# evidence is demoted to needs_review (surfaced, not scored). Install-time hooks (setup.py,
+# npm postinstall) are NOT CI config and stay fully scored.
+_CI_DIR_SEGMENTS: frozenset[str] = frozenset(
+    {".circleci", ".buildkite", ".woodpecker", "cloudbuild"}
+)
+_CI_EXACT_NAMES: frozenset[str] = frozenset(
+    {
+        ".gitlab-ci.yml", ".travis.yml", "appveyor.yml", ".appveyor.yml",
+        "azure-pipelines.yml", ".cirrus.yml", ".drone.yml", "jenkinsfile",
+    }
+)
+
+
+def is_ci_path(relpath: str) -> bool:
+    """True if ``relpath`` is CI/CD pipeline configuration (runs on the project's CI, not for
+    the component's consumers)."""
+    parts = relpath.lower().split("/")
+    if any(part in _CI_DIR_SEGMENTS for part in parts[:-1]):
+        return True
+    # .github/workflows/* — the pair, not bare "workflows" (too generic a segment on its own).
+    for i in range(len(parts) - 2):
+        if parts[i] == ".github" and parts[i + 1] == "workflows":
+            return True
+    return parts[-1] in _CI_EXACT_NAMES
 
 
 # Human-facing documentation / metadata: prose and ignore-files that are never executed and
@@ -108,7 +286,9 @@ def is_doc_path(relpath: str) -> bool:
     if suffix not in _PROSE_SUFFIXES:
         return False
     stem = name[: name.rindex(".")] if suffix else name
-    return any(word in _DOC_KEYWORDS for word in re.split(r"[_-]", stem))
+    # Split on `.` too so a localized/variant doc keeps its keyword: README.zh-CN.md ->
+    # ["readme","zh","cn"], CHANGELOG.fr.md -> ["changelog","fr"].
+    return any(word in _DOC_KEYWORDS for word in re.split(r"[._-]", stem))
 
 
 # Token types that count as "inside a string" for code-context demotion (f-string parts are
@@ -125,6 +305,282 @@ def _offset_in_spans(spans: list[tuple[int, int]] | None, offset: int) -> bool:
         if start <= offset < end:
             return True
     return False
+
+
+# C-family languages whose `//` and `/* */` comments are demotable code-context (a pattern that
+# only appears in a comment is a doc/description, not executed behavior). String literals are NOT
+# demoted for these by default (unlike Python) — a credential path passed as a string argument is
+# real access. A rule may opt into demoting C-family string literals too, via the
+# ``strings_and_comments_all`` code-context policy (used by ST-PROMPT-INJECTION: an injection phrase
+# inside a Go/JS/Rust value-string is a pattern definition/description, not a live directive).
+_C_FAMILY_SUFFIXES: frozenset[str] = frozenset(
+    {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".cc", ".cpp",
+     ".h", ".hpp"}
+)
+
+
+def _c_comment_spans(text: str) -> list[tuple[int, int]]:
+    """Char-spans of ``//`` line and ``/* */`` block comments in C-family source.
+
+    String-aware (skips ``'…'``/``"…"``/`` `…` `` with backslash escapes) so a ``//`` or ``/*``
+    inside a string literal is not mistaken for a comment. Best-effort and stdlib-only; template
+    ``${…}`` interpolation is treated as opaque string content (worst case: no demotion).
+    """
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in ("'", '"', "`"):
+            quote = c
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "/":
+                start = i
+                i += 2
+                while i < n and text[i] != "\n":
+                    i += 1
+                spans.append((start, i))
+                continue
+            if nxt == "*":
+                start = i
+                i += 2
+                while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                    i += 1
+                i = min(n, i + 2)
+                spans.append((start, i))
+                continue
+        i += 1
+    return spans
+
+
+def _c_string_spans(text: str) -> list[tuple[int, int]]:
+    """Char-spans of ``'…'``/``"…"``/`` `…` `` string literals in C-family source.
+
+    The mirror image of :func:`_c_comment_spans`: comment-aware (skips ``//`` line and ``/* */``
+    block comments) so a quote inside a comment does not open a bogus string, and it RECORDS the
+    string spans instead of skipping them. Same best-effort escape handling and stdlib-only
+    approach; template ``${…}`` interpolation is treated as opaque string content (worst case: the
+    whole template counts as one string span). Used only by the ``strings_and_comments_all``
+    code-context policy (ST-PROMPT-INJECTION).
+    """
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in ("'", '"', "`"):
+            quote = c
+            start = i
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            spans.append((start, i))
+            continue
+        if c == "/" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "/":
+                i += 2
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if nxt == "*":
+                i += 2
+                while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                    i += 1
+                i = min(n, i + 2)
+                continue
+        i += 1
+    return spans
+
+
+# Rust unit tests live INLINE in the same .rs file as production code (gated by `#[cfg(test)]`
+# on a module or `#[test]` on a function), unlike the separate test directories is_test_path
+# recognizes. That gated code is compiled only for `cargo test` and never shipped to consumers,
+# so a credential-looking string there is a test fixture, not behavior. We locate those spans so
+# the engine can demote evidence inside them exactly as it demotes path-based test code.
+# `#[cfg(not(test))]` (code compiled when NOT testing) is deliberately NOT matched.
+_RUST_TEST_FN_ATTR = r"#\[\s*(?:[A-Za-z_]\w*\s*::\s*)*test\s*\]"
+_RUST_CFG_TEST_ATTR = r"#!?\[\s*cfg\s*\(\s*(?:all\s*\(|any\s*\()?\s*test\b"
+_RUST_TEST_MARKER = re.compile(f"{_RUST_TEST_FN_ATTR}|{_RUST_CFG_TEST_ATTR}")
+_RUST_BLOCK_ITEM = re.compile(r"\b(?:fn|mod)\b")
+_RUST_MARKER_LOOKAHEAD = 400  # max chars from a test attribute to its block body `{`
+
+
+# Markdown fenced-code delimiters. Only a FENCED block counts as code: inline backticks sit in a
+# sentence ("example values (Stripe's docs `sk_live_…`)"), which is still prose.
+_MARKDOWN_SUFFIXES: frozenset[str] = frozenset({".md", ".mdx"})
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _markdown_code_spans(text: str) -> list[tuple[int, int]]:
+    """Char-spans of fenced code blocks in markdown.
+
+    An unclosed fence runs to end of file, which is how renderers treat it too.
+    """
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    start: int | None = None
+    marker = ""
+    for line in text.splitlines(keepends=True):
+        match = _FENCE_RE.match(line)
+        if start is None:
+            if match:
+                start, marker = offset, match.group(1)[0]
+        elif match and match.group(1)[0] == marker:
+            spans.append((start, offset + len(line)))
+            start = None
+        offset += len(line)
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
+def _rust_code_mask(text: str) -> str:
+    """Return ``text`` with comment / string / char-literal regions blanked to spaces.
+
+    Length and newlines are preserved so offsets stay identical to the original. Blanking the
+    non-code regions lets :func:`_rust_test_spans` count ``{``/``}`` and find attribute markers
+    without being fooled by braces — or the word ``test`` — inside strings or comments. Handles
+    ``//`` and (nesting) ``/* */`` comments, ``"…"`` and raw ``r#"…"#`` strings, and char/byte
+    literals, while leaving Rust lifetimes (``'a``) untouched. Best-effort, stdlib-only.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+
+    def blank(a: int, b: int) -> None:
+        for p in range(a, b):
+            if out[p] != "\n":
+                out[p] = " "
+
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":  # line comment
+            j = i
+            while j < n and text[j] != "\n":
+                j += 1
+            blank(i, j)
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":  # block comment (Rust nests)
+            depth, j = 1, i + 2
+            while j < n and depth > 0:
+                if text[j] == "/" and j + 1 < n and text[j + 1] == "*":
+                    depth += 1
+                    j += 2
+                    continue
+                if text[j] == "*" and j + 1 < n and text[j + 1] == "/":
+                    depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            blank(i, j)
+            i = j
+            continue
+        if c == "r" and i + 1 < n and text[i + 1] in ('"', "#"):  # raw string r#"…"#
+            j, hashes = i + 1, 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                close = '"' + "#" * hashes
+                end = text.find(close, j + 1)
+                end = n if end == -1 else end + len(close)
+                blank(i, end)
+                i = end
+                continue
+        if c == '"':  # normal / byte string
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            blank(i, j)
+            i = j
+            continue
+        if c == "'":  # char literal ('x', '\n', '\u{..}') -> blank; lifetime ('a) -> keep
+            if i + 1 < n and text[i + 1] == "\\":
+                j = i + 2
+                while j < n and text[j] not in ("'", "\n"):
+                    j += 1
+                if j < n and text[j] == "'":
+                    j += 1
+                blank(i, j)
+                i = j
+                continue
+            if i + 2 < n and text[i + 2] == "'":
+                blank(i, i + 3)
+                i += 3
+                continue
+            i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _match_brace(masked: str, open_pos: int) -> int:
+    """Index just past the ``}`` matching the ``{`` at ``masked[open_pos]`` (len on imbalance)."""
+    depth, i, n = 0, open_pos, len(masked)
+    while i < n:
+        ch = masked[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _rust_test_spans(text: str) -> list[tuple[int, int]]:
+    """Char-spans of inline Rust test code (``#[cfg(test)] mod`` / ``#[test] fn`` blocks)."""
+    masked = _rust_code_mask(text)
+    spans: list[tuple[int, int]] = []
+    for m in _RUST_TEST_MARKER.finditer(masked):
+        brace = masked.find("{", m.end(), m.end() + _RUST_MARKER_LOOKAHEAD)
+        if brace == -1:
+            continue
+        if not _RUST_BLOCK_ITEM.search(masked, m.end(), brace):
+            continue  # attribute on a non-block item (use/const) -> no body to demote
+        spans.append((m.start(), _match_brace(masked, brace)))
+    return spans
+
+
+def _unquoted_hash_index(line: str) -> int | None:
+    """Index of the first shell comment ``#`` in ``line``, or None.
+
+    A ``#`` starts a comment only when it is unquoted and at the start of the line or preceded by
+    whitespace (``echo "a # b"`` and ``x=a#b`` are not comments). Single-line tracking is enough
+    for evidence demotion; heredocs/line-continuations are out of scope (worst case: no demotion).
+    """
+    in_single = in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double and (i == 0 or line[i - 1] in " \t"):
+            return i
+    return None
 
 
 # Hidden / deceptive code points neutralized in DISPLAYED snippets (Trojan-Source defense): a
@@ -173,6 +629,45 @@ class IndexedFile:
     # Lazily-computed char-spans of Python string literals / comments (None = not yet computed).
     _str_spans: list[tuple[int, int]] | None = field(default=None, repr=False, compare=False)
     _comment_spans: list[tuple[int, int]] | None = field(default=None, repr=False, compare=False)
+    # Lazily-computed char-spans of shell (#) comments, for non-Python code-context demotion.
+    _sh_comment_spans: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed char-spans of C-family (// and /* */) comments.
+    _c_comment_spans_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed char-spans of C-family string literals ('…'/"…"/`…`).
+    _c_string_spans_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed char-spans of markdown fenced code blocks.
+    _md_code_spans_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed char-spans of inline Rust test code (#[cfg(test)] / #[test] blocks).
+    _rust_test_spans_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed de-obfuscation result: None until computed; (None,) once computed as
+    # identity; ((norm, idx),) once computed with a real change. The 1-tuple wrapper
+    # distinguishes "not yet computed" from "computed: identity".
+    _norm_cache: tuple[tuple[str, list[int]] | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def normalized_or_none(self) -> tuple[str, list[int]] | None:
+        """De-obfuscated ``(normalized_text, index_map)``, or None when normalization is the
+        identity (the common, pure-ASCII case).
+
+        Cached: normalization is a per-character Python loop and MULTIPLE scanners ask for it
+        (prompt-surface strong patterns, MCP code surfaces); without the cache each rule
+        re-normalized every file on every call — minutes of wall clock on a large repo.
+        """
+        if self._norm_cache is None:
+            norm, idx = normalize_with_map(self.text)
+            self._norm_cache = ((norm, idx),) if norm and norm != self.text else (None,)
+        return self._norm_cache[0]
 
     @property
     def name(self) -> str:
@@ -223,6 +718,113 @@ class IndexedFile:
         """True if ``offset`` falls inside a Python comment (Python files only)."""
         self._ensure_code_spans()
         return _offset_in_spans(self._comment_spans, offset)
+
+    def _ensure_sh_comment_spans(self) -> None:
+        """Record shell (#) comment char-spans once, for ``.sh``/``.bash``/``.zsh`` files."""
+        if self._sh_comment_spans is not None:
+            return
+        spans: list[tuple[int, int]] = []
+        if self.suffix in (".sh", ".bash", ".zsh"):
+            offset = 0
+            for line in self.text.splitlines(keepends=True):
+                hash_idx = _unquoted_hash_index(line)
+                if hash_idx is not None:
+                    spans.append((offset + hash_idx, offset + len(line)))
+                offset += len(line)
+        self._sh_comment_spans = spans
+
+    def in_shell_comment(self, offset: int) -> bool:
+        """True if ``offset`` falls inside a shell ``#`` comment (shell files only)."""
+        self._ensure_sh_comment_spans()
+        return _offset_in_spans(self._sh_comment_spans, offset)
+
+    def _ensure_md_code_spans(self) -> None:
+        """Record markdown fenced-code char-spans once, for markdown files only."""
+        if self._md_code_spans_cache is not None:
+            return
+        self._md_code_spans_cache = (
+            _markdown_code_spans(self.text) if self.suffix in _MARKDOWN_SUFFIXES else []
+        )
+
+    def in_markdown_prose(self, offset: int) -> bool:
+        """True if ``offset`` is markdown PROSE — inside a .md/.mdx file, outside any fenced block.
+
+        Prose describes behaviour rather than performing it: "credentials live in
+        ~/.aws/credentials" is a sentence, while the same path inside a ```bash``` block is
+        configuration the component ships. Returns False for non-markdown files, so callers can
+        invoke it unconditionally.
+        """
+        if self.suffix not in _MARKDOWN_SUFFIXES:
+            return False
+        self._ensure_md_code_spans()
+        return not _offset_in_spans(self._md_code_spans_cache, offset)
+
+    def in_markdown_fenced_comment(self, offset: int) -> bool:
+        """True if ``offset`` sits on a ``#`` comment line INSIDE a markdown fenced block.
+
+        A fenced block is what the component ships, but a comment inside it is still a comment:
+        ``# credentials live in ~/.aws/credentials`` inside a ```bash``` block documents the
+        snippet, exactly as the same line would in a .sh file (which ``in_shell_comment``
+        already demotes).
+        """
+        if self.suffix not in _MARKDOWN_SUFFIXES:
+            return False
+        self._ensure_md_code_spans()
+        if not _offset_in_spans(self._md_code_spans_cache, offset):
+            return False
+        line_no = self.line_of_offset(offset)
+        hash_at = _unquoted_hash_index(self._line_text(line_no))
+        if hash_at is None:
+            return False
+        return self._line_starts[line_no - 1] + hash_at <= offset
+
+    def _ensure_c_comment_spans(self) -> None:
+        """Record C-family (// and /* */) comment char-spans once, for C-family files only."""
+        if self._c_comment_spans_cache is not None:
+            return
+        self._c_comment_spans_cache = (
+            _c_comment_spans(self.text) if self.suffix in _C_FAMILY_SUFFIXES else []
+        )
+
+    def in_c_comment(self, offset: int) -> bool:
+        """True if ``offset`` falls inside a C-family ``//`` or ``/* */`` comment.
+
+        Returns False for non-C-family files, so callers can invoke it unconditionally.
+        """
+        self._ensure_c_comment_spans()
+        return _offset_in_spans(self._c_comment_spans_cache, offset)
+
+    def _ensure_c_string_spans(self) -> None:
+        """Record C-family string-literal char-spans once, for C-family files only."""
+        if self._c_string_spans_cache is not None:
+            return
+        self._c_string_spans_cache = (
+            _c_string_spans(self.text) if self.suffix in _C_FAMILY_SUFFIXES else []
+        )
+
+    def in_c_string(self, offset: int) -> bool:
+        """True if ``offset`` falls inside a C-family string literal ('…'/"…"/`…`).
+
+        Returns False for non-C-family files, so callers can invoke it unconditionally.
+        """
+        self._ensure_c_string_spans()
+        return _offset_in_spans(self._c_string_spans_cache, offset)
+
+    def _ensure_rust_test_spans(self) -> None:
+        """Record inline Rust test-block char-spans once, for ``.rs`` files only."""
+        if self._rust_test_spans_cache is not None:
+            return
+        self._rust_test_spans_cache = (
+            _rust_test_spans(self.text) if self.suffix == ".rs" else []
+        )
+
+    def in_rust_test(self, offset: int) -> bool:
+        """True if ``offset`` falls inside inline Rust test code (#[cfg(test)] / #[test]).
+
+        Returns False for non-Rust files, so callers can invoke it unconditionally.
+        """
+        self._ensure_rust_test_spans()
+        return _offset_in_spans(self._rust_test_spans_cache, offset)
 
     def line_of_offset(self, offset: int) -> int:
         """Return the 1-based line number containing ``offset``."""
@@ -288,20 +890,41 @@ class IndexedFile:
 class FileIndex:
     """An immutable, pre-walked view of a component directory."""
 
-    def __init__(self, root: Path, files: list[IndexedFile], stats: dict[str, int]):
+    def __init__(
+        self,
+        root: Path,
+        files: list[IndexedFile],
+        stats: dict[str, int],
+        minified: list[str] | None = None,
+    ):
         self.root = root
         self.files = files
         self.stats = stats
+        # Relative paths of shipped bundles that were deliberately not indexed (see _is_minified).
+        self.minified = minified or []
 
     # ------------------------------------------------------------------ build
     @classmethod
-    def build(cls, root: Path, *, exclude: Iterable[str] | None = None) -> FileIndex:
+    def build(
+        cls,
+        root: Path,
+        *,
+        exclude: Iterable[str] | None = None,
+        skip_build_output: bool = True,
+    ) -> FileIndex:
         root = Path(root).resolve()
         files: list[IndexedFile] = []
-        stats = {"indexed": 0, "skipped_binary": 0, "skipped_large": 0, "total_seen": 0}
+        minified: list[str] = []
+        stats = {
+            "indexed": 0,
+            "skipped_binary": 0,
+            "skipped_large": 0,
+            "skipped_minified": 0,
+            "total_seen": 0,
+        }
         excludes = tuple(exclude or ())
 
-        for path in cls._walk(root, excludes):
+        for path in cls._walk(root, excludes, skip_build_output=skip_build_output):
             stats["total_seen"] += 1
             try:
                 size = path.stat().st_size
@@ -324,6 +947,10 @@ class FileIndex:
             # unaffected.
             if text.startswith("\ufeff"):
                 text = text[1:]
+            if _is_minified(path.name, text):
+                stats["skipped_minified"] += 1
+                minified.append(path.relative_to(root).as_posix())
+                continue
             files.append(
                 IndexedFile(
                     path=path,
@@ -335,15 +962,19 @@ class FileIndex:
             stats["indexed"] += 1
 
         files.sort(key=lambda f: f.relpath)
-        return cls(root, files, stats)
+        return cls(root, files, stats, sorted(minified))
 
     @staticmethod
-    def _walk(root: Path, exclude: tuple[str, ...] = ()) -> Iterator[Path]:
+    def _walk(
+        root: Path, exclude: tuple[str, ...] = (), *, skip_build_output: bool = True
+    ) -> Iterator[Path]:
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
             rel = path.relative_to(root)
-            if any(part in SKIP_DIRS for part in rel.parts):
+            if any(
+                _is_skipped_dir(part, skip_build_output=skip_build_output) for part in rel.parts
+            ):
                 continue
             if exclude and _matches_any(rel.as_posix(), exclude):
                 continue

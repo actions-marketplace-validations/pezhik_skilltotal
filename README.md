@@ -1,3 +1,5 @@
+<!-- mcp-name: ai.skilltotal/skilltotal -->
+
 # SkillTotal
 
 [![PyPI](https://img.shields.io/pypi/v/skilltotal)](https://pypi.org/project/skilltotal/)
@@ -37,7 +39,29 @@ files inside the component.
 - **Deterministic** — regex + AST, no LLM in the static engine; the same input always yields
   the same report.
 - **Evidence-anchored & low false-positive** — every finding points at an exact file:line.
+- **Standards-aligned** — every component gets a behavioral **trait fingerprint** mapped to the
+  **Cloud Security Alliance (CSA)** agentic threat model, **MAESTRO** threat-model layers, and
+  **MITRE ATLAS** tactics — including a three-way *execution-context* read (embedded static
+  credential → delegated OAuth/OIDC → least-privilege scoped identity) that shows the blast radius
+  of a compromise, not just that a secret exists.
 - **Free and open source** (Apache-2.0) — the full static report is free, forever.
+
+## Measured, not asserted
+
+Detection claims are cheap, so the numbers behind them are published with the data and the code
+that produced them.
+
+- **[The whole MCP registry, scanned](docs/mcp-registry-survey.md)** — every distinct component in
+  the official registry, 17,535 of them, in one deterministic run.
+  81.5% expose tools to an agent, 65.2% can reach the network, 29.3% can execute shell commands —
+  and the risk distribution underneath is far flatter, because a capability scores zero here.
+  [Raw JSON](docs/mcp-registry-survey.json) · [the harness](tests/manual_eval/survey_registry.py).
+- **[Detection efficacy](docs/efficacy-report.md)** — recall and precision on a labelled corpus,
+  regenerated every release and enforced by CI as a floor.
+- **[Corpus report](docs/corpus-report.md)** — full findings across real published AI components.
+
+Every one of these reproduces: same input, same engine, same output. Nothing is executed and no
+LLM is involved.
 
 ## Install
 
@@ -100,9 +124,25 @@ skilltotal scan ./component --fail-on-score 50
 # Skip paths (repeatable; combined with the config file's `exclude`)
 skilltotal scan ./component --exclude "vendor/*" --exclude "*.min.js"
 
+# Opt-in provenance for npm:/pypi: sources (registry metadata -> needs_review, never scored)
+skilltotal scan npm:some-lib --provenance
+
 # Baseline: snapshot current findings, then suppress them on later scans
 skilltotal scan ./component --write-baseline .skilltotal-baseline.json
 skilltotal scan ./component --baseline .skilltotal-baseline.json --fail-on-high
+
+# Diff two versions of a component: what changed between them?
+# Each side is any scannable source (path/archive/git/npm:/pypi:) or a saved --json report.
+skilltotal diff npm:some-lib@1.2.3 npm:some-lib@1.2.4
+skilltotal diff ./old-checkout ./new-checkout --json
+skilltotal diff old-report.json new-report.json
+# CI gate: fail (exit 2) if the new version INTRODUCES a high/critical finding
+skilltotal diff npm:some-lib@1.2.3 npm:some-lib@1.2.4 --fail-on-new high
+
+# Pre-install guard: allow/block decision (exit 2 on block) you can chain before installing
+skilltotal guard npm:some-mcp-server && claude mcp add some-mcp-server -- npx some-mcp-server
+skilltotal guard --installed            # check every AI component already on this machine
+skilltotal guard npm:x --block-on malicious   # block only on malicious indicators
 
 # Inventory: discover AI components already installed on this machine and scan them
 # (reads agent configs for Claude Desktop/Code, Cursor, Windsurf, VS Code, Gemini, and
@@ -111,6 +151,8 @@ skilltotal inventory
 skilltotal inventory --json
 skilltotal inventory --no-scan          # list only, do not scan
 skilltotal inventory --project .        # also include this project's agent configs
+skilltotal inventory --sbom             # AI-BOM: CycloneDX 1.6 JSON of your agent stack,
+                                        # scan verdicts attached as component properties
 
 # List every detection rule
 skilltotal rules list
@@ -121,6 +163,26 @@ skilltotal rules list --json
 `(rule id, file, code snippet)` — independent of line numbers, so it survives edits.
 Suppressed findings are removed before scoring and do not affect the risk score.
 
+**Diff** reports new / resolved / changed findings, evidence-level additions and removals
+(matched by the same line-independent fingerprint as the baseline, so pure line shifts are
+not noise), capability changes, and the risk-score delta. `--fail-on-new LEVEL` gates only
+on risk the new version *introduces* — existing accepted findings never trip it, so it fits
+upgrade reviews ("is 1.2.4 riskier than the 1.2.3 we already vetted?") without a baseline
+file.
+
+**Guard** is the install-time answer to "should I trust this component right now?".
+Malicious indicators always block; scored risk at/above `--block-on` blocks;
+**capabilities alone never block** — a legitimate MCP server with shell/network access
+passes, so the guard stays quiet enough to leave enabled everywhere (unlike a raw
+`--fail-on high` gate, which would trip on most of the ecosystem's honest capability
+findings).
+
+**Provenance** (`--provenance`, opt-in) adds registry-metadata signals for `npm:` /
+`pypi:` sources: *recently published*, *deprecated / yanked*, *no recent releases*, *no
+repository link*. Metadata is context about a component, not component content — so these
+signals go to `needs_review` and **never** affect the score or verdict, and the default
+scan stays 100% component-only and offline.
+
 **Project config** (optional) — commit a `.skilltotal.toml` instead of repeating flags
 (CLI flags override it):
 
@@ -130,6 +192,14 @@ fail_on_score = 50         # or gate on the 0-100 risk score
 exclude = ["vendor/*", "*.min.js"]
 ignore = ["ST-NET-PY"]     # rule ids to drop
 baseline = ".skilltotal-baseline.json"
+
+# Per-rule policy: reviewable gate decisions that live in the repo, not in a dashboard.
+[policy]
+"ST-SHELL-PIPE-EXEC" = "block"   # gate trips (exit 2) whenever this rule fires,
+                                 # even with no fail_on configured
+"ST-DYN-PY" = "warn"             # explicit accept-but-show: reported, still counts toward
+                                 # the risk score, but exempt from the fail_on severity gate
+"ST-SENS-WORD" = "ignore"        # suppressed entirely (same effect as `ignore`)
 ```
 
 Suppress a single finding inline with a `# skilltotal:ignore` (or `# skilltotal:ignore[ST-ID]`)
@@ -143,14 +213,14 @@ comment on its line.
 |------|---------|
 | 0 | Success |
 | 1 | Usage / collection error (e.g. path missing, clone failed) |
-| 2 | A configured gate tripped (`--fail-on`/`--fail-on-high` severity, or `--fail-on-score`) |
+| 2 | A configured gate tripped (`--fail-on`/`--fail-on-high` severity, `--fail-on-score`, or `diff --fail-on-new`) |
 
 > **Gate semantics:** `--fail-on`/`--fail-on-high` trip on the **severity of any single finding**,
 > not the aggregate `risk_score`. A component can report `risk_level: low` (score 0) and still fail
 > the gate if it has a high-severity finding — including a powerful *capability* (e.g. shell or
 > network access), which is reported but never scored as malicious. To gate on the score instead,
-> use `--fail-on-score`; to accept known findings, use a baseline or an inline
-> `# skilltotal:ignore[ST-ID]`.
+> use `--fail-on-score`; to accept known findings, use a baseline, an inline
+> `# skilltotal:ignore[ST-ID]`, or a per-rule `[policy]` action (`block` / `warn` / `ignore`).
 
 ## CI / GitHub Action
 
@@ -169,7 +239,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: pezhik/skilltotal@v0.18.0
+      - uses: pezhik/skilltotal@v0.43.0
         with:
           source: .             # a path, a git URL, or an npm:/pypi:<name> spec
           fail-on: high         # fail the build on a high/critical finding (or 'none')
@@ -193,7 +263,7 @@ Run SkillTotal on every commit via [pre-commit](https://pre-commit.com):
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pezhik/skilltotal
-    rev: v0.18.0
+    rev: v0.43.0
     hooks:
       - id: skilltotal
         args: [".", "--fail-on-high"]   # scan the repo; block the commit on a high/critical finding
@@ -201,6 +271,21 @@ repos:
 
 Then `pre-commit install`. The hook installs the CLI in its own environment and scans the repo
 on commit; tune the scan with the same flags as the CLI (e.g. `--exclude`, `--fail-on`).
+
+### Use as an MCP server
+
+Let your agent check a component *before* installing it. `skilltotal mcp` runs the engine
+as a stdio MCP server (stdlib-only, still zero dependencies) — register it in Claude
+Code/Desktop, Cursor, Windsurf, or any MCP client:
+
+```json
+{ "mcpServers": { "skilltotal": { "command": "skilltotal", "args": ["mcp"] } } }
+```
+
+Tools exposed: `scan_component` (full report for a path / git URL / `npm:` / `pypi:`
+source), `diff_components` (upgrade review: what changed between two versions), and
+`list_rules`. Scans run locally with the same never-execute static engine — the component's
+code is not uploaded anywhere.
 
 ### Add a status badge
 
@@ -300,7 +385,8 @@ Runtime behavior and sandbox analysis are planned for **SkillTotal Cloud** (paid
 
 A normalized report containing the component identity, a **risk score (0–100)** and
 **risk level** (low / medium / high / critical), detected **capabilities** (each
-evidence-backed), **findings**, **needs_review**, and **metadata**. See
+evidence-backed), a behavioral **trait fingerprint** (with a CSA / MAESTRO / MITRE ATLAS
+crosswalk), **findings**, **needs_review**, and **metadata**. See
 [docs/report-schema.md](docs/report-schema.md) and [docs/scoring.md](docs/scoring.md).
 
 Every finding also carries its **OWASP Agentic Skills Top 10** category ids (`owasp`), emitted in
@@ -309,6 +395,13 @@ both the JSON report and SARIF (native `taxonomies`/`relationships`);
 (AST01–AST05) and the honest gaps. For MCP servers,
 [docs/mcp-owasp-mapping.md](docs/mcp-owasp-mapping.md) maps SkillTotal's checks to the OWASP MCP
 Security Cheat Sheet (and names the runtime controls a static engine can't cover).
+
+The report's **`traits`** array is a behavioral fingerprint — a higher-level projection over the
+findings (e.g. `execution_authority`, `embedded_credential`, `untrusted_perception`, and the
+*emergent* `exfil_correlation` combination) — each mapped to the Cloud Security Alliance
+trait-based model, a MAESTRO threat-model layer, and a MITRE ATLAS tactic where there is an honest
+fit. It is descriptive and never affects the score; see
+[docs/trait-crosswalk.md](docs/trait-crosswalk.md).
 
 ## Architecture
 

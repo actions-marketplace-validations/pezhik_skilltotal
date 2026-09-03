@@ -102,7 +102,12 @@ collector.py → file_index.py → scanners/* → capabilities.py + scoring.py �
 - **Test-code demotion** — `engine._split_test_evidence` (using `file_index.is_test_path`)
   moves evidence found only in test code (`__tests__/`, `*.test.*`, `tests/`, `conftest.py`,
   …) into `needs_review`, so test code never drives capabilities or the score. Findings with
-  both prod and test evidence keep only the prod evidence.
+  both prod and test evidence keep only the prod evidence. It also catches **inline Rust unit
+  tests** (`IndexedFile.in_rust_test`): code under `#[cfg(test)]`/`#[test]` lives in a normal
+  `.rs` source path `is_test_path` can't see, yet compiles only for `cargo test` and never ships,
+  so a fake key/path there is a fixture (`_rust_test_spans` masks comments/strings/char-literals
+  before brace-matching; `#[cfg(not(test))]` is left as prod). This runs before synthesis, so a
+  test-only secret/path can't feed `ST-COMBO-EXFIL`.
 - **`baseline.py`** — fingerprints `(rule id, file, snippet)` (line-independent) to suppress
   accepted findings; `engine.analyze_directory(..., suppress=set)` drops them before scoring.
 - **`sarif.py`** — renders SARIF 2.1.0 (one result per evidence; severity → level +
@@ -120,13 +125,26 @@ collector.py → file_index.py → scanners/* → capabilities.py + scoring.py �
   fired) and `ST-CONVERGENCE` (≥2 distinct malicious-indicator findings co-occur; computed
   *after* `_assign_threat_classes` so classes are final). All synthesized rules are registered in
   `rules.py` with a matching `threat_class` (else `_assign_threat_classes` silently un-scores
-  them).
+  them). **`combinations.py` is the declarative registry** for these four: it owns the ordered
+  list + phase (`PRE_CLASSIFICATION` runs over base findings — exfil before the trifecta it
+  suppresses; `POST_CLASSIFICATION` runs after threat-class assignment — convergence) and a
+  `technique` label per combo (for the public per-technique benchmark); `engine.py` iterates it
+  instead of hardcoding the calls. The detection logic itself still lives in `scoring.py`; adding
+  a combination is a registry entry, not an engine edit. Each combo id is kept in sync with its
+  `RuleSpec` (rules.py) and `ComponentTrait` (traits.py) by `tests/test_combinations.py`.
 - **Evidence-context demotion** — besides test code (`_split_test_evidence`), `engine.py` also
   demotes evidence that is not executed/agent-facing behavior to `needs_review`:
   `_split_doc_evidence` (human-facing docs/prose via `file_index.is_doc_path`; AI-instruction
-  surfaces like `SKILL.md`/manifests stay in scope) and `_split_code_context_evidence` (matches
-  inside Python string-literals/comments, per each rule's `RuleSpec.code_context`). This is why
-  a security scanner does not flag its own pattern literals or a README's example attack.
+  surfaces like `SKILL.md`/manifests stay in scope); `_split_data_corpus_evidence` (inert
+  data/eval/benchmark corpora via `file_index.is_data_corpus_path` — a corpus *data* file like
+  `eval_datasets/poisoning.yaml`, restricted to non-code suffixes so a real code payload there is
+  still scanned); and `_split_code_context_evidence` (matches inside Python string-literals/comments,
+  shell `#` comments, or C-family `//` `/* */` comments (.ts/.js/.go/.rs/…), per each rule's
+  `RuleSpec.code_context`). This is why a security scanner does
+  not flag its own pattern literals, a README's example attack, a `# Usage: curl|bash` comment, or a
+  prompt-injection sample shipped as an eval test vector. `sensitive_paths.py` and `secrets.py`
+  additionally route denylist/guardrail credential paths and public Algolia DocSearch keys to
+  `needs_review` at the scanner level.
 
 ## Conventions
 
@@ -179,5 +197,6 @@ rule → unit test → FP calibration on the trusted corpus → bump `RULESET_VE
 ## Docs
 
 `docs/architecture.md`, `docs/report-schema.md` + `docs/report.schema.json`,
-`docs/scoring.md`, `docs/contributing-rules.md`, `docs/releasing.md`, `docs/open-core.md`.
+`docs/scoring.md`, `docs/trait-crosswalk.md`, `docs/contributing-rules.md`, `docs/releasing.md`,
+`docs/open-core.md`.
 `CHANGELOG.md` / `RULES_CHANGELOG.md` track engine and ruleset changes.
