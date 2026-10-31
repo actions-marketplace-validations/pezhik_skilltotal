@@ -2,75 +2,104 @@
 
 Commands:
     skilltotal scan <source> [--json|--sarif] [--output FILE]
-                             [--fail-on LEVEL | --fail-on-high] [--fail-on-score N]
-                             [--exclude GLOB ...] [--config FILE]
+                             [--fail-on LEVEL|none | --fail-on-high] [--fail-on-score N]
+                             [--fail-on-unanalyzed] [--fail-on-default LEVEL]
+                             [--exclude GLOB ...] [--config FILE | --no-config] [--staged]
                              [--baseline FILE | --write-baseline FILE]
-        <source>: a local directory, a project archive (.zip/.tar.gz/.tgz/.tar) or a single
-        file, a git URL, or an npm:<name> / pypi:<name> package spec.
-        Optional project config: .skilltotal.toml (fail_on, fail_on_score, exclude, ignore,
-        baseline, and a per-rule [policy] table with block/warn/ignore actions). CLI flags
-        override config. Inline `# skilltotal:ignore[ST-ID]` suppresses a finding on its line.
+                             [--sarif-uri-prefix PATH] [--sarif-category NAME]
+        <source>: a local directory, an archive (.zip/.tar.gz/.tgz/.tar/.tar.bz2/.tar.xz,
+        or a .mcpb/.dxt/.whl/.vsix package) or a single file, a git URL, or an
+        npm:<name> / pypi:<name> package spec.
+        Optional project config: .skilltotal.toml (fail_on, fail_on_score, fail_on_unanalyzed,
+        exclude, ignore, baseline, and a per-rule [policy] table with block/warn/ignore
+        actions), read from the current directory (or --config FILE; --no-config ignores it).
+        A config that was applied is named on the console. CLI flags override config. Inline
+        `# skilltotal:ignore[ST-ID]` on a finding's line, or on the line above it, suppresses it
+        when the source is a local directory (never in a fetched package or repository).
     skilltotal diff <old> <new> [--json] [--output FILE] [--fail-on-new LEVEL]
+                                [--fail-on-unanalyzed] [--no-config]
         compare two versions of a component: each side is any scannable source (as in
         `scan`) or a previously saved JSON report. Reports new/resolved findings,
-        evidence-level changes, and capability changes.
+        evidence-level changes, capability changes, and what only the new version's scan
+        could not analyze.
     skilltotal guard <source> [--block-on malicious|high|medium] [--json]
     skilltotal guard --installed [--project DIR] [--block-on ...] [--json]
         pre-install allow/block decision (exit 2 on block): malicious indicators always
         block; scored risk at/above the block level blocks; capabilities alone never do.
-    skilltotal inventory [--json] [--no-scan] [--project DIR]
+        --accept FILE accepts reviewed false positives (one component at one exact version);
+        --write-accept FILE drafts entries for what blocks, each reason left to fill in.
+    skilltotal inventory [--json] [--no-scan] [--project DIR] [--accept FILE]
         discover AI components installed on this machine (agent configs / MCP servers), then scan.
     skilltotal rules list [--json]
     skilltotal mcp
         run SkillTotal as an MCP server on stdio, so agents can scan components before
         installing them (register: {"command": "skilltotal", "args": ["mcp"]}).
+    skilltotal hook claude-code
+        Claude Code PreToolUse hook (used by the SkillTotal plugin): reads the hook event on
+        stdin, scans any package the Bash command would install, and prints the decision.
+        Always exits 0; a failed scan asks the person and never blocks the install, except in
+        CI strict mode (CI or SKILLTOTAL_STRICT set), where what would be asked is denied. A
+        scan that outlasts the wait goes on in the background and keeps its verdict for the
+        next run of the command.
 
 Exit codes:
     0  success
     1  usage / collection error
-    2  a configured gate tripped (scan --fail-on* / diff --fail-on-new)
+    2  a configured gate tripped (scan --fail-on* / diff --fail-on-new), or guard blocked the
+       component
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import json
+import os
+import re
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
 
-from skilltotal import __version__
-from skilltotal.baseline import build_baseline, load_baseline
-from skilltotal.collector import CollectionError
-from skilltotal.config import Config, find_config, load_config
-from skilltotal.diff import diff_reports, max_new_severity
-from skilltotal.engine import analyze
-from skilltotal.guard import BLOCK_LEVELS, DEFAULT_BLOCK_LEVEL, evaluate
-from skilltotal.inventory import discover
-from skilltotal.models import Severity
-from skilltotal.report import (
-    render_diff_json,
-    render_diff_text,
-    render_guard_json,
-    render_guard_text,
-    render_inventory_json,
-    render_inventory_text,
-    render_json,
-    render_rules_json,
-    render_rules_text,
-    render_text,
-)
-from skilltotal.rules import get_rules
-from skilltotal.sarif import render_sarif
+from skilltotal import RULESET_VERSION, __version__, parallel
+from skilltotal.guard import BLOCK_LEVELS, DEFAULT_BLOCK_LEVEL, evaluate, evaluate_installed
+
+# The engine, the collector and the scanners are imported inside the commands that use them:
+# the Claude Code hook starts this CLI before every install-like Bash command the agent runs, and
+# loading the whole engine for a command that turns out to install nothing costs most of a second.
+if TYPE_CHECKING:
+    from skilltotal.accept import AcceptList, Applied
+    from skilltotal.config import Config
+    from skilltotal.hook_scan import Marker, Pending, ScanContinues
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_FAIL_ON_HIGH = 2
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse, except that a usage error exits 1 rather than 2: exit code 2 means a gate tripped,
+    and a CI job must be able to tell a mistyped flag from a component that failed its check.
+
+    Abbreviated options are refused: `--out` taken for `--output` today becomes ambiguous, or
+    another option, the day a flag that starts the same way is added. Subparsers are built by
+    this class too, so the rule covers every command."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str):  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_ERROR, f"{self.prog}: error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="skilltotal",
-        description="AI Component Security Platform — static analysis of AI components.",
+        description="AI Component Security Platform - static analysis of AI components.",
     )
     parser.add_argument("--version", action="version", version=f"skilltotal {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -82,20 +111,43 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "source",
         help=(
-            "Local directory, project archive (.zip/.tar.gz/.tgz/.tar) or single file, "
-            "git URL, or npm:<name> / pypi:<name>."
+            "Local directory, archive (.zip/.tar.gz/.tgz/.tar/.tar.bz2/.tar.xz, "
+            ".mcpb/.dxt/.whl/.vsix) or single file, git URL, or npm:<name> / pypi:<name>."
         ),
     )
-    scan.add_argument("--json", action="store_true", help="Emit JSON to stdout.")
-    scan.add_argument(
+    output_format = scan.add_mutually_exclusive_group()
+    output_format.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON (to stdout, or to --output with a summary on the console).",
+    )
+    output_format.add_argument(
         "--sarif",
         action="store_true",
-        help="Emit SARIF 2.1.0 to stdout (and to --output if given).",
+        help="Emit SARIF 2.1.0 (to stdout, or to --output with a summary on the console).",
     )
     scan.add_argument(
         "--output",
         metavar="FILE",
-        help="Write the report to FILE (SARIF if --sarif, else JSON).",
+        help=(
+            "Write the report to FILE (SARIF if --sarif, else JSON); the console then shows only "
+            "a short summary (verdict, risk, counts). A FILE that is a symbolic link is refused."
+        ),
+    )
+    scan.add_argument(
+        "--sarif-uri-prefix",
+        metavar="PATH",
+        help=(
+            "Prefix every SARIF file location with PATH (e.g. the scanned folder relative to the "
+            "repository root), so Code Scanning alerts point at real files."
+        ),
+    )
+    scan.add_argument(
+        "--sarif-category",
+        metavar="NAME",
+        help=(
+            "Set the SARIF run's automationDetails.id (the Code Scanning category), so two scans "
+            "uploaded from one job do not replace each other's alerts."
+        ),
     )
     scan.add_argument(
         "--baseline",
@@ -105,24 +157,51 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--write-baseline",
         metavar="FILE",
-        help="Write a baseline file covering the current findings, then exit normally.",
+        help=(
+            "Write a baseline file covering the current findings, then exit 0: writing a baseline "
+            "is an adoption step, so no gate is applied."
+        ),
     )
     scan.add_argument(
         "--fail-on-high",
         action="store_true",
-        help="Exit with code 2 if any finding is high or critical (alias for --fail-on high).",
+        help=(
+            "Exit with code 2 on a high or critical finding (alias for --fail-on high). "
+            "Malicious indicators trip it at any severity; capabilities never do."
+        ),
     )
     scan.add_argument(
         "--fail-on",
         metavar="LEVEL",
+        choices=["low", "medium", "high", "critical", "none"],
+        help=(
+            "Exit with code 2 on a finding at or above LEVEL severity: low, medium, high or "
+            "critical. Malicious indicators trip it at any severity; capabilities (what a "
+            "component can do) never do. 'none' turns off every gate the config sets."
+        ),
+    )
+    scan.add_argument(
+        "--fail-on-default",
+        metavar="LEVEL",
         choices=["low", "medium", "high", "critical"],
-        help="Exit with code 2 if any finding is at or above LEVEL severity.",
+        help=(
+            "The --fail-on LEVEL to use only when no --fail-on flag is given and the config sets "
+            "no fail_on or fail_on_score (for wrappers such as the GitHub Action)."
+        ),
     )
     scan.add_argument(
         "--fail-on-score",
         metavar="N",
-        type=int,
+        type=_score_arg,
         help="Exit with code 2 if the risk score is >= N (0-100).",
+    )
+    scan.add_argument(
+        "--fail-on-unanalyzed",
+        action="store_true",
+        help=(
+            "Exit with code 2 if the report says a file, or part of one, could not be analyzed "
+            "(binary files and dependency folders are skipped by design and do not count)."
+        ),
     )
     scan.add_argument(
         "--exclude",
@@ -132,10 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip files matching GLOB (repeatable). Combined with config 'exclude'.",
     )
     scan.add_argument(
-        "--config",
-        metavar="FILE",
-        help="Path to a .skilltotal.toml config (default: auto-discover in the current dir).",
+        "--staged",
+        action="store_true",
+        help=(
+            "Scan what the next commit would contain: the files staged in git's index, not the "
+            "working tree (untracked and ignored files are left out). For pre-commit."
+        ),
     )
+    _config_arguments(scan)
     scan.add_argument(
         "--provenance",
         action="store_true",
@@ -173,7 +256,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["low", "medium", "high", "critical"],
         help=(
             "Exit with code 2 if the new version introduces a finding (or new evidence "
-            "on an existing finding) at or above LEVEL severity."
+            "on an existing finding) at or above LEVEL severity (low, medium, high, critical). "
+            "As with scan --fail-on, malicious indicators trip it at any severity and "
+            "capabilities never do."
+        ),
+    )
+    diff.add_argument(
+        "--fail-on-unanalyzed",
+        action="store_true",
+        help=(
+            "Exit with code 2 if the new version has a file, or part of one, that could not be "
+            "analyzed and the old version did not: a finding that disappeared with it may only "
+            "be out of view."
         ),
     )
     diff.add_argument(
@@ -183,11 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Skip files matching GLOB on both sides (repeatable).",
     )
-    diff.add_argument(
-        "--config",
-        metavar="FILE",
-        help="Path to a .skilltotal.toml config (default: auto-discover in the current dir).",
-    )
+    _config_arguments(diff)
 
     guard = sub.add_parser(
         "guard",
@@ -212,16 +302,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --installed: also check project-local agent configs in DIR.",
     )
     guard.add_argument(
+        "--allow-unchecked",
+        action="store_true",
+        help=(
+            "With --installed: exit 0 even when a component could not be checked (a scan error, "
+            "a remote or unsupported server) or none was found. Without it that exits 1."
+        ),
+    )
+    guard.add_argument(
         "--block-on",
         metavar="LEVEL",
         choices=list(BLOCK_LEVELS),
-        default=DEFAULT_BLOCK_LEVEL,
+        default=None,
         help=(
-            "What blocks (exit 2): 'malicious' = only malicious indicators; "
+            "What blocks (exit 2): 'malicious' = malicious indicators; "
             "'high' (default) = also risk level high/critical; 'medium' = also medium. "
-            "Capabilities alone never block."
+            "At every level an install script that could not be read, a component with nothing "
+            "readable and a name a letter or two from a popular package also block. "
+            "Capabilities alone never block. With --installed, editor extensions default to "
+            "'malicious'."
         ),
     )
+    _installed_arguments(guard, "With --installed: ")
+    _accept_arguments(guard, "blocks")
     guard.add_argument("--json", action="store_true", help="Emit JSON to stdout.")
 
     inv = sub.add_parser(
@@ -243,6 +346,8 @@ def build_parser() -> argparse.ArgumentParser:
     inv.add_argument(
         "--project", metavar="DIR", help="Also look for project-local agent configs in DIR."
     )
+    _installed_arguments(inv, "")
+    _accept_arguments(inv, "flags (high risk, malicious, or blocked by the guard)")
 
     rules = sub.add_parser("rules", help="Inspect the detection rules.")
     rules_sub = rules.add_subparsers(dest="rules_command", required=True)
@@ -257,13 +362,122 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    hook = sub.add_parser(
+        "hook",
+        help="Agent hook entry points (used by the SkillTotal Claude Code plugin).",
+    )
+    agents = hook.add_subparsers(dest="agent", required=True, metavar="agent")
+    claude_code = agents.add_parser(
+        "claude-code",
+        help="Claude Code PreToolUse hook: check what a Bash or PowerShell command installs.",
+        description=HOOK_CLAUDE_CODE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # The two processes a check runs in, started by the hook itself (see skilltotal.hook_scan).
+    claude_code.add_argument("--supervise", metavar="DIR", help=argparse.SUPPRESS)
+    claude_code.add_argument("--scan-into", metavar="DIR", help=argparse.SUPPRESS)
+    claude_code.add_argument(
+        "--protocol", metavar="N", type=int, default=0,
+        help=f"The hook protocol the caller needs (this CLI speaks {HOOK_PROTOCOL}); a higher "
+             f"one exits 1, so the plugin can tell a CLI older than itself.",
+    )
+
     return parser
 
 
+def _installed_arguments(sub: argparse.ArgumentParser, prefix: str) -> None:
+    """The options `inventory` and `guard --installed` share."""
+    sub.add_argument(
+        "--no-extensions",
+        action="store_true",
+        help=prefix + "Leave out editor extensions (VS Code, Cursor, Windsurf, VSCodium); "
+        "scanning them can take minutes.",
+    )
+    sub.add_argument(
+        "--state",
+        metavar="FILE",
+        help=prefix + "Keep each component's version and risk-finding fingerprints in FILE and "
+        "report a component that gained risk findings when its version changed (drift). "
+        "The first run only records.",
+    )
+
+
+def _accept_arguments(sub: argparse.ArgumentParser, flagged: str) -> None:
+    """--accept and --write-accept, which `guard` and `inventory` share."""
+    sub.add_argument(
+        "--accept",
+        metavar="FILE",
+        help="Accept the reviewed false positives FILE lists: each entry names a component, its "
+        "exact version and the fingerprints of the findings accepted, with a reason. Any other "
+        "version or finding is judged as usual.",
+    )
+    sub.add_argument(
+        "--write-accept",
+        metavar="FILE",
+        help=f"Add an entry to FILE for each component this run {flagged}, with an empty "
+        "reason to fill in (FILE is refused until every reason is), and exit 0.",
+    )
+
+
+def _config_arguments(sub: argparse.ArgumentParser) -> None:
+    config = sub.add_mutually_exclusive_group()
+    config.add_argument(
+        "--config",
+        metavar="FILE",
+        help="Path to a .skilltotal.toml config (default: auto-discover in the current dir).",
+    )
+    config.add_argument(
+        "--no-config",
+        action="store_true",
+        help="Ignore any .skilltotal.toml, including one in the current dir.",
+    )
+
+
+def _exit_on_sigterm() -> None:
+    """Make SIGTERM (a cancelled CI job) end the scan like Ctrl-C does: by an exception, so the
+    context managers that remove a cloned repository or an unpacked package still run. The
+    default action kills the process on the spot and leaves them in the temp folder."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        return  # signal handlers can only be set from the main thread
+
+    def _terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _terminate)
+
+
+def _no_lookup_in_current_directory(environ=os.environ, os_name: str = os.name) -> None:
+    """Windows runs a bare program name from the current directory before PATH, so a scan run
+    inside a cloned repository would start a ``git.exe`` committed to it. This variable turns that
+    lookup off for this process and everything it starts."""
+    if os_name == "nt":
+        environ["NoDefaultCurrentDirectoryInExePath"] = "1"
+
+
 def main(argv: list[str] | None = None) -> int:
+    _no_lookup_in_current_directory()  # before anything can start a program
+    # The CLI's main modules are guarded, so a large scan may use worker processes.
+    parallel.enable()
+    # Redirected output on Windows is written in the legacy code page, which cannot encode much of
+    # what a scanned package may contain: a `✓` in one snippet crashed `scan --json > r.json` and
+    # left the file empty. Reports go out as UTF-8 and never fail on their own content.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):  # absent on injected test streams
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
     parser = build_parser()
     args = parser.parse_args(argv)
+    bad = invalid_settings(os.environ)
+    if bad:
+        print(f"error: {bad}", file=sys.stderr)
+        return EXIT_ERROR
 
+    if args.command in ("scan", "diff", "guard", "inventory"):
+        _exit_on_sigterm()
     if args.command == "scan":
         return _cmd_scan(args)
     if args.command == "diff":
@@ -276,30 +490,356 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_rules(args)
     if args.command == "mcp":
         return _cmd_mcp()
+    if args.command == "hook":
+        return _cmd_hook(args)
     parser.error("unknown command")  # pragma: no cover
     return EXIT_ERROR
 
 
-def _cmd_scan(args: argparse.Namespace) -> int:
-    config = _load_config(args)
+def invalid_settings(environ) -> str:
+    """The first whole-number setting in the environment that is not a positive whole number,
+    described; empty when all are fine. Read leniently, `SKILLTOTAL_MAX_ARCHIVE_MB=150mb` crashed
+    the import with a traceback."""
+    from skilltotal.collector import INT_SETTINGS
 
-    baseline_path = args.baseline or config.baseline
+    for name in (*INT_SETTINGS, "SKILLTOTAL_WORKERS"):
+        raw = environ.get(name, "").strip()
+        if raw and not (raw.isdigit() and int(raw) > 0):
+            return f"{name} must be a positive whole number, not {raw!r}"
+    return ""
+
+
+def _emit(text: str) -> None:
+    """Print to stdout; a reader that went away (`| head`) is not an error of the scan."""
+    try:
+        print(text)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Point stdout at nothing so the interpreter's final flush does not raise again.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+
+
+class _ProgressLine:
+    """One line on a terminal that says what a long scan is doing and for how long, rewritten in
+    place and erased at the end. A clock thread keeps the seconds moving while one step runs."""
+
+    def __init__(self, stream) -> None:
+        import threading
+
+        self._stream = stream
+        self._started = time.monotonic()
+        self._message = ""
+        self._width = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._clock = threading.Thread(target=self._tick, daemon=True)
+        self._clock.start()
+
+    def __call__(self, message: str) -> None:
+        with self._lock:
+            self._message = message
+            self._draw()
+
+    def _tick(self) -> None:
+        while not self._stop.wait(1.0):
+            with self._lock:
+                self._draw()
+
+    def _draw(self) -> None:
+        if not self._message:
+            return
+        line = f"{self._message}... {time.monotonic() - self._started:.0f}s"
+        self._stream.write("\r" + line.ljust(self._width))
+        self._stream.flush()
+        self._width = len(line)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._clock.join(timeout=2)
+        with self._lock:
+            if self._width:
+                self._stream.write("\r" + " " * self._width + "\r")
+                self._stream.flush()
+            self._width = 0
+
+
+def _own_report(source: str, output: str | None) -> list[str]:
+    """The report file this scan writes, when it lies inside the folder scanned: a pipeline that
+    runs `scan . --sarif --output skilltotal.sarif` on every build would otherwise read the last
+    build's report, whose rule descriptions quote detection patterns, and fail a clean repository.
+    """
+    if not output:
+        return []
+    try:
+        relpath = Path(output).resolve().relative_to(Path(source).expanduser().resolve())
+    except (OSError, ValueError):
+        return []
+    # An exclude is a glob; a literal file name must not act as one.
+    return ["".join(f"[{c}]" if c in "*?[" else c for c in relpath.as_posix())]
+
+
+class StagedError(Exception):
+    """``--staged`` could not read git's index for the source."""
+
+
+@contextlib.contextmanager
+def _staged_snapshot(source: str):
+    """A temporary copy of what the next commit would contain under ``source`` (a folder in a git
+    work tree): the staged blobs, read with ``git cat-file`` and written by path. The copy keeps
+    the repository's own name, so the component reads as itself; it is removed afterwards."""
+    import subprocess  # nosec B404 - runs git with fixed arguments, never a shell
+    import tempfile
+
+    from skilltotal.collector import find_program
+
+    folder = Path(source).expanduser()
+    if not folder.is_dir():
+        raise StagedError(f"{source} is not a folder")
+    # Never a git from the current directory: the hook runs inside the repository being committed.
+    git = find_program("git")
+    if git is None:
+        raise StagedError("git is not installed")
+
+    # Nothing the repository's own configuration names runs while the index is read: no LFS
+    # download (its .lfsconfig would pick the host git-lfs fetches from), no fsmonitor hook, no
+    # hook from core.hooksPath, no lazy fetch of a missing object (security review, 2026-10-15).
+    # The blobs are read raw, so no smudge or process filter from .git/config runs either:
+    # `git checkout-index` runs them to write a file out.
+    env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_TERMINAL_PROMPT": "0",
+           "GIT_NO_LAZY_FETCH": "1"}
+    with tempfile.TemporaryDirectory(prefix="skilltotal-staged-") as tmp:
+        no_hooks = Path(tmp) / "hooks"
+        no_hooks.mkdir()
+        base = [git, "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={no_hooks}",
+                "-C", str(folder)]
+
+        def run(*argv: str) -> bytes:
+            done = subprocess.run(  # nosec B603 - fixed git arguments, no shell
+                [*base, *argv], capture_output=True, check=False, env=env)
+            if done.returncode != 0:
+                error = os.fsdecode(done.stderr or b"").strip()
+                raise StagedError(error or f"git {argv[0]} failed")
+            return done.stdout
+
+        top = Path(os.fsdecode(run("rev-parse", "--show-toplevel")).strip()).resolve()
+        copy = Path(tmp) / "copy" / (top.name or "repo")
+        target = copy / folder.resolve().relative_to(top)
+        target.mkdir(parents=True)
+        # Run inside `source`, ls-files lists only what is staged under it, relative to it.
+        _write_blobs(base, env, run("ls-files", "--stage", "-z"), target)
+        yield target
+
+
+# What a staged path may not hold on Windows: a device name (`CON`, `aux.txt`) opens the device,
+# and `\` or `:` would read as a separator or a stream there.
+_WINDOWS_DEVICE = re.compile(r"(?i)^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?$")
+
+
+def _staged_parts(path: str) -> list[str] | None:
+    """The components of an index path to write under the copy, or None for one that could
+    leave it or name something else than a file in it."""
+    parts = path.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    if os.name == "nt" and any(
+            "\\" in part or ":" in part or part.endswith((".", " ")) or _WINDOWS_DEVICE.match(part)
+            for part in parts):
+        return None
+    return parts
+
+
+def _write_blobs(base: list[str], env: dict[str, str], listing: bytes, root: Path) -> None:
+    """Write each staged regular file of ``listing`` (``git ls-files --stage -z``) under ``root``,
+    its content read raw with ``git cat-file --batch``. A link (mode 120000), a submodule and an
+    unmerged entry are left out, as the scan of a folder skips links; nothing is ever created
+    except plain folders and files, so no write can be redirected out of ``root``."""
+    import subprocess  # nosec B404 - runs git with fixed arguments, never a shell
+
+    entries = []
+    for record in listing.split(b"\0"):
+        meta, _, raw_path = record.partition(b"\t")
+        fields = meta.split(b" ")
+        if len(fields) != 3 or fields[0] not in (b"100644", b"100755") or fields[2] != b"0":
+            continue
+        parts = _staged_parts(os.fsdecode(raw_path))
+        if parts is not None:
+            entries.append((fields[1], fields[0] == b"100755", root.joinpath(*parts)))
+    if not entries:
+        return
+    with subprocess.Popen(  # nosec B603 - fixed git arguments, no shell
+            [*base, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env) as proc:
+        assert proc.stdin is not None and proc.stdout is not None  # nosec B101 - set by PIPE
+        try:
+            # One object at a time: each answer is read whole before the next is asked for.
+            for sha, executable, dest in entries:
+                proc.stdin.write(sha + b"\n")
+                proc.stdin.flush()
+                header = proc.stdout.readline().split()
+                if len(header) != 3 or header[1] != b"blob":
+                    if not header:
+                        raise StagedError("git cat-file stopped answering")
+                    continue  # missing: nothing to write
+                size = int(header[2])
+                data = proc.stdout.read(size + 1)[:size]  # each object ends with a newline
+                if len(data) != size:
+                    raise StagedError("git cat-file stopped answering")
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(data)
+                    if executable and os.name != "nt":
+                        dest.chmod(0o755)
+                except OSError:
+                    continue  # a path this file system cannot hold
+        finally:
+            proc.stdin.close()
+            proc.stdout.read()
+            proc.wait()
+
+
+# Once a day at most, a scan removes the temporary folders of scans that were killed (a CI job
+# cancelled mid-clone, a hook check timed out): the MCP server does it when it starts, and a
+# machine that only runs the CLI or the hook would otherwise keep them.
+_TEMP_SWEEP_STAMP = "skilltotal-temp-sweep"
+_TEMP_SWEEP_INTERVAL = 24 * 3600
+
+
+def _sweep_stale_temp_dirs_daily(tmp: str | None = None) -> threading.Thread | None:
+    """Start removing stale temporary folders (of ``tmp``, by default the temp directory) in the
+    background, if no sweep ran in the last day; returns the thread doing it. Best effort: it
+    never delays or fails the scan."""
+    import stat
+    import tempfile
+
+    try:
+        tmp = tmp or tempfile.gettempdir()
+        stamp = os.path.join(tmp, _TEMP_SWEEP_STAMP)
+        try:
+            info = os.lstat(stamp)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(info.st_mode) or time.time() - info.st_mtime < _TEMP_SWEEP_INTERVAL:
+                return None  # swept recently, or something else holds the name: leave it alone
+            os.remove(stamp)  # removes a link itself, never what it points at
+        # O_EXCL: created here, never opened through a link someone put in its place.
+        os.close(os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        from skilltotal.mcp_server import remove_stale_temp_dirs
+
+        sweep = threading.Thread(target=remove_stale_temp_dirs, args=(tmp,),
+                                 name="skilltotal-temp-sweep", daemon=True)
+        sweep.start()
+        return sweep
+    except Exception:  # noqa: BLE001  # nosec B110 - housekeeping must never fail a scan
+        return None
+
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    from skilltotal.baseline import build_baseline, load_baseline
+    from skilltotal.collector import CollectionError, classify_source
+    from skilltotal.config import ConfigError
+    from skilltotal.engine import analyze
+    from skilltotal.report import render_json, render_summary_text, render_text
+    from skilltotal.sarif import render_sarif
+
+    _sweep_stale_temp_dirs_daily()
+
+    try:
+        config = _load_config(args)
+    except ConfigError as exc:  # a gate that would silently be off
+        print(f"error: {_diagnostic(str(exc))}", file=sys.stderr)
+        return EXIT_ERROR
+
+    # A report the scan cannot write is known before the scan, which can take minutes.
+    for what, path in (("report", args.output), ("baseline", args.write_baseline)):
+        problem = _output_problem(path) if path else ""
+        if problem:
+            print(f"error: cannot write the {what} to {_one_line(path)}: {problem}",
+                  file=sys.stderr)
+            return EXIT_ERROR
+
+    baseline_path = args.baseline or config.baseline_path()
     suppress: set[str] = set()
     if baseline_path:
+        # A device (`CON`, a FIFO) is never a baseline: reading one waits for input forever.
+        if not Path(baseline_path).is_file() or (
+                os.name == "nt" and _WINDOWS_DEVICE.match(Path(baseline_path).name)):
+            print(f"error: cannot read baseline {_one_line(str(baseline_path))}: not a file",
+                  file=sys.stderr)
+            return EXIT_ERROR
         try:
             suppress = load_baseline(baseline_path)
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"error: cannot read baseline {baseline_path}: {exc}", file=sys.stderr)
+            print(f"error: cannot read baseline {_one_line(str(baseline_path))}: "
+                  f"{_diagnostic(str(exc))}", file=sys.stderr)
             return EXIT_ERROR
 
-    exclude = [*config.exclude, *args.exclude]
+    exclude = [*config.exclude, *args.exclude, *_own_report(args.source, args.output)]
+    # A large package takes minutes (thousands of files): on a terminal, say what is happening so
+    # the wait does not read as a hang. Never in a pipe or a CI log.
+    progress = _ProgressLine(sys.stderr) if sys.stderr.isatty() else None
+    # A `skilltotal:ignore` marker is the code owner's decision. Only a local directory (a
+    # checkout, as in CI) is the person's own code; a fetched package or repository must not be
+    # able to silence its own findings.
+    markers_apply = (classify_source(args.source) == "local"
+                     and Path(args.source).expanduser().is_dir())
     try:
-        report = analyze(
-            args.source, suppress=suppress, ignore_rules=config.ignored_rules(), exclude=exclude
-        )
-    except CollectionError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        with contextlib.ExitStack() as stack:
+            target = args.source
+            if args.staged:
+                target = str(stack.enter_context(_staged_snapshot(args.source)))
+            if progress is not None:
+                progress("Fetching")
+            report = analyze(
+                target, suppress=suppress, ignore_rules=config.ignored_rules(), exclude=exclude,
+                inline_ignores=markers_apply, progress=progress,
+            )
+            report.component.source = args.source  # not the snapshot's temporary path
+    except StagedError as exc:
+        print(f"error: --staged: {_diagnostic(str(exc))}", file=sys.stderr)
         return EXIT_ERROR
+    except CollectionError as exc:
+        from skilltotal.collector import failure_category
+
+        # A repository that does not exist reads as git asking for a password.
+        if failure_category(exc) == "repo-not-found":
+            print(f"error: {_one_line(args.source)}: the repository was not found, or it is "
+                  "private (a private repository needs git credentials)", file=sys.stderr)
+        else:
+            print(f"error: {_diagnostic(str(exc))}", file=sys.stderr)
+        if _joined_by_trailing_backslash(args.source):
+            print("hint: a trailing backslash before the closing quote joined your arguments; "
+                  "drop the trailing \\ (write '.\\my folder', not '.\\my folder\\')",
+                  file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        if progress is not None:
+            progress.close()
+
+    if config.path is not None:
+        # The scanned repository's own config can relax the gate (exclude, ignore, a lower
+        # fail_on): the report and the log always say that one was applied, and what it changes.
+        report.metadata["config_applied"] = {
+            "path": str(config.path),
+            "exclude": len(config.exclude),
+            "ignore": len(config.ignore),
+            "policy": len(config.policy),
+            **({"fail_on": config.fail_on} if config.fail_on else {}),
+            **({"fail_on_score": config.fail_on_score}
+               if config.fail_on_score is not None else {}),
+            # A baseline hides findings from the gate: one the config brings is named with it.
+            **({"baseline": config.baseline} if config.baseline else {}),
+        }
+    if baseline_path:
+        report.metadata["baseline"] = str(baseline_path)
+        silenced = report.metadata.get("baseline_suppressed_malicious") or []
+        if silenced:
+            # The text report says this on its Baseline line; --json and --sarif output would
+            # not, and a CI log has to show that the gate was passed with an indicator hidden.
+            print(f"warning: baseline {_one_line(str(baseline_path))} hides malicious "
+                  f"indicator(s) {', '.join(silenced)}; the verdict and the gate do not see them",
+                  file=sys.stderr)
 
     if args.provenance:
         # Provenance is deliberately a CLI-layer add-on: the engine stays component-only,
@@ -309,7 +849,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         try:
             signals = collect_provenance(args.source)
         except ProvenanceError as exc:
-            print(f"warning: {exc}", file=sys.stderr)
+            print(f"warning: {_diagnostic(str(exc))}", file=sys.stderr)
         else:
             report.needs_review.extend(signals)
             report.metadata["provenance_checked"] = True
@@ -321,169 +861,473 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
     if args.write_baseline:
         doc = build_baseline(report.findings)
-        Path(args.write_baseline).write_text(
-            json.dumps(doc, indent=2), encoding="utf-8"
-        )
+        try:
+            _write_file(args.write_baseline, json.dumps(doc, indent=2))
+        except OSError as exc:
+            print(f"error: cannot write the baseline to {args.write_baseline}: "
+                  f"{exc.strerror or exc}", file=sys.stderr)
+            return EXIT_ERROR
         print(
             f"Baseline with {len(doc['suppressed'])} fingerprint(s) written to "
             f"{args.write_baseline}",
             file=sys.stderr,
         )
+        from skilltotal.models import ThreatClass
+
+        malicious = sorted({f.id for f in report.findings
+                            if f.threat_class is ThreatClass.MALICIOUS_INDICATOR})
+        if malicious:
+            # A baseline is meant for accepted noise; one that accepts a malicious indicator
+            # silences the finding that should stop a merge, from now on.
+            print(f"warning: the baseline accepts malicious indicator(s): {', '.join(malicious)}; "
+                  "check each one is a false positive before you commit it", file=sys.stderr)
 
     # Choose the structured renderer once; reuse for stdout and --output.
     if args.sarif:
-        structured = render_sarif(report)
+        structured = render_sarif(
+            report, uri_prefix=args.sarif_uri_prefix or "", category=args.sarif_category or "")
     else:
         structured = render_json(report)
 
-    if args.sarif or args.json:
-        print(structured)
-    else:
-        print(render_text(report))
-
+    # The file first: whatever happens to the console, the report the caller asked for exists.
     if args.output:
-        Path(args.output).write_text(structured, encoding="utf-8")
+        try:
+            _write_file(args.output, structured)
+        except OSError as exc:
+            print(f"error: cannot write the report to {args.output}: {exc.strerror or exc}",
+                  file=sys.stderr)
+            return EXIT_ERROR
         print(f"Report written to {args.output}", file=sys.stderr)
 
-    level = args.fail_on or ("high" if args.fail_on_high else None) or config.fail_on
-    score = args.fail_on_score if args.fail_on_score is not None else config.fail_on_score
-    if _fails_gate(report, level, score, config.policy):
-        return EXIT_FAIL_ON_HIGH
-    return EXIT_OK
+    # With --output the report is in the file; the console gets a short summary: the verdict, the
+    # risk and the counts (the gate lines follow on stderr). A SARIF document printed too ran to
+    # thousands of lines in a CI log, and so did the full text report next to the file.
+    if args.output:
+        _emit(render_summary_text(report, args.output))
+    elif args.sarif or args.json:
+        if config.path is not None:
+            # The text summary names the config; with a structured report on stdout, the log does.
+            print(f"config applied: {_one_line(config.describe())}", file=sys.stderr)
+        _emit(structured)
+    else:
+        # Inline markers are honored only for a local folder (see `inline_ignores` above).
+        _emit(render_text(report, markers_apply=markers_apply))
+
+    if args.write_baseline:
+        # An adoption step: the findings it records are the ones being accepted.
+        return EXIT_OK
+
+    gate = _scan_gate(args, config)
+    gaps = _unanalyzed(report)
+    if gaps:
+        # Always said in the log, whether or not a gate counts it: with --json or --sarif the
+        # report is all stdout carries (SARIF has no needs_review), and a file the scan did not
+        # read must never pass in silence. Only failing on it is opt-in.
+        print(f"Not everything was analyzed: {'; '.join(gaps)}.", file=sys.stderr)
+    failures = _gate_failures(report, gate.level, gate.score, gate.policy,
+                              level_label=gate.level_label, score_label=gate.score_label)
+    if gaps and gate.unanalyzed:
+        failures.insert(0, f"{gate.unanalyzed_label} tripped")
+    for failure in failures:
+        print(f"gate: {failure}", file=sys.stderr)
+    return EXIT_FAIL_ON_HIGH if failures else EXIT_OK
+
+
+class _Gate(NamedTuple):
+    level: str | None
+    level_label: str
+    score: int | None
+    score_label: str
+    unanalyzed: bool
+    unanalyzed_label: str
+    policy: dict[str, str]
+
+
+def _scan_gate(args: argparse.Namespace, config: Config) -> _Gate:
+    """Which gates apply, and how to name each in the log. Flags override the config;
+    `--fail-on none` turns every gate the config sets off (a flag set alongside still counts);
+    `--fail-on-default` applies only when nothing else sets a severity or score gate."""
+    off = args.fail_on == "none"
+    in_config = f"in {config.path}"
+    level, level_label = None, ""
+    if args.fail_on and not off:
+        level, level_label = args.fail_on, f"--fail-on {args.fail_on}"
+    elif args.fail_on_high:
+        level, level_label = "high", "--fail-on-high"
+    elif config.fail_on and not off:
+        level, level_label = config.fail_on, f'fail_on = "{config.fail_on}" {in_config}'
+    elif (args.fail_on_default and not off and not config.sets_gate()
+          and args.fail_on_score is None):
+        level, level_label = args.fail_on_default, f"--fail-on-default {args.fail_on_default}"
+    if args.fail_on_score is not None:
+        score, score_label = args.fail_on_score, f"--fail-on-score {args.fail_on_score}"
+    elif config.fail_on_score is not None and not off:
+        score = config.fail_on_score
+        score_label = f"fail_on_score = {config.fail_on_score} {in_config}"
+    else:
+        score, score_label = None, ""
+    if args.fail_on_unanalyzed:
+        unanalyzed, unanalyzed_label = True, "--fail-on-unanalyzed"
+    else:
+        unanalyzed = config.fail_on_unanalyzed and not off
+        unanalyzed_label = f"fail_on_unanalyzed = true {in_config}"
+    policy = dict(config.policy)
+    if off:  # a `block` is a gate; `warn` and `ignore` are not
+        policy = {rule: action for rule, action in policy.items() if action != "block"}
+    return _Gate(level, level_label, score, score_label, unanalyzed, unanalyzed_label, policy)
+
+
+def _unanalyzed(report) -> list[str]:
+    """The titles of the needs_review notes that say a file, or a part of one, was not analyzed."""
+    from skilltotal.models import UNANALYZED_TITLES
+
+    return list(dict.fromkeys(n.title for n in report.needs_review if n.title in UNANALYZED_TITLES))
 
 
 def _cmd_diff(args: argparse.Namespace) -> int:
-    config = _load_config(args)
-    exclude = [*config.exclude, *args.exclude]
+    from skilltotal.collector import CollectionError
+    from skilltotal.config import ConfigError
+    from skilltotal.diff import diff_reports
+    from skilltotal.report import render_diff_json, render_diff_text
 
     try:
-        old_report = _resolve_diff_side(args.old, config, exclude)
-        new_report = _resolve_diff_side(args.new, config, exclude)
+        config = _load_config(args)
+    except ConfigError as exc:  # a gate that would silently be off
+        print(f"error: {_diagnostic(str(exc))}", file=sys.stderr)
+        return EXIT_ERROR
+    exclude = [*config.exclude, *args.exclude]
+    problem = _output_problem(args.output) if args.output else ""
+    if problem:  # known before two scans, not after them
+        print(f"error: cannot write the diff report to {_one_line(args.output)}: {problem}",
+              file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        old_report, old_saved = _resolve_diff_side(args.old, config, exclude)
+        new_report, new_saved = _resolve_diff_side(args.new, config, exclude)
     except CollectionError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_diagnostic(str(exc))}", file=sys.stderr)
         return EXIT_ERROR
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"error: cannot read report: {exc}", file=sys.stderr)
+        print(f"error: cannot read report: {_diagnostic(str(exc))}", file=sys.stderr)
         return EXIT_ERROR
 
     diff = diff_reports(old_report, new_report)
+    if config.path is not None:
+        print(f"config applied: {_one_line(config.describe())}", file=sys.stderr)
+    # A saved report is taken as it says: whoever wrote the file wrote its findings. The gate
+    # below compares what the file claims, so the log says that no scan stands behind it.
+    for side, source, saved in (("old", args.old, old_saved), ("new", args.new, new_saved)):
+        if saved:
+            print(f"diff: the {side} side ({_one_line(source)}) was read as a saved SkillTotal "
+                  "report, not scanned; its findings are taken as given", file=sys.stderr)
+
+    if args.output:
+        try:
+            _write_file(args.output, render_diff_json(diff))
+        except OSError as exc:
+            print(f"error: cannot write the diff report to {args.output}: "
+                  f"{exc.strerror or exc}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"Diff report written to {args.output}", file=sys.stderr)
 
     if args.json:
         print(render_diff_json(diff))
     else:
         print(render_diff_text(diff))
 
-    if args.output:
-        Path(args.output).write_text(render_diff_json(diff), encoding="utf-8")
-        print(f"Diff report written to {args.output}", file=sys.stderr)
-
     if args.fail_on_new:
-        worst = max_new_severity(diff)
-        if worst is not None and worst.rank >= Severity[args.fail_on_new.upper()].rank:
+        tripping = _new_risk(diff, args.fail_on_new)
+        if tripping:
+            first = tripping[0]
+            more = f" and {len(tripping) - 1} more" if len(tripping) > 1 else ""
+            print(f"gate: --fail-on-new {args.fail_on_new} tripped by {_one_line(first['id'])} "
+                  f"({_one_line(first['severity'])}){more}", file=sys.stderr)
+            return EXIT_FAIL_ON_HIGH
+    if diff.coverage_gaps_added:
+        titles = "; ".join(dict.fromkeys(_one_line(str(n.get("title", "")))
+                                         for n in diff.coverage_gaps_added))
+        print(f"Not analyzed in the new version only: {titles}.", file=sys.stderr)
+        if args.fail_on_unanalyzed:
+            print("gate: --fail-on-unanalyzed tripped", file=sys.stderr)
             return EXIT_FAIL_ON_HIGH
     return EXIT_OK
 
 
-def _resolve_diff_side(source: str, config: Config, exclude: list[str]) -> dict:
-    """Resolve one diff side: a saved JSON report is loaded, anything else is scanned."""
+def _new_risk(diff, level: str) -> list[dict]:
+    """The new findings, and findings with new evidence, that trip `--fail-on-new LEVEL`: the same
+    risk `scan --fail-on` counts. A malicious indicator trips any level; a risky construct or a
+    shipped secret trips at its severity; a capability (what the component can do) never does.
+    A saved report from before threat classes existed has none, and every finding in it counts."""
+    from skilltotal.models import Severity
+
+    threshold = Severity[level.upper()].rank
+    changed = [c for c in diff.changed_findings if c["added_evidence"]]
+    tripping = []
+    for f in [*diff.new_findings, *changed]:
+        threat_class = f.get("threat_class")
+        if threat_class == "capability":
+            continue
+        if threat_class == "malicious_indicator" or Severity(f["severity"]).rank >= threshold:
+            tripping.append(f)
+    return tripping
+
+
+def _resolve_diff_side(source: str, config: Config, exclude: list[str]) -> tuple[dict, bool]:
+    """Resolve one diff side: a saved JSON report is loaded, anything else is scanned. Returns
+    the report and whether it was a saved one."""
+    from skilltotal.engine import analyze
+
     path = Path(source)
     if path.is_file() and path.suffix.lower() == ".json":
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict) and {"component", "risk_score", "findings"} <= data.keys():
-            return data
+            return data, True
         # A .json file that is not a saved report (e.g. a bare package.json) is scanned
         # like any other single-file source.
     report = analyze(source, ignore_rules=config.ignored_rules(), exclude=exclude)
-    return report.to_dict()
+    return report.to_dict(), False
 
 
 def _cmd_guard(args: argparse.Namespace) -> int:
+    from skilltotal.collector import CollectionError
+    from skilltotal.engine import analyze
+    from skilltotal.report import render_guard_json, render_guard_text
+
     if args.installed == bool(args.source):
         print("error: pass a source to check, or --installed (not both)", file=sys.stderr)
         return EXIT_ERROR
     if args.installed:
         return _guard_installed(args)
-
-    try:
-        report = analyze(args.source).to_dict()
-    except CollectionError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    if args.state or args.no_extensions:
+        print("error: --state and --no-extensions go with --installed", file=sys.stderr)
         return EXIT_ERROR
-    decision = evaluate(report, args.block_on)
+    acc = _open_accept(args)
+    if acc is None:
+        return EXIT_ERROR
+
+    from skilltotal.accept import source_key
+
+    key = source_key(args.source)
+    try:
+        report, version, accepted = _scan_accepting(analyze, args.source, acc.entries, key)
+    except CollectionError as exc:
+        print(f"error: {_diagnostic(str(exc))}", file=sys.stderr)
+        return EXIT_ERROR
+    decision = evaluate(report, args.block_on or DEFAULT_BLOCK_LEVEL)
+    shown = accepted.to_dict() if accepted else None
     if args.json:
-        print(render_guard_json(args.source, report, decision))
+        print(render_guard_json(args.source, report, decision, shown))
     else:
-        print(render_guard_text(args.source, report, decision))
+        print(render_guard_text(args.source, report, decision, shown))
+    _warn_accepted(acc, key if not version else f"{key}@{version}", accepted)
+    if acc.entries is not None:
+        _warn_stale(acc, acc.entries.stale(key))
+    if args.write_accept:
+        drafts = [] if decision.allow else _drafts(key, version, report)
+        return EXIT_OK if _write_accept(acc, drafts, [] if decision.allow or drafts
+                                        else [args.source]) else EXIT_ERROR
     return EXIT_OK if decision.allow else EXIT_FAIL_ON_HIGH
 
 
 def _guard_installed(args: argparse.Namespace) -> int:
-    """Guard every installed AI component; block if any of them blocks."""
-    components = discover(project=Path(args.project) if args.project else None)
+    """Guard every installed AI component: exit 2 if any of them blocks, else 1 if any could not
+    be checked or none was found (unless --allow-unchecked), else 0. What was not checked is never
+    reported as passed: a sweep where every scan failed used to say "ALLOW"."""
+    from skilltotal import engine
+    from skilltotal.drift import component_key
+    from skilltotal.inventory import discover
+    from skilltotal.report import (
+        _terminal_safe,
+        accepted_text,
+        drift_text,
+        one_line,
+        render_inventory_json,
+    )
+
+    if _project_missing(args.project):
+        return EXIT_ERROR
+    state = _open_state(args.state) if args.state else {}
+    if state is None:
+        return EXIT_ERROR
+    acc = _open_accept(args)
+    if acc is None:
+        return EXIT_ERROR
+    components = _discovered(discover, args)
     items: list[dict] = []
     blocked: list[str] = []
+    drafts: list[dict] = []
+    nothing_to_accept: list[str] = []
     for c in components:
         item: dict = {"host": c.host, "name": c.name, "kind": c.kind, "source": c.source}
+        if c.secrets:
+            item["secrets"] = c.secrets
         if not (c.scannable and c.source):
-            item["decision"] = "not scanned"
+            # SkillTotal's own MCP server is the tool doing this check: it counts as checked. A
+            # remote server has no code here to scan: it is named apart from a failure, but it is
+            # still not checked, so it fails the sweep like one unless --allow-unchecked (a CI
+            # gate must not read "nothing could be scanned" as "everything passed").
+            item["decision"] = ("this scanner" if c.this_tool else "remote" if c.remote
+                                else "risky" if c.risky else "not scanned")
             item["note"] = c.note
             items.append(item)
             continue
+        key = component_key(c.host, c.kind, c.name, c.version)
         try:
-            report = analyze(c.source).to_dict()
+            report, version, accepted = _scan_accepting(engine.analyze, c.source, acc.entries,
+                                                        key, c.version)
         except Exception as exc:  # noqa: BLE001 - one bad item must not abort the sweep
             item["decision"] = "error"
             item["note"] = str(exc)
             items.append(item)
             continue
-        decision = evaluate(report, args.block_on)
+        drift = _track_drift(state, c, report, item, accepted) if args.state else None
+        decision = evaluate_installed(report, c.kind, args.block_on, drift)
         item["decision"] = "allow" if decision.allow else "block"
         item["risk_level"] = report.get("risk_level", "")
         item["reasons"] = decision.reasons
+        if accepted:
+            item["accepted"] = accepted.to_dict()
+            _warn_accepted(acc, c.name, accepted)
         if not decision.allow:
             blocked.append(c.name)
+            found = _drafts(key, version, report)
+            drafts.extend(found)
+            if not found:
+                nothing_to_accept.append(c.name)
         items.append(item)
+    saved = _save_state(args.state, state) if args.state else True
+    if acc.entries is not None:
+        _warn_stale(acc, acc.entries.stale())
 
+    unchecked = {kind: sum(it["decision"] == kind for it in items)
+                 for kind in ("error", "not scanned", "remote", "risky")}
+    missing = sum(unchecked.values())
     if args.json:
         print(render_inventory_json(items))
     else:
+        lines: list[str] = []
         for it in items:
-            marker = {"allow": "ok", "block": "BLOCK"}.get(it["decision"], it["decision"])
+            marker = {"allow": "ACCEPTED" if it.get("accepted") else "ok", "block": "BLOCK",
+                      "risky": "RISKY"}.get(it["decision"], it["decision"])
             risk = f"  risk={it['risk_level']}" if it.get("risk_level") else ""
-            print(f"[{marker}] {it['name']} ({it['host']}, {it['kind']}){risk}")
-            for reason in it.get("reasons", []):
-                print(f"      - {reason}")
-        print()
+            # Names and notes come from config files anyone can write (a repository's
+            # `.mcp.json`): one_line keeps a newline or a bidi control in one from forging an
+            # "ALLOW:" line or a workflow command.
+            lines.append(f"[{marker}] {one_line(str(it['name']))} ({one_line(str(it['host']))}, "
+                         f"{one_line(str(it['kind']))}){risk}")
+            lines.extend(f"      - {one_line(str(reason))}" for reason in it.get("reasons", []))
+            if it.get("accepted"):
+                lines.append(f"      - {one_line(accepted_text(it['accepted']))}")
+            if it.get("drift") and not it["drift"]["blocks"]:
+                lines.append(f"      - {one_line(drift_text(it['drift']))}")
+            if it.get("note") and (it["decision"] in unchecked
+                                   or it["decision"] == "this scanner"):
+                lines.append(f"      - {one_line(str(it['note']))}")
+            lines.extend(f"      - inline secret in its config: {one_line(str(secret))}"
+                         for secret in it.get("secrets", []))
+        lines.append("")
+        labels = {"remote": "remote (not scannable)"}
+        counts = ", ".join(f"{n} {labels.get(kind, kind)}"
+                           + ("s" if kind == "error" and n > 1 else "")
+                           for kind, n in unchecked.items() if n)
+        not_checked = (f"{missing} of {len(items)} component(s) could not be checked "
+                       f"({counts}).")
         if blocked:
-            print(f"BLOCK: {len(blocked)} component(s) failed the guard: {', '.join(blocked)}")
+            lines.append(f"BLOCK: {len(blocked)} component(s) failed the guard: "
+                         f"{', '.join(one_line(str(name)) for name in blocked)}")
+            if missing:
+                lines.append(not_checked)
+        elif not items:
+            lines.append("UNCHECKED: no installed AI components were found, so nothing was "
+                         "checked." if not args.allow_unchecked else
+                         "ALLOW: no installed AI components were found.")
+        elif missing:
+            lead = "ALLOW (--allow-unchecked): " if args.allow_unchecked else "UNCHECKED: "
+            lines.append(lead + not_checked)
         else:
-            print(f"ALLOW: all {len(items)} component(s) passed the guard.")
-    return EXIT_FAIL_ON_HIGH if blocked else EXIT_OK
+            lines.append(f"ALLOW: all {len(items)} component(s) passed the guard.")
+        accepted_count = sum(1 for it in items if it.get("accepted"))
+        if accepted_count:
+            lines.append(f"{accepted_count} component(s) with findings the accept file accepts.")
+        # Names come from config files anyone can write (a repository's `.mcp.json`): their
+        # escape sequences must not reach the terminal, as in every other text report.
+        print(_terminal_safe("\n".join(lines)))
+    if args.write_accept:
+        return EXIT_OK if _write_accept(acc, drafts, nothing_to_accept) and saved else EXIT_ERROR
+    if blocked:
+        return EXIT_FAIL_ON_HIGH
+    if (missing or not items) and not args.allow_unchecked:
+        return EXIT_ERROR  # could not check: never a silent pass
+    return EXIT_OK if saved else EXIT_ERROR
 
 
 def _cmd_inventory(args: argparse.Namespace) -> int:
-    project = Path(args.project) if args.project else None
-    components = discover(project=project)
+    from skilltotal.collector import CollectionError
+    from skilltotal.drift import component_key
+    from skilltotal.engine import analyze
+    from skilltotal.inventory import discover
+    from skilltotal.report import render_inventory_json, render_inventory_text
+
+    if _project_missing(args.project):
+        return EXIT_ERROR
+    if (args.state or args.accept or args.write_accept) and args.no_scan:
+        print("error: --state, --accept and --write-accept need a scan; drop --no-scan",
+              file=sys.stderr)
+        return EXIT_ERROR
+    state = _open_state(args.state) if args.state else {}
+    if state is None:
+        return EXIT_ERROR
+    acc = _open_accept(args)
+    if acc is None:
+        return EXIT_ERROR
+    components = _discovered(discover, args)
 
     items: list[dict] = []
+    drafts: list[dict] = []
+    nothing_to_accept: list[str] = []
     for c in components:
         item = {
             "host": c.host, "name": c.name, "kind": c.kind,
             "source": c.source, "scannable": c.scannable, "note": c.note,
-            "config": c.config,
+            "config": c.config, "risky": c.risky, "secrets": c.secrets,
+            "remote": c.remote, "this_tool": c.this_tool,
         }
+        if c.version:
+            item["version"] = c.version
         if c.scannable and not args.no_scan and c.source is not None:
+            key = component_key(c.host, c.kind, c.name, c.version)
             try:
-                report = analyze(c.source)
-                item["verdict"] = report.verdict.get("level")
-                item["risk_level"] = report.risk_level.value
-                item["risk_score"] = report.risk_score
-                item["has_malicious_indicators"] = report.verdict.get("has_malicious_indicators")
+                report, version, accepted = _scan_accepting(analyze, c.source, acc.entries, key,
+                                                            c.version)
+                verdict = report.get("verdict") or {}
+                item["verdict"] = verdict.get("level")
+                item["risk_level"] = report.get("risk_level")
+                item["risk_score"] = report.get("risk_score")
+                item["has_malicious_indicators"] = verdict.get("has_malicious_indicators")
+                # What `guard --installed` would decide, at its default level: a component it
+                # blocks (a typosquatted name, an unread install script) needs attention here
+                # too, whatever its score says.
+                drift = _track_drift(state, c, report, item, accepted) if args.state else None
+                decision = evaluate_installed(report, c.kind, drift=drift)
+                item["guard"] = "allow" if decision.allow else "block"
+                item["guard_reasons"] = decision.reasons
+                if accepted:
+                    item["accepted"] = accepted.to_dict()
+                    _warn_accepted(acc, c.name, accepted)
+                if not decision.allow or item["verdict"] in ("malicious", "critical", "high"):
+                    found = _drafts(key, version, report)
+                    drafts.extend(found)
+                    if not found:
+                        nothing_to_accept.append(c.name)
             except CollectionError as exc:
                 item["error"] = str(exc)
             except Exception as exc:  # noqa: BLE001 - one bad item must not abort the sweep
                 item["error"] = f"scan failed: {exc}"
         items.append(item)
+    saved = _save_state(args.state, state) if args.state else True
+    if acc.entries is not None:
+        _warn_stale(acc, acc.entries.stale())
 
     if args.sbom:
         from skilltotal.sbom import build_aibom
@@ -493,24 +1337,811 @@ def _cmd_inventory(args: argparse.Namespace) -> int:
         print(render_inventory_json(items))
     else:
         print(render_inventory_text(items))
-    return EXIT_OK
+    if args.write_accept and not _write_accept(acc, drafts, nothing_to_accept):
+        return EXIT_ERROR
+    return EXIT_OK if saved else EXIT_ERROR
+
+
+def _discovered(discover, args: argparse.Namespace) -> list:
+    """What `inventory` and `guard --installed` check: everything discovered, less the editor
+    extensions with --no-extensions."""
+    from skilltotal.inventory import EDITOR_EXTENSION
+
+    components = discover(project=Path(args.project).expanduser() if args.project else None)
+    if args.no_extensions:
+        components = [c for c in components if c.kind != EDITOR_EXTENSION]
+    return components
+
+
+def _open_state(path: str) -> dict | None:
+    """The components a --state file records ({} before its first run), or None after saying
+    why it cannot be used. A file that is not a state file is never overwritten."""
+    from skilltotal.drift import StateError, load_state
+
+    problem = _output_problem(path)
+    target = Path(path).expanduser()
+    if not problem and target.exists() and (not target.is_file() or _is_link(target) or (
+            os.name == "nt" and _WINDOWS_DEVICE.match(target.name))):
+        problem = "not a regular file"
+    if not problem and target.exists():
+        try:
+            return load_state(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, StateError) as exc:
+            problem = str(exc)
+    if problem:
+        print(f"error: cannot use the state file {_one_line(path)}: {_one_line(problem)}",
+              file=sys.stderr)
+        return None
+    return {}
+
+
+def _save_state(path: str, state: dict) -> bool:
+    from skilltotal.drift import dump_state
+
+    try:
+        _write_file(str(Path(path).expanduser()), dump_state(state))
+    except OSError as exc:
+        print(f"error: cannot write the state file {_one_line(path)}: {exc.strerror or exc}",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _track_drift(state: dict, component, report: dict, item: dict, accepted=None):
+    """Compare a scanned component with its entry in ``state``, record it there, and put any
+    drift on its output ``item``. What the accept file accepted (``accepted``) is not drift, and
+    it is recorded all the same, so the state is the one a run without the file would keep."""
+    from skilltotal.drift import component_key, component_version, detect, record
+
+    key = component_key(component.host, component.kind, component.name, component.version)
+    version = component_version(report, component.version)
+    drift = detect(state.get(key), report, version)
+    state[key] = record(report, version)
+    if accepted is not None:
+        state[key]["risk"] = sorted(set(state[key]["risk"]) | accepted.risk_fingerprints)
+    if drift is not None:
+        item["drift"] = drift.to_dict()
+    return drift
+
+
+class _Accept(NamedTuple):
+    """An --accept file's entries (None without one), the --write-accept file's current text
+    (None when there is none yet) and the paths, for messages."""
+
+    entries: AcceptList | None
+    path: str
+    write_path: str
+    write_text: str | None
+
+
+def _open_accept(args: argparse.Namespace) -> _Accept | None:
+    """The --accept and --write-accept files, checked before any scan; None after saying why
+    one cannot be used. An invalid accept file fails closed, and a file that is not an accept
+    file is never overwritten."""
+    from datetime import date
+
+    from skilltotal.accept import AcceptError, AcceptList, dump_with, load_accept
+
+    entries = None
+    if args.accept:
+        target = Path(args.accept).expanduser()
+        problem = ""
+        if not target.exists():
+            problem = "no such file"
+        elif not target.is_file() or (os.name == "nt" and _WINDOWS_DEVICE.match(target.name)):
+            problem = "not a regular file"
+        else:
+            try:
+                entries = AcceptList(load_accept(target.read_text(encoding="utf-8")),
+                                     date.today())
+            except (OSError, UnicodeDecodeError, AcceptError) as exc:
+                problem = str(exc)
+        if problem or entries is None:
+            print(f"error: cannot use the accept file {_one_line(args.accept)}: "
+                  f"{_one_line(problem)}", file=sys.stderr)
+            return None
+        if entries.expired:
+            print(f"warning: accept file {_one_line(args.accept)}: expired entr(ies) no longer "
+                  "apply: " + ", ".join(f"{_one_line(e.label())} (expired {e.expires})"
+                                        for e in entries.expired), file=sys.stderr)
+    write_text = None
+    if args.write_accept:
+        target = Path(args.write_accept).expanduser()
+        problem = _output_problem(args.write_accept)
+        if not problem and target.exists():
+            if not target.is_file() or _is_link(target) or (
+                    os.name == "nt" and _WINDOWS_DEVICE.match(target.name)):
+                problem = "not a regular file"
+            else:
+                try:
+                    write_text = target.read_text(encoding="utf-8")
+                    dump_with(write_text, [])  # raises unless it is an accept file
+                except (OSError, UnicodeDecodeError, AcceptError) as exc:
+                    problem = f"{exc}; it is not overwritten"
+        if problem:
+            print(f"error: cannot write the accept file {_one_line(args.write_accept)}: "
+                  f"{_one_line(problem)}", file=sys.stderr)
+            return None
+    return _Accept(entries, args.accept or "", args.write_accept or "", write_text)
+
+
+@functools.lru_cache(maxsize=1)
+def _threat_classes() -> dict[str, str]:
+    from skilltotal.rules import get_rules
+
+    return {r.id: r.threat_class.value for r in get_rules()}
+
+
+def _scan_accepting(analyze, source: str, accept: AcceptList | None, key: str,
+                    known_version: str = "") -> tuple[dict, str, Applied | None]:
+    """Scan ``source`` (``analyze`` is the engine's) and return the report, the version scanned
+    and what the accept file took out of it: the evidence its entries for ``key`` accept at that
+    exact version is removed before scoring, so the verdict and the guard see the rest.
+
+    An editor extension's version is read from its manifest before the scan (``known_version``);
+    a package a launcher runs at its latest version, or a ``guard <source>``, shows its version
+    only in the scan. Then the entries for every version of the component are tried at once, and
+    the component is scanned a second time, with its own version's entries alone, only when an
+    entry for another version took something out: one scan unless it was updated."""
+    from skilltotal.accept import applied
+    from skilltotal.drift import component_version
+
+    def scan(fingerprints: set[str], hits: dict[str, str]) -> dict:
+        if not fingerprints:
+            return analyze(source).to_dict()
+        return analyze(source, suppress=fingerprints, suppressed_out=hits).to_dict()
+
+    if accept is None:
+        report = analyze(source).to_dict()
+        return report, component_version(report, known_version), None
+    hits: dict[str, str] = {}
+    report = scan(accept.candidates(key, known_version or None), hits)
+    version = component_version(report, known_version)
+    entries = accept.matching(key, version)
+    own = set().union(*(e.findings for e in entries))
+    if not hits.keys() <= own:
+        hits = {}
+        report = scan(own, hits)
+    return report, version, applied(entries, hits, _threat_classes())
+
+
+def _warn_accepted(acc: _Accept, name: str, accepted: Applied | None) -> None:
+    """A malicious indicator the accept file hides is named on stderr on every run, so a log or a
+    SIEM shows that the guard passed a component with one."""
+    if accepted is not None and accepted.malicious:
+        print(f"warning: accept file {_one_line(acc.path)} hides malicious indicator(s) "
+              f"{', '.join(accepted.malicious)} in {_one_line(name)} (reason: "
+              f"{_one_line(accepted.reason)}); the verdict and the guard do not see them",
+              file=sys.stderr)
+
+
+def _warn_stale(acc: _Accept, stale: list) -> None:
+    if stale:
+        print(f"warning: accept file {_one_line(acc.path)}: {len(stale)} entr(ies) match no "
+              f"component scanned at their version (stale): "
+              f"{', '.join(_one_line(e.label()) for e in stale)}", file=sys.stderr)
+
+
+def _drafts(key: str, version: str, report: dict) -> list[dict]:
+    """The --write-accept entry for a component this run flagged: its risk findings, or none
+    when what flags it is not a finding (an install script that could not be read)."""
+    from skilltotal.accept import draft_entry, risk_findings
+
+    fingerprints, rules = risk_findings(report)
+    return [draft_entry(key, version, fingerprints, rules)] if fingerprints else []
+
+
+def _write_accept(acc: _Accept, drafts: list[dict], nothing_to_accept: list[str]) -> bool:
+    """Add ``drafts`` to the --write-accept file and say what is left to do."""
+    from skilltotal.accept import dump_with
+
+    path = acc.write_path
+    if nothing_to_accept:
+        print(f"note: nothing to accept for {', '.join(_one_line(n) for n in nothing_to_accept)}:"
+              " what flags it is not a finding (an install script or a component that could not "
+              "be read)", file=sys.stderr)
+    text, added = dump_with(acc.write_text, drafts)
+    if not added:
+        print(f"Nothing new to accept; {_one_line(path)} was not changed.", file=sys.stderr)
+        return True
+    try:
+        _write_file(str(Path(path).expanduser()), text)
+    except OSError as exc:
+        print(f"error: cannot write the accept file {_one_line(path)}: {exc.strerror or exc}",
+              file=sys.stderr)
+        return False
+    print(f"{added} entr(ies) added to {_one_line(path)}, each with an empty \"reason\". The "
+          "file is refused until a reviewer writes in every entry why its findings are safe.",
+          file=sys.stderr)
+    return True
 
 
 def _cmd_mcp() -> int:
-    from skilltotal.mcp_server import serve
+    import threading
+
+    from skilltotal.mcp_server import remove_stale_temp_dirs, serve
 
     # The MCP stdio transport is UTF-8, but Windows consoles default to a legacy codepage
     # (e.g. cp1251), which would mojibake any non-ASCII snippet in a report and crash the
     # client's decoder. newline="\n" keeps the transport's one-message-per-LF framing free
     # of CRLF translation.
-    if hasattr(sys.stdin, "reconfigure"):  # real stdio; absent on injected test streams
-        sys.stdin.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):  # real stdio; absent on injected test streams
         sys.stdout.reconfigure(encoding="utf-8", newline="\n")
-    serve(sys.stdin, sys.stdout)
+    # Requests are read as bytes and decoded per line: a text stdin raised on one byte that is
+    # not UTF-8 and ended the session.
+    stdin = getattr(sys.stdin, "buffer", sys.stdin)
+    # Folders a scan left in the temp directory when a client killed this server mid-scan; in the
+    # background, so the client's initialize is answered at once.
+    threading.Thread(target=remove_stale_temp_dirs, name="skilltotal-mcp-sweep",
+                     daemon=True).start()
+    serve(stdin, sys.stdout)
     return EXIT_OK
 
 
+# The answer when the hook cannot finish its own check. Exiting with an error would let the plugin's
+# wrapper pass the command with only a warning, and denying would block for SkillTotal's own fault:
+# the person decides. In CI strict mode nobody is there to decide, so the command is denied.
+HOOK_FAILED = {
+    "systemMessage": "SkillTotal could not check this command.",
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": "SkillTotal could not check this command.",
+    },
+}
+# The hook protocol this CLI speaks, which the plugin's wrapper asks for with --protocol: 2 is the
+# console line for every install and CI strict mode. A CLI that speaks an older one, or knows no
+# --protocol at all, fails on it, and the wrapper says the CLI is older than the plugin (in CI it
+# denies). Raise it, with the wrapper's PROTOCOL (a test keeps them equal), when the wrapper comes
+# to rely on something an older CLI does not do.
+HOOK_PROTOCOL = 2
+# How to update the CLI, whichever way it was installed (the plugin's wrapper says the same).
+HOOK_UPDATE = "update the skilltotal CLI (pipx upgrade skilltotal or pip install -U skilltotal)"
+# Set by the plugin's wrapper: the answer starts with a line naming this CLI's version
+# (`skilltotal 0.73.0`), so the wrapper can tell a CLI older than the plugin without starting it a
+# second time for `--version`. A CLI that predates it prints no such line, and an older wrapper
+# never sets it, so neither sees the line.
+HOOK_VERSION_LINE_ENV = "SKILLTOTAL_HOOK_VERSION_LINE"
+HOOK_CLAUDE_CODE_HELP = """\
+Claude Code PreToolUse hook (the SkillTotal plugin runs it before every Bash or PowerShell
+command). Reads one hook event (JSON) on stdin, finds the packages the command would install,
+checks each one, and prints Claude Code's hook answer (JSON) on stdout, or nothing for a command
+that installs nothing:
+
+  deny     a package with malicious indicators
+  ask      high or critical risk, or anything SkillTotal could not check (a custom registry or
+           index, a name the shell fills in, a check that failed or ran out of time)
+  no decision, with a console line
+           clean packages, and installs with no package name to check (a lockfile, a local
+           path, a downloaded script, a remote MCP server, a container image)
+
+Environment:
+  SKILLTOTAL_STRICT           1/true/yes/on turns CI strict mode on, 0/false/no/off turns it
+                              off; unset, it is on when CI, TF_BUILD, JENKINS_URL,
+                              TEAMCITY_VERSION, CODEBUILD_BUILD_ID, BUILDKITE or GITLAB_CI is
+                              set. In strict mode what would be asked is denied, and so is an
+                              unchecked install whose kind is not allowed.
+  SKILLTOTAL_ALLOW_UNCHECKED  the kinds of unchecked install strict mode lets through, comma-
+                              separated: lockfile, local, script, partial, remote, container,
+                              registry (a package from a configured registry or mirror)
+  SKILLTOTAL_STRICT_PARTIAL   1: strict mode also denies a partly analyzed package
+  SKILLTOTAL_HOOK_BUDGET      seconds all checks of one command share (default 60, at most 100;
+                              in strict mode 600, at most 840)
+  SKILLTOTAL_WORKERS          processes one large check may use (1 turns it off)
+  SKILLTOTAL_CACHE_DIR        where verdicts are kept (default: skilltotal/ under
+                              XDG_CACHE_HOME, LOCALAPPDATA or ~/.cache)
+  NPM_CONFIG_REGISTRY, PIP_INDEX_URL, PIP_EXTRA_INDEX_URL, UV_INDEX_URL, UV_DEFAULT_INDEX...
+                              a registry or index other than the public one (also from .npmrc
+                              or pip.conf/pip.ini): its packages are asked about (denied in CI)
+  SKILLTOTAL_NPM_REGISTRY, SKILLTOTAL_PYPI_INDEX, SKILLTOTAL_REGISTRY_TOKEN
+                              a registry mirror: packages whose configured registry is this
+                              mirror are checked through it instead
+
+Exit codes: always 0 (the decision is in the answer; a failure of the hook asks, or denies in
+strict mode); 1 when --protocol asks for a newer protocol than this CLI speaks.
+"""
+# CI strict mode for the hook: SKILLTOTAL_STRICT=1/true/yes/on turns it on and 0/false/no/off off;
+# any other non-empty value turns it on too (a typo must not loosen a gate; the console says so).
+# Otherwise it is on when CI, or the marker of a CI service that does not always set CI, is set to
+# anything but empty or a false value. The plugin's wrapper reads them the same way (a shared test
+# table keeps the two in step): only ASCII letters are lowercased, and only spaces, tabs and line
+# ends are removed.
+HOOK_STRICT_ENV = "SKILLTOTAL_STRICT"
+HOOK_CI_MARKERS = ("CI", "TF_BUILD", "JENKINS_URL", "TEAMCITY_VERSION", "CODEBUILD_BUILD_ID",
+                   "BUILDKITE", "GITLAB_CI")
+_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+_ENV_SPACE = re.compile(r"[ \t\r\n]")
+_ENV_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _env_word(value: str) -> str:
+    return _ENV_SPACE.sub("", value).translate(_ENV_LOWER)
+
+
+def _hook_strict(environ) -> str:
+    """The variable that turns CI strict mode on (where what the hook would ask about is denied),
+    or "" when it is off."""
+    value = _env_word(environ.get(HOOK_STRICT_ENV, ""))
+    if value in _ENV_FALSE:
+        return ""
+    if value:  # on, or a value that is neither on nor off: a typo must not loosen a gate
+        return HOOK_STRICT_ENV
+    return next((name for name in HOOK_CI_MARKERS
+                 if _env_word(environ.get(name, "")) not in _ENV_FALSE | {""}), "")
+
+
+def _hook_failed_strict(strict_by: str) -> dict:
+    """The hook's own failure in CI strict mode, where nobody is there to decide: denied."""
+    from skilltotal.agent_hook import strict_note
+
+    reason = "(CI rule) SkillTotal blocked this command: it could not check it."
+    return {
+        "systemMessage": f"{reason} {strict_note(strict_by)}",
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+    }
+
+
+def _hook_allowed_unchecked(environ) -> frozenset[str]:
+    """The kinds of unchecked install strict mode lets through (SKILLTOTAL_ALLOW_UNCHECKED)."""
+    from skilltotal.agent_hook import ALLOW_UNCHECKED_ENV, UNCHECKED_KINDS
+
+    named = {part.strip().lower() for part in environ.get(ALLOW_UNCHECKED_ENV, "").split(",")}
+    return frozenset(named & set(UNCHECKED_KINDS))
+
+
+_OFF_WORDS = {"", "0", "false", "no", "off"}
+
+
+def _hook_strict_partial(environ) -> bool:
+    """SKILLTOTAL_STRICT_PARTIAL=1 (or true, yes, on): CI also denies a partly analyzed package.
+    A value that is neither on nor off turns it on: a typo must not loosen a gate."""
+    from skilltotal.agent_hook import STRICT_PARTIAL_ENV
+
+    return environ.get(STRICT_PARTIAL_ENV, "").strip().lower() not in _OFF_WORDS
+
+
+def _cmd_hook(args: argparse.Namespace) -> int:
+    if args.supervise or args.scan_into:  # one of the processes of a check the hook started
+        from skilltotal import hook_scan
+
+        if args.scan_into:
+            _sweep_stale_temp_dirs_daily()
+            return hook_scan.scan_into(Path(args.scan_into))
+        return hook_scan.supervise(Path(args.supervise), remember=_hook_remember)
+    if args.protocol > HOOK_PROTOCOL:
+        print(f"error: this skilltotal speaks hook protocol {HOOK_PROTOCOL}, the plugin needs "
+              f"{args.protocol}; {HOOK_UPDATE}", file=sys.stderr)
+        return EXIT_ERROR
+    strict_by = _hook_strict(os.environ)
+    try:
+        answer = _hook_answer(strict_by)
+    except Exception:  # noqa: BLE001 - a failure of ours asks (in CI denies), never passes silently
+        answer = _hook_failed_strict(strict_by) if strict_by else HOOK_FAILED
+    if os.environ.get(HOOK_VERSION_LINE_ENV):
+        print(f"skilltotal {__version__}")
+    if answer is not None:
+        print(json.dumps(answer))
+    return EXIT_OK
+
+
+def _hook_answer(strict_by: str = "") -> dict | None:
+    from skilltotal.agent_hook import BUDGET_ENV, hook_response
+
+    if hasattr(sys.stdin, "reconfigure"):  # Windows consoles default to a legacy codepage
+        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")
+    raw = sys.stdin.read()
+    try:
+        event = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        # Not a hook event at all: stay out of the agent's way, except in CI, where a command the
+        # hook could not read must not pass.
+        return _hook_failed_strict(strict_by) if strict_by else None
+    # In CI nobody can answer a question, so a check the hook stopped waiting for is a denial:
+    # there the hook waits for the full check of all but the largest packages instead.
+    default, ceiling = ((HOOK_STRICT_BUDGET_S, HOOK_STRICT_MAX_BUDGET_S) if strict_by
+                        else (HOOK_BUDGET_S, HOOK_MAX_BUDGET_S))
+    try:
+        budget = float(os.environ.get(BUDGET_ENV, default))
+    except ValueError:
+        budget = default
+    # Claude Code lets a command through when its hook outlives the hook's timeout (900 s in the
+    # plugin's hooks.json), so a budget past it would turn every slow check into a silent pass.
+    budget = max(1.0, min(budget, ceiling))
+    answer = hook_response(event, scan=_hook_scan_cached, budget_s=budget,
+                           strict=bool(strict_by), strict_by=strict_by,
+                           allow_unchecked=_hook_allowed_unchecked(os.environ),
+                           deny_partial=_hook_strict_partial(os.environ),
+                           environ=os.environ, home=_home())
+    note = _hook_settings_note(os.environ, ceiling)
+    if answer is not None and note:
+        answer["systemMessage"] = f"{answer.get('systemMessage', '')} {note}".strip()
+    return answer
+
+
+def _home() -> Path | None:
+    """The person's home folder, or None when it cannot be told (no HOME on a bare system)."""
+    try:
+        return Path.home()
+    except (RuntimeError, KeyError, OSError):
+        return None
+
+
+def _hook_settings_note(environ, ceiling: float) -> str:
+    """For the console: a hook setting with a value the hook cannot use (it falls back)."""
+    from skilltotal.agent_hook import (
+        ALLOW_UNCHECKED_ENV,
+        BUDGET_ENV,
+        STRICT_PARTIAL_ENV,
+        UNCHECKED_KINDS,
+    )
+
+    notes = []
+    strict = _env_word(environ.get(HOOK_STRICT_ENV, ""))
+    if strict and strict not in _ENV_TRUE | _ENV_FALSE:
+        notes.append(f"{HOOK_STRICT_ENV} is {strict!r}, read as on; use 1 or 0.")
+    word = environ.get(STRICT_PARTIAL_ENV, "").strip().lower()
+    if word not in _OFF_WORDS | {"1", "true", "yes", "on"}:
+        notes.append(f"{STRICT_PARTIAL_ENV} is {word!r}, read as on; use 1 or 0.")
+    named = {p.strip().lower() for p in environ.get(ALLOW_UNCHECKED_ENV, "").split(",")} - {""}
+    unknown = sorted(named - set(UNCHECKED_KINDS))
+    if unknown:
+        notes.append(f"{ALLOW_UNCHECKED_ENV} names unknown kind(s) {', '.join(unknown)}; the "
+                     f"kinds are {', '.join(UNCHECKED_KINDS)}.")
+    raw = environ.get(BUDGET_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = None
+        if value is None or not 1 <= value <= ceiling:
+            notes.append(f"{BUDGET_ENV} must be seconds from 1 to {ceiling:g}, not {raw!r}.")
+    from skilltotal.collector import CollectionError, registry_mirror
+
+    for kind in ("npm", "pypi"):
+        try:
+            registry_mirror(kind, environ)
+        except CollectionError as exc:  # the message names the setting, never its value
+            notes.append(f"{exc}; it is not used.")
+    return " ".join(notes)
+
+
+# How long the agent waits for the checks of one install command (a check that needs longer goes
+# on in the background), and how long a verdict is reused: a week for an exact npm/PyPI release
+# (its files never change), an hour for anything that can change under the same name (a git
+# repository, or a package whose release could not be resolved).
+HOOK_BUDGET_S = 60.0
+HOOK_MAX_BUDGET_S = 100.0
+# The same in CI strict mode, where a question becomes a denial: wait for the check itself.
+HOOK_STRICT_BUDGET_S = 600.0
+HOOK_STRICT_MAX_BUDGET_S = 840.0
+HOOK_RELEASE_TTL_S = 7 * 24 * 3600
+HOOK_MOVING_TTL_S = 3600
+HOOK_CACHE_MAX_ENTRIES = 500
+
+
+def _hook_cache_path() -> Path:
+    from skilltotal.hook_scan import cache_file
+
+    return cache_file()
+
+
+def _hook_scan_cached(source: str, timeout: float, mirror: bool = False) -> dict:
+    """``_hook_scan``, reusing a verdict. Agents run the same ``npx tsc`` again and again, and each
+    must not cost a scan.
+
+    A verdict belongs to one artifact. ``npm:x`` is first resolved to the release the registry
+    serves now (``npm:x@1.2.3``; on PyPI, also the file pip would install) and that is what is
+    scanned and remembered, so a clean verdict from this morning never vouches for a release, or a
+    file, published this afternoon. A new engine version rescans everything.
+
+    ``mirror`` reads the package from the registry mirror SKILLTOTAL_NPM_REGISTRY /
+    SKILLTOTAL_PYPI_INDEX names, where the installer fetches it; its verdict is kept apart from
+    the public registry's, under the mirror's URL. Without it the public registry is read, even
+    when a mirror is configured.
+
+    One artifact is checked once at a time: while a check of it runs, the answer says so instead
+    of starting another. A check that outlasts the wait goes on in the background and keeps its
+    verdict itself (``_hook_hand_over``), and the same command run again is answered from it.
+    """
+    from skilltotal.agent_hook import CheckInBackground
+    from skilltotal.hook_scan import GRACE_S, AlreadyRunning, Pending, ScanContinues
+
+    started = time.monotonic()
+    # Claude Code lets the command run when the hook outlives its timeout: nothing on this path
+    # waits past the budget and a short grace.
+    hard = started + timeout + GRACE_S
+    release = _hook_lookup(source, max(1.0, min(5.0, timeout / 2)), mirror)
+    key = release.key if release else source
+    if mirror:
+        key = f"{key} via {_hook_mirror_base(source)}"
+    target = release.source if release else source
+    ttl = _hook_cache_ttl(key)
+    path = _hook_cache_path()
+    now = time.time()
+    hit = _hook_cache_read(path).get(key)
+    if _usable(hit) and _fresh(hit, now, ttl):
+        return hit["report"]
+    # What the verdict is kept under, and for which file: everything that keeps it needs to know.
+    job = {"key": key, "ttl": ttl, "artifact": release.artifact if release else "", "at": now,
+           "engine": __version__, "ruleset": RULESET_VERSION}
+    pending = Pending(path.parent / "hook-pending")
+    try:
+        marker = pending.claim(key, now, wait_s=min(2.0, max(0.0, hard - time.monotonic())))
+    except AlreadyRunning as running:
+        raise CheckInBackground(running.seconds_left, started_ago=running.age) from None
+    # The check takes what its verdict is recorded under along, in case this hook goes away; with
+    # no marker to track it by, it never runs on alone.
+    check = {**job, "token": marker.token} if marker is not None else None
+    try:
+        report = (_hook_scan(target, timeout - (time.monotonic() - started), check, mirror=True)
+                  if mirror else _hook_scan(target, timeout - (time.monotonic() - started), check))
+    except ScanContinues as late:
+        try:
+            # Raises unless the check ended in the meantime.
+            report = _hook_hand_over(late, pending, marker, job, hard, target)
+        except CheckInBackground:
+            raise  # handed over: the marker is the check's now
+        except BaseException:
+            # Whatever went wrong, the check is not left half handed over. A failure to stop it
+            # is not reported: the error being raised is the one that matters.
+            with contextlib.suppress(Exception):
+                late.scan.stop()
+            pending.release(marker)
+            raise
+    except BaseException:
+        pending.release(marker)
+        raise  # a failed or late scan: nothing is cached
+    pending.release(marker)
+    return _hook_remember(job, report, deadline=hard)
+
+
+def _hook_mirror_base(source: str) -> str:
+    """The mirror a ``mirror`` check of ``source`` reads, as the cache key names it."""
+    from skilltotal.collector import CollectionError, classify_source, registry_mirror
+
+    try:
+        return registry_mirror(classify_source(source)) or "an unset mirror"
+    except CollectionError:
+        return "an unusable mirror setting"
+
+
+def _hook_mirror_set() -> bool:
+    """Whether this process has a registry mirror setting at all."""
+    from skilltotal.collector import NPM_REGISTRY_ENV, PYPI_INDEX_ENV
+
+    return any(os.environ.get(name, "").strip() for name in (NPM_REGISTRY_ENV, PYPI_INDEX_ENV))
+
+
+def _hook_lookup(source: str, timeout: float, mirror: bool = False):
+    """The release ``source`` resolves to, or None when the registry has not answered within
+    ``timeout`` seconds, as for a registry that did not answer. A lookup's own timeout covers each
+    network step, not a slow name lookup or a trickle of data, so it runs in a thread that this
+    process does not wait for past ``timeout``. The public registry is asked unless ``mirror``."""
+    from skilltotal.collector import resolve_release
+
+    # A configured mirror is skipped for a package the installer fetches from the public registry.
+    options = {"use_mirror": False} if not mirror and _hook_mirror_set() else {}
+    found: list = []
+    lookup = threading.Thread(
+        target=lambda: found.append(resolve_release(source, timeout=timeout, **options)),
+        daemon=True)
+    lookup.start()
+    lookup.join(timeout)
+    return found[0] if found else None
+
+
+def _hook_hand_over(
+    late: ScanContinues, pending: Pending, marker: Marker | None, job: dict, deadline: float,
+    target: str,
+) -> dict:
+    """Decide the fate of a check the hook stops waiting for.
+
+    It goes on in the background and keeps its verdict itself, unless its size says it cannot end
+    before the ceiling, it could not be tracked (no marker could be written), or
+    ``MAX_BACKGROUND`` checks already go on without a hook: then it is stopped, and records nothing.
+    Raises what the answer then says; returns the report instead when the check ended in the
+    meantime.
+    """
+    from skilltotal.agent_hook import BackgroundFull, CheckInBackground, TooLargeToCheck
+    from skilltotal.hook_scan import CEILING_S, MAX_BACKGROUND
+
+    scan = late.scan
+    if late.too_large:
+        report = scan.stop(deadline)
+        if report is not None:
+            return report
+        pending.release(marker)
+        raise TooLargeToCheck(target, CEILING_S)
+    running: int | None = None
+    if marker is not None:
+        try:
+            # Counting the others and joining them is one step.
+            with pending.lock(max(0.0, min(5.0, deadline - time.monotonic()))):
+                running = pending.background(time.time(), exclude=marker)
+                ends = None if late.seconds_left is None else time.time() + late.seconds_left
+                # The marker goes to the background before the check is handed over: a check that
+                # ends right after frees a marker already in its final state (written after, it
+                # would come back for a check that is over).
+                if running < MAX_BACKGROUND and pending.go_background(marker, ends):
+                    report = scan.hand_over(deadline)
+                    if report is not None:
+                        return report
+                    raise CheckInBackground(late.seconds_left, large=late.large)
+                if running < MAX_BACKGROUND:
+                    running = None  # its marker is gone: it cannot be tracked
+        except CheckInBackground:
+            raise
+        except (TimeoutError, OSError):
+            running = None  # the markers cannot be kept safely: start nothing more
+    report = scan.stop(deadline)
+    if report is not None:
+        return report
+    pending.release(marker)
+    if running is None:
+        raise TimeoutError(job["key"])  # answered as a check that ran out of time
+    raise BackgroundFull(running)
+
+
+def _hook_cache_read(path: Path) -> dict:
+    """The verdict cache; a missing or corrupt file is an empty one."""
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def _hook_remember(job: dict, report: dict, deadline: float | None = None) -> dict:
+    """The verdict of a scan as the cache keeps it, kept under ``job["key"]``; returns it.
+
+    The one way a verdict is kept, whoever keeps it: the hook, for a scan that finished while it
+    waited, or the check itself, for one that finished after the hook had stopped waiting.
+    """
+    from skilltotal.models import UNANALYZED_TITLES
+
+    verdict = report.get("verdict") or {}
+    entry = {
+        "engine": job["engine"],
+        "ruleset": job.get("ruleset"),
+        "at": job["at"],
+        "ttl": job["ttl"],
+        "report": {
+            "risk_level": report.get("risk_level"),
+            "risk_score": report.get("risk_score"),
+            "component": {"version": (report.get("component") or {}).get("version", "")},
+            "verdict": {
+                "has_malicious_indicators": bool(verdict.get("has_malicious_indicators")),
+                "headline": verdict.get("headline", ""),
+            },
+            # The scored findings, trimmed to what a reason names (title, file:line), so a
+            # cached answer says what was found exactly like the first one did.
+            "findings": [
+                {
+                    "id": f.get("id"),
+                    "title": f.get("title"),
+                    "severity": f.get("severity"),
+                    "threat_class": f.get("threat_class"),
+                    "evidence": [
+                        {"file": e.get("file"), "line_start": e.get("line_start")}
+                        for e in (f.get("evidence") or [])[:1]
+                    ],
+                }
+                for f in report.get("findings") or []
+                if f.get("threat_class") in ("malicious_indicator", "risky_construct")
+            ],
+            # What the scan could not read decides the answer as much as a finding: an install
+            # script it could not analyze, a component nothing of which was read, or any other
+            # part of it left unanalyzed (said in the console, denied in CI).
+            "needs_review": [
+                {"category": n.get("category"), "title": n.get("title"), "file": n.get("file")}
+                for n in report.get("needs_review") or []
+                if n.get("title") in UNANALYZED_TITLES
+            ],
+        },
+    }
+    scanned = str((report.get("component") or {}).get("download_url") or "").rsplit("/", 1)[-1]
+    if job["artifact"] and scanned != job["artifact"]:
+        # A file was added to the release between the lookup and the scan: the verdict is good
+        # for what was scanned, but it is not the artifact the key names, so it is not kept.
+        return entry["report"]
+    # The hook's own cache, wherever the check that found the verdict ran.
+    _hook_cache_store(_hook_cache_path(), job["key"], entry, deadline)
+    return entry["report"]
+
+
+def _hook_cache_store(path: Path, key: str, entry: dict, deadline: float | None = None) -> None:
+    """Add ``entry`` to the cache file. Every writer holds the cache's lock from reading the file to
+    writing it back: two checks that finish at once must both be kept. A hook waits for the lock
+    until ``deadline`` at most (a check in the background, up to 15 seconds)."""
+    from skilltotal.hook_scan import file_lock, write_atomic
+
+    wait_s = 15.0 if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(path.with_name(path.name + ".lock"), wait_s=wait_s):
+            now = time.time()
+            cache = _hook_cache_read(path)
+            # Keep the file small: drop what has expired, then the oldest past the cap.
+            live = {k: v for k, v in cache.items()
+                    if isinstance(v, dict) and _fresh(v, now, _hook_cache_ttl(k))}
+            newest = sorted(live, key=lambda k: _number(live[k].get("at")), reverse=True)
+            kept = {key: entry,
+                    **{k: live[k] for k in newest[: HOOK_CACHE_MAX_ENTRIES - 1] if k != key}}
+            write_atomic(path, json.dumps(kept), deadline)
+    except (OSError, TimeoutError):
+        pass  # no cache this time; the verdict itself is still good
+
+
+# A key that names one exact artifact: an npm release, or a PyPI release with the file pip installs
+# (and a digest of every file in the release). Anything else can change under the same name.
+_RELEASE_KEY = re.compile(
+    r"npm:(?:@[^/\s@]+/)?[^/\s@]+@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?"
+    r"|pypi:[^\s=]+==\S+ \S+(?: [0-9a-f]{16})?"
+)
+
+
+def _hook_cache_ttl(key: str) -> float:
+    """How long a verdict kept under ``key`` may be reused: a week for one exact release, an hour
+    for anything else. It is worked out from the key, never taken from the cache file."""
+    return HOOK_RELEASE_TTL_S if _RELEASE_KEY.fullmatch(key) else HOOK_MOVING_TTL_S
+
+
+def _usable(entry: object) -> bool:
+    """Whether a cache entry may answer at all: it records this engine and ruleset, and a verdict.
+
+    The cache is a plain file that anything running as the person can write, so this is not a
+    defense against such a program (it can as well replace the CLI); it keeps a stale entry, or
+    one written by hand without these fields, from deciding an install.
+    """
+    if not isinstance(entry, dict):
+        return False
+    report = entry.get("report")
+    return (entry.get("engine") == __version__ and entry.get("ruleset") == RULESET_VERSION
+            and isinstance(report, dict) and isinstance(report.get("verdict"), dict))
+
+
+def _fresh(entry: dict, now: float, ttl: float) -> bool:
+    """Whether a cache entry is still good: younger than its key allows. An entry dated in the
+    future, or claiming a longer life than its key allows, is not."""
+    stored = _number(entry.get("ttl", ttl))
+    return stored <= ttl and 0 <= now - _number(entry.get("at")) < stored
+
+
+def _number(value: object) -> float:
+    """A cache timestamp or TTL as a float; anything malformed counts as 0 (expired)."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _hook_scan(source: str, timeout: float, job: dict | None = None, *,
+               mirror: bool = False) -> dict:
+    """Scan ``source`` in processes of its own and wait up to ``timeout`` seconds for the report.
+
+    The scan outlives the wait: past it, this raises ``ScanContinues`` (a TimeoutError) with the
+    running check, and the caller hands it over or stops it. ``job`` (what the verdict is recorded
+    under, and the check's marker token) lets the check keep its verdict even if this hook goes
+    away. The check runs in an empty directory with a temp directory of its own, never in the
+    agent's project (see ``RunningScan.start``). Only a ``mirror`` check gets the registry mirror
+    settings and token.
+    """
+    from skilltotal.hook_scan import GRACE_S, RunningScan
+
+    deadline = time.monotonic() + timeout + GRACE_S
+    return RunningScan.start(source, job, deadline, mirror=mirror).wait(timeout)
+
+
 def _cmd_rules(args: argparse.Namespace) -> int:
+    from skilltotal.report import render_rules_json, render_rules_text
+    from skilltotal.rules import get_rules
+
     if args.rules_command == "list":
         rules = get_rules()
         if args.json:
@@ -521,38 +2152,220 @@ def _cmd_rules(args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+def _score_arg(text: str) -> int:
+    """A risk score threshold: a whole number from 0 to 100 (200 would never trip, -5 always)."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a whole number from 0 to 100, not {text!r}") from None
+    if not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError(f"must be from 0 to 100, not {value}")
+    return value
+
+
 def _load_config(args: argparse.Namespace) -> Config:
-    """Load .skilltotal.toml (explicit --config or auto-discovered); empty config if none."""
+    """Load .skilltotal.toml (explicit --config or auto-discovered); empty config if none, or
+    with --no-config."""
+    from skilltotal.config import Config, find_config, load_config
+
+    if getattr(args, "no_config", False):
+        return Config()
     path = Path(args.config) if args.config else find_config()
     if path is None:
         return Config()
+    # A config that cannot be read is an error (ConfigError, exit 1), never "no config": the gate
+    # it configures would be silently off.
+    return load_config(path)
+
+
+def _one_line(text: str) -> str:
+    from skilltotal.report import one_line
+
+    return one_line(text)
+
+
+def _diagnostic(text: str) -> str:
+    """An error message that carries text from outside (a git server's `remote:` lines, a
+    registry's answer, a file name): its line breaks are kept, but control characters and CI
+    workflow commands (`::error::`, `##[...]`) are shown as text, as in a report."""
+    from skilltotal.report import _terminal_safe
+
+    return _terminal_safe(text)
+
+
+# A quote inside one argument, then the end of it or what reads as a flag: on Windows, `\"` in a
+# command line is a literal quote, so PowerShell's `'.\my comp\' --json` reaches the program as the
+# single argument `.\my comp" --json`.
+_JOINED_ARGS = re.compile(r'"(?:\s*$|\s+--?[A-Za-z])')
+
+
+def _joined_by_trailing_backslash(source: str) -> bool:
+    return bool(_JOINED_ARGS.search(source))
+
+
+def _project_missing(project: str | None) -> bool:
+    """Say so and return True when ``--project DIR`` names no folder: a mistyped DIR used to
+    check nothing in it and exit 0, as if its agent configs had passed."""
+    if project and not Path(project).expanduser().is_dir():
+        print(f"error: project directory not found: {_one_line(project)}", file=sys.stderr)
+        return True
+    return False
+
+
+def _output_problem(path: str) -> str:
+    """Why a report cannot be written to ``path``, checked before a scan that may take minutes;
+    "" when it can be tried. The write itself still reports what this cannot foresee."""
+    parent = Path(path).expanduser().parent
+    if not parent.is_dir():
+        return (f"the folder {_one_line(str(parent))} does not exist; create it first "
+                "(the report file is created, its folder is not)")
+    if not os.access(parent, os.W_OK):
+        return f"the folder {_one_line(str(parent))} is not writable"
+    return ""
+
+
+class UnsafeOutputPath(OSError):
+    """The output path is a link: writing through it would overwrite whatever it points to."""
+
+
+def _is_link(path: Path) -> bool:
+    """A symbolic link, or on Windows any reparse point (a junction)."""
+    import stat
+
     try:
-        return load_config(path)
-    except OSError as exc:
-        print(f"warning: cannot read config {path}: {exc}", file=sys.stderr)
-        return Config()
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(st, "st_file_attributes", 0) & reparse)
+
+
+def _linked_folder_below_cwd(target: Path) -> Path | None:
+    """The first folder between the working directory and ``target`` that is a link, if any."""
+    cwd = Path(os.path.abspath(os.getcwd()))
+    parent = Path(os.path.abspath(target)).parent
+    try:
+        rel = parent.relative_to(cwd)
+    except ValueError:
+        return None  # outside the working directory: an absolute path the operator chose
+    folder = cwd
+    for part in rel.parts:
+        folder = folder / part
+        if _is_link(folder):
+            return folder
+    return None
+
+
+def _write_file(path: str, text: str) -> None:
+    """Write ``text`` to ``path`` (UTF-8) without following a link at ``path``.
+
+    A repository can commit `skilltotal.sarif` as a link to a file outside the checkout; the
+    action writing its report there would overwrite that file. So a link is refused, and the text
+    goes to a temporary file in the same folder that then replaces ``path`` (an atomic rename,
+    which replaces a name and never writes through it).
+    """
+    import tempfile
+
+    target = Path(path)
+    if _is_link(target):
+        raise UnsafeOutputPath(f"{path} is a symbolic link or junction; refusing to write "
+                               "through it")
+    # The same holds for a folder on the way inside the working directory, where a checkout
+    # puts what a repository commits: `reports/` as a link out of it redirected the write
+    # (security review, 2026-10-15). Folders above the working directory are the machine's own
+    # (macOS /tmp is a link) and are not the repository's to choose.
+    linked = _linked_folder_below_cwd(target)
+    if linked is not None:
+        raise UnsafeOutputPath(f"{linked} is a symbolic link or junction; refusing to write "
+                               f"{path} through it")
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if os.name != "nt":
+            # mkstemp creates the file readable by its owner only; a report is an ordinary file.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _fails_gate(
     report, level: str | None, score: int | None, policy: dict[str, str] | None = None
 ) -> bool:
-    """True if the report trips the configured CI gate (severity level and/or risk score).
+    """True if the report trips the configured CI gate (see :func:`_gate_failures`)."""
+    return bool(_gate_failures(report, level, score, policy))
+
+
+def _gate_failures(
+    report, level: str | None, score: int | None, policy: dict[str, str] | None = None,
+    *, level_label: str = "", score_label: str = "",
+) -> list[str]:
+    """Why the report trips the configured CI gate (severity level, risk score, policy), one line
+    per gate that tripped; empty when it passes. A failed gate that does not say why sends the
+    engineer looking through the whole report.
+
+    The severity gate counts what the score counts as risk. A malicious indicator trips any
+    level (a prompt-injection hit is medium severity, and its verdict is still malicious); a
+    risky construct or a shipped secret trips at its severity; a capability, which is what a
+    component can do (run a shell, reach the network), never trips it on its own. Counting
+    capabilities failed CI for most honest tools: a shell call is high severity.
+
+    What the scan could not read fails the severity gate closed, as it does in `guard`: a script
+    that runs at install time and was not analyzed, or a component nothing of which was read.
+    Counting capabilities used to cover the first by accident (an install hook is a high
+    capability), so a dropper padded past the size limit failed CI; it must still.
 
     Per-rule policy actions refine the severity gate: a `block` rule trips it whenever it
-    fires (even with no `fail_on` configured); a `warn` rule is exempt from the severity
-    threshold (explicit accept-but-show). The aggregate `fail_on_score` gate is unaffected —
-    warn findings still count toward the risk score.
+    fires (even with no `fail_on` configured, capabilities included: the way to forbid one);
+    a `warn` rule is exempt from the severity threshold (explicit accept-but-show). The
+    aggregate `fail_on_score` gate is unaffected — warn findings still count toward the
+    risk score.
     """
+    from skilltotal.models import NOTHING_READ, UNANALYZED_INSTALL_SCRIPT, Severity, ThreatClass
+
     policy = policy or {}
-    if any(policy.get(f.id) == "block" for f in report.findings):
-        return True
+    failures: list[str] = []
+    for f in report.findings:
+        if policy.get(f.id) == "block":
+            failures.append(f'[policy] "{f.id}" = "block" tripped by {f.id}{_where(f)}')
     if level:
+        label = level_label or f"--fail-on {level}"
+        for n in report.needs_review:
+            if n.title in (UNANALYZED_INSTALL_SCRIPT, NOTHING_READ):
+                failures.append(f"{label} fails closed: {_one_line(n.title)}"
+                                + (f" ({_one_line(n.file)})" if n.file else ""))
+                break
         threshold = Severity[level.upper()].rank
-        if any(
-            f.severity.rank >= threshold and policy.get(f.id) != "warn"
-            for f in report.findings
-        ):
-            return True
+        tripping = [
+            f for f in report.findings
+            if policy.get(f.id) != "warn" and f.threat_class is not ThreatClass.CAPABILITY
+            and (f.threat_class is ThreatClass.MALICIOUS_INDICATOR or f.severity.rank >= threshold)
+        ]
+        if tripping:
+            first = tripping[0]
+            more = f" and {len(tripping) - 1} more" if len(tripping) > 1 else ""
+            # The gate reads each finding, not the headline score, so "low risk (20/100)" can sit
+            # next to a tripped high gate; naming the finding's severity says which one fired.
+            why = ("a malicious indicator" if first.threat_class is ThreatClass.MALICIOUS_INDICATOR
+                   else f"severity {first.severity.value}")
+            failures.append(f"{label} tripped by {first.id}{_where(first)}, {why}{more}")
     if score is not None and report.risk_score >= score:
-        return True
-    return False
+        label = score_label or f"--fail-on-score {score}"
+        failures.append(f"{label} tripped: risk score {report.risk_score} >= {score}")
+    return failures
+
+
+def _where(finding) -> str:
+    """`` (file:line)`` of a finding's first evidence, safe to print on one line."""
+    if not finding.evidence:
+        return ""
+    e = finding.evidence[0]
+    return f" ({_one_line(e.file)}:{e.line_start})"

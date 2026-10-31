@@ -7,6 +7,79 @@ Please report security issues privately via GitHub Security Advisories
 **contact@skilltotal.ai** — not in public issues. We aim to acknowledge within a few
 business days.
 
+### What to report privately, and what in public
+
+- **Privately:** anything that lets a component make SkillTotal itself misbehave. For example,
+  code from a scanned package, repository or archive that runs on the user's machine; an install
+  command the Claude Code plugin should have read but missed, or an install it let through against
+  its own verdict; a path escape during extraction; or a way to tamper with a report or a cached
+  verdict.
+- **In a public issue, or a pull request with a sanitized fixture:** a package that was scanned
+  but that no rule flagged (a detection gap), or a false positive. Detection gaps are expected in
+  a static scanner. They are fixed in the open, and the sample is added to the test corpus.
+
+Send a description, the SkillTotal version (`skilltotal --version`) and, if you can, a minimal
+sanitized reproducer. We acknowledge within a few business days, keep you informed while we fix
+it, and credit you in the advisory unless you prefer otherwise.
+
+## Scanning untrusted input
+
+SkillTotal is built to be pointed at code you do not trust. What it does and does not do with it:
+
+- **It never runs the scanned code.** Files are read as text and parsed (Python's `ast`, JSON,
+  TOML, markdown); nothing is imported, executed, installed or built, and no LLM is called. Package
+  install scripts are read, never run.
+- **What it contacts, and when.** A local folder, archive or file is scanned without any network
+  request. A git URL is cloned with `git clone --depth 1` (terminal prompts off, Git LFS downloads
+  skipped), after GitHub REST API calls that check the size of a github.com repository. An `npm:`
+  or `pypi:` source is fetched over HTTPS from the npm registry or PyPI. `--provenance` fetches
+  registry metadata. `inventory`, `guard --installed` and the Claude Code plugin fetch the packages
+  they check from the same places. There is no telemetry.
+- **Limits.** Each file over 2 MiB is not read (the verdict says "Partially analyzed"), except a
+  VS Code extension's entry points, which are read up to 8 MiB. Archives,
+  clones and the total text read are capped by environment variables, and a source over a limit
+  is refused with the variable to raise: `SKILLTOTAL_MAX_ARCHIVE_MB` (150), `SKILLTOTAL_MAX_EXTRACT_MB`
+  (400), `SKILLTOTAL_MAX_ARCHIVE_MEMBERS` (30000), `SKILLTOTAL_MAX_CLONE_MB` (200),
+  `SKILLTOTAL_MAX_READABLE_MB` (same as the clone limit) and `SKILLTOTAL_CLONE_TIMEOUT` (300 seconds).
+  Registry and download requests time out after 60 seconds, and JSON is parsed with size and depth
+  bounds. Regular expressions that ran superlinearly on crafted input are bounded and tested on
+  200,000-character inputs.
+- **Archives and links.** Archive entries are checked before anything is written: symbolic and
+  hard links, devices and FIFOs are left out, a path that would land outside the extraction folder
+  stops the scan, password-protected archives are refused, and stored permissions are not applied.
+  In a scanned folder, symbolic links and junctions are not followed. Temporary clones and
+  extractions are removed when the scan ends, also on Ctrl-C or SIGTERM.
+- **Output.** `--output`, `--write-baseline`, `--write-accept` and the `--state` file refuse to
+  write when the target, or any folder between the working directory and it, is a symbolic link
+  or junction, and replace the file atomically. A `--state` or `--write-accept` file that holds
+  anything other than SkillTotal's own format is left as it is; the GitHub Action refuses a `sarif-file` under such a folder of the workspace before
+  it creates or removes anything there. The text report prints control characters from the
+  scanned files as escapes (`\x1b`; in file names, `<U+XXXX>`, which also covers newlines), so
+  they cannot drive your terminal or forge report lines, and the GitHub Action stops workflow
+  commands from its first line until its own annotations, so neither the scanned text nor an
+  input (a branch name, an issue title) can raise one.
+- **Its own tools.** `git` is resolved from absolute `PATH` entries only, never from the current
+  directory. Run the CLI as the `skilltotal` console script or `python -P -m skilltotal`: plain
+  `python -m` imports from the current directory first, so a planted `json.py` would run.
+- **Config discovery.** `.skilltotal.toml` is read from the directory the CLI runs in. In CI that
+  is usually the repository being scanned, so a pull request can loosen the gate through it, its
+  baseline file or inline `skilltotal:ignore` markers. Protect those files with CODEOWNERS and
+  branch protection, and pass `--no-config` (Action: `config: none`) when you scan code you don't
+  control from its own root. An applied config is always named in the output (in the Action, also
+  in the job summary and the pull request comment, with a warning when a pull request changes it
+  and the base branch is fetched). Inline markers are
+  honored only when scanning a local directory, never in a fetched package or repository.
+
+A finding is evidence of what the code can do, not proof of intent, and a clean report is not
+proof of safety: see the [limitations](docs/detection.md#limitations).
+
+## Supported versions
+
+Only the latest release receives fixes. The engine, the CLI, the Claude Code plugin, the GitHub
+Action and the npm runner are released together under one version number. Upgrade the CLI with
+`pipx upgrade skilltotal`; the plugin updates through its marketplace, and the GitHub Action and
+the pre-commit hook move when you change the tag they are pinned to.
+
 ## Preventing secret/key leakage (defense in depth)
 
 SkillTotal is a security product; its own repo must not leak secrets. Four independent layers
@@ -22,9 +95,13 @@ guard against committing secrets or keys — no single layer is relied on alone:
    protection blocks a `git push` containing a recognized **partner** secret format (an AWS
    `AKIA…`, a Hugging Face `hf_…`, a GitHub `ghp_…` token, …) — a stop even if layers 1–2 are
    bypassed. This layer is **not disable-able by repo config** for partner patterns.
-4. **No long-lived tokens** (OIDC): PyPI publishing uses **Trusted Publishing** (OpenID
-   Connect) from GitHub Actions, so there are no PyPI API tokens stored in the repo, in CI
-   secrets, or on any developer machine. There is no static publishing key to leak.
+4. **No long-lived tokens** (OIDC): PyPI and npm publishing use **Trusted Publishing** (OpenID
+   Connect) from GitHub Actions. No PyPI or npm API token is stored in the repo or in CI secrets,
+   so there is no static publishing key to leak. What the release workflow publishes carries a
+   PEP 740 attestation (PyPI) or npm provenance that points back to the workflow run that built
+   it.
+   The `pypi` and `npm` environments publish only from `v*` tags. Release tags are signed and
+   protected: only a maintainer can create one, and no release tag can be moved or deleted.
 
 Supporting measures: `.gitignore` excludes common secret files (`.env`, `*.pem`, `*.key`,
 `id_rsa`, `.pypirc`, `.npmrc`, …); a `detect-secrets` baseline (`.secrets.baseline`) tracks
@@ -53,6 +130,7 @@ not weakened:
 
 ## If a secret is ever exposed
 
-Treat it as compromised: rotate/revoke it immediately at the provider, then purge it from
-history (e.g. `git filter-repo`) and force-push. Because publishing uses OIDC, a leaked repo
-contains no usable publishing credential.
+Treat it as compromised and rotate or revoke it at the provider immediately. Rotation is the fix.
+A secret that reached a public repository has already been copied, and rewriting history does not
+take it back (the default branch is protected against force-pushes). Because publishing uses OIDC,
+the repository holds no publishing credential that could leak.

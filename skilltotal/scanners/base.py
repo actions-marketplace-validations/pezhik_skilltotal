@@ -15,12 +15,18 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from skilltotal.file_index import FileIndex, IndexedFile
+from skilltotal.bounded_json import MAX_DEPTH
+from skilltotal.file_index import FileIndex, IndexedFile, is_test_path
 from skilltotal.models import Capability, Evidence, Finding, NeedsReview, Severity, ThreatClass
 from skilltotal.text_normalize import original_span
 
-# Cap evidence kept per finding so a noisy file cannot bloat the report.
+# Cap evidence kept per finding so a noisy file cannot bloat the report. The engine applies it
+# AFTER test/doc/string demotion (engine._cap_evidence).
 MAX_EVIDENCE_PER_FINDING = 25
+# Bound on matches a scanner collects for one finding before demotion. Collecting only the first 25
+# let 25 mentions in a README or a test crowd out a real match in code: the doc matches were
+# demoted, the finding vanished, and the code match was never looked at.
+MAX_EVIDENCE_SCANNED = 500
 
 
 def deobfuscated_spans(
@@ -45,6 +51,42 @@ def deobfuscated_spans(
             yield f, start, end
 
 
+def concat_folded_spans(
+    index: FileIndex, pattern: re.Pattern[str], *, suffixes: tuple[str, ...] | None = None
+) -> Iterator[tuple[IndexedFile, int, int]]:
+    """Yield ``(file, start, end)`` for ``pattern`` matches found only after folding away string
+    concatenation (``"a" + "b"`` -> ``"ab"``; see :mod:`skilltotal.concat_normalize`).
+
+    Each match span is mapped back to the ORIGINAL file offsets so evidence stays anchored (the
+    span covers the whole original concatenation, e.g. ``"~/." + "ssh/id_rsa"``). Files where
+    folding is the identity (no concatenated literals — the common case) are skipped, so this is
+    nearly free for normal code and only does work where literals were actually spliced. The
+    caller de-dupes against raw matches and applies its own context/suppression on the original
+    line.
+    """
+    for f in index.select(suffixes=suffixes):
+        folded = f.concat_folded_or_none()
+        if folded is None:
+            continue
+        text, idx = folded
+        for m in pattern.finditer(text):
+            start, end = original_span(idx, m.start(), m.end())
+            if start < end:
+                yield f, start, end
+
+
+# Post-exploitation tactics (MITRE ATT&CK names in short form). A rule declares at most one; the
+# ST-POSTEX-CHAIN combination fires when the findings cover at least two, one of them a way in
+# (remote access) or a call home (command and control).
+TACTIC_REMOTE_ACCESS = "remote_access"
+TACTIC_PERSISTENCE = "persistence"
+TACTIC_DEFENSE_EVASION = "defense_evasion"
+TACTIC_COMMAND_AND_CONTROL = "command_and_control"
+TACTICS: tuple[str, ...] = (
+    TACTIC_REMOTE_ACCESS, TACTIC_PERSISTENCE, TACTIC_DEFENSE_EVASION, TACTIC_COMMAND_AND_CONTROL,
+)
+
+
 @dataclass(frozen=True)
 class RuleSpec:
     """Metadata + (optional) detection pattern for a single rule."""
@@ -66,6 +108,9 @@ class RuleSpec:
     #   "any"                  - count every match (default; e.g. AST/JSON-anchored rules).
     #   "comments"             - demote matches inside Python comments only (real positives are
     #                            value-strings, e.g. ST-EXPOSE-* `host="0.0.0.0"`).
+    #   "comments_and_docstrings" - as "comments", plus Python docstrings (a string literal that
+    #                            stands alone as a statement documents the code; its examples do
+    #                            not run). Other string literals stay in scope.
     #   "strings_and_comments" - demote matches inside Python string literals OR comments (real
     #                            positives are never a plain .py value-string). C-family string
     #                            literals are NOT demoted (a credential path in a JS string is
@@ -76,6 +121,10 @@ class RuleSpec:
     #                            definition ``Description: "ignore previous instructions"``) is data
     #                            describing an attack, not a live directive.
     code_context: str = "any"
+    # The post-exploitation tactic a rule's finding is a step of (one of ``TACTICS``), or None.
+    # The ST-POSTEX-CHAIN combination counts distinct tactics among the findings that survive
+    # demotion, so a new rule joins the chain by declaring its tactic here. Not serialized.
+    tactic: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -89,6 +138,55 @@ class RuleSpec:
             "threat_class": self.threat_class.value,
         }
 
+# How many places an aggregated needs_review note names before "and N more".
+REVIEW_PLACES_SHOWN = 5
+
+
+def aggregated_review(
+    *,
+    category: str,
+    title: str,
+    places: list[tuple[str, int | None]],
+    what: str,
+    advice: str,
+    capped: bool = False,
+) -> NeedsReview:
+    """One needs_review note for every place a review-only heuristic matched.
+
+    These heuristics used to write one note per file or per line, so a single package could
+    carry hundreds of identical rows (352 "Unparseable Python file" notes for one linter's test
+    fixtures). The note now says how many places matched, names the first few as ``file:line``,
+    says how many are in test code, and points ``file``/``line`` at the first one.
+    """
+    shown = ", ".join(f"{f}:{ln}" if ln else f for f, ln in places[:REVIEW_PLACES_SHOWN])
+    more = len(places) - REVIEW_PLACES_SHOWN
+    if more > 0:
+        shown += f", and {more}{'+' if capped else ''} more"
+    count = f"{len(places)}{'+' if capped else ''}"
+    in_tests = len({f for f, _ in places if is_test_path(f)})
+    tests = f" {in_tests} of the files are test code." if in_tests else ""
+    return NeedsReview(
+        category=category,
+        title=title,
+        reason=f"{count} {what}: {shown}.{tests} {advice}",
+        file=places[0][0],
+        line=places[0][1],
+    )
+
+
+def deep_json_review(category: str, file: str) -> NeedsReview:
+    """A note that part of a JSON file, nested past bounded_json.MAX_DEPTH, was not analyzed."""
+    return NeedsReview(
+        category=category,
+        title="Deeply nested JSON partly analyzed",
+        reason=(
+            f"Values nested deeper than {MAX_DEPTH} levels were read as empty and not analyzed; "
+            "the rest of the file was. Nothing an agent or a client configures sits that deep."
+        ),
+        file=file,
+        line=None,
+    )
+
 
 @dataclass
 class ScanResult:
@@ -96,6 +194,10 @@ class ScanResult:
 
     findings: list[Finding] = field(default_factory=list)
     needs_review: list[NeedsReview] = field(default_factory=list)
+    # Files whose structure the scanner could not analyze (Python nested too deeply to parse or
+    # walk), read by regex alone. A match in a string literal there is all the evidence there is,
+    # so the engine does not set such matches aside as text.
+    regex_only_files: list[str] = field(default_factory=list)
 
 
 class Scanner(ABC):
@@ -150,7 +252,7 @@ def _collect_evidence(index: FileIndex, rule: RuleSpec) -> list[Evidence]:
             continue
         seen.add(key)
         evidence.append(ev)
-        if len(evidence) >= MAX_EVIDENCE_PER_FINDING:
+        if len(evidence) >= MAX_EVIDENCE_SCANNED:
             break
     return evidence
 
@@ -158,7 +260,8 @@ def _collect_evidence(index: FileIndex, rule: RuleSpec) -> list[Evidence]:
 def _finding_from_rule(rule: RuleSpec, evidence: list[Evidence]) -> Finding:
     description = rule.description
     if len(evidence) > 1:
-        description = f"{description} ({len(evidence)} occurrence(s) shown as evidence)."
+        shown = min(len(evidence), MAX_EVIDENCE_PER_FINDING)
+        description = f"{description} ({shown} occurrence(s) shown as evidence)."
     return Finding(
         id=rule.id,
         severity=rule.severity,

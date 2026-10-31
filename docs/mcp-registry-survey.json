@@ -1,8 +1,9 @@
 {
   "metadata": {
-    "generated": "2026-08-20",
-    "engine": "0.41.0",
-    "ruleset": 45,
+    "generated": "2026-09-19",
+    "population_snapshot": "2026-08-16",
+    "engine": "0.49.0",
+    "ruleset": 59,
     "registry_entries": 73460,
     "registry_url": "https://registry.modelcontextprotocol.io/v0/servers",
     "clone_mb": 50,
@@ -10,47 +11,100 @@
   },
   "summary": {
     "population": 17535,
-    "scanned": 15538,
-    "skipped": 1997,
+    "scanned": 15341,
+    "skipped": 2194,
     "skip_reasons": {
-      "larger than the size bound": 146,
-      "repository or package no longer reachable": 1593,
-      "slower than the time bound": 194,
-      "other": 60,
-      "access denied": 4
+      "larger than the size bound": 188,
+      "repository or package no longer reachable": 1637,
+      "other": 65,
+      "access denied": 2,
+      "slower than the time bound": 302
     },
     "by_ecosystem": {
       "git": {
         "total": 7312,
-        "scanned": 5518
+        "scanned": 5389
       },
       "npm": {
         "total": 7152,
-        "scanned": 7016
+        "scanned": 6967
       },
       "pypi": {
         "total": 3071,
-        "scanned": 3004
+        "scanned": 2985
       }
     },
     "risk_level": {
-      "low": 15109,
-      "medium": 143,
-      "high": 256,
-      "critical": 30
+      "low": 15225,
+      "medium": 90,
+      "high": 22,
+      "critical": 4
     },
-    "malicious_indicators": 65,
+    "malicious_indicators": 0,
+    "rulesets": {
+      "56": 11774,
+      "57": 9,
+      "58": 30,
+      "59": 3528
+    },
     "capabilities": {
-      "mcp_tools_detected": 12666,
-      "network_egress": 10134,
-      "shell_execution": 4551,
-      "filesystem_read": 3936,
-      "filesystem_write": 3286,
-      "install_time_execution": 1162,
-      "delegated_authentication": 914,
-      "dynamic_code_execution": 539,
-      "scoped_identity": 85,
-      "prompt_surface_risk": 63
+      "mcp_tools_detected": 13524,
+      "network_egress": 9938,
+      "shell_execution": 3230,
+      "filesystem_read": 3828,
+      "filesystem_write": 3206,
+      "install_time_execution": 1134,
+      "delegated_authentication": 895,
+      "dynamic_code_execution": 475,
+      "scoped_identity": 81,
+      "prompt_surface_risk": 0
+    },
+    "owasp": {
+      "AST01": 73,
+      "AST02": 1216,
+      "AST03": 1905,
+      "AST04": 0,
+      "AST05": 53
+    },
+    "top_rules": {
+      "ST-MCP-DETECTED": 13524,
+      "ST-NET-NODE": 7417,
+      "ST-NET-PY": 2782,
+      "ST-FS-PY-READ": 2343,
+      "ST-SHELL-NODE": 2121,
+      "ST-FS-PY-WRITE": 1964,
+      "ST-FS-NODE-READ": 1547,
+      "ST-EXPOSE-BIND": 1363,
+      "ST-FS-NODE-WRITE": 1312,
+      "ST-MCP-DANGEROUS-TOOL": 1298,
+      "ST-SHELL-PY": 1149,
+      "ST-AUTH-DELEGATED": 895,
+      "ST-INSTALL-NPM-PREPARE": 749,
+      "ST-MCP-SERVER-EXEC": 695,
+      "ST-INSTALL-NPM": 375,
+      "ST-DYN-NODE": 372,
+      "ST-SECRET-EMBEDDED": 179,
+      "ST-CMDI-NODE": 166,
+      "ST-DYN-PY": 103,
+      "ST-AUTH-SCOPED": 81,
+      "ST-CMDI-PY": 72,
+      "ST-SHELL-EVASION": 60,
+      "ST-DESERIALIZE-PY": 53,
+      "ST-SENS-PATH": 52,
+      "ST-AGENT-AUTORUN": 49,
+      "ST-SHELL-PIPE-EXEC": 37,
+      "ST-INSTALL-PY": 35,
+      "ST-ENV-SHIPPED": 19,
+      "ST-COMBO-EXFIL": 13,
+      "ST-AGENT-CLI-BYPASS": 12,
+      "ST-SENS-PATH-PY": 10,
+      "ST-EXPOSE-DEBUG": 8,
+      "ST-TAINT-SHELL-PY": 7,
+      "ST-MCP-AUTO-APPROVE": 5,
+      "ST-TAINT-EXEC-PY": 4,
+      "ST-TYPOSQUAT": 3,
+      "ST-EMAIL-BCC-EXFIL": 1,
+      "ST-INSTALL-DROPPER": 1
     },
     "registry_shape": {
       "git_sources": 7312,

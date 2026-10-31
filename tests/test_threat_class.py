@@ -52,14 +52,18 @@ def test_clean_component_verdict_is_clean(clean_report):
     assert v["headline"] == "No significant risks found"
 
 
-def test_combo_finding_is_capability_not_malware(malicious_py):
-    # filesystem+network combo is an exfiltration *surface*, not proof of intent.
-    by_id = _by_id(malicious_py)
-    if "ST-COMBO-FS-NET" in by_id:
-        assert by_id["ST-COMBO-FS-NET"].threat_class == ThreatClass.CAPABILITY
-
-
 def test_every_finding_has_a_threat_class(malicious_npm, malicious_py, mcp_report):
     for report in (malicious_npm, malicious_py, mcp_report):
         for f in report.findings:
             assert isinstance(f.threat_class, ThreatClass)
+
+
+def test_a_single_risky_construct_is_low_risk_but_not_called_clean(tmp_path):
+    # One risky construct scores 20 (low band). The headline said "No significant risks found"
+    # above the finding it had just listed.
+    from skilltotal.engine import analyze
+
+    (tmp_path / "m.py").write_text("import pickle\nobj = pickle.loads(blob)\n", encoding="utf-8")
+    report = analyze(str(tmp_path))
+    assert (report.risk_score, report.risk_level.value) == (20, "low")
+    assert report.verdict["headline"] == "Low risk - review the findings before installing"

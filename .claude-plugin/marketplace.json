@@ -1,0 +1,20 @@
+{
+  "name": "skilltotal",
+  "description": "Checks packages for malicious indicators before the agent installs them.",
+  "owner": {
+    "name": "SkillTotal",
+    "url": "https://www.skilltotal.ai"
+  },
+  "plugins": [
+    {
+      "name": "skilltotal",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/pezhik/skilltotal.git",
+        "path": "plugin",
+        "ref": "stable"
+      },
+      "description": "Scan packages before the agent installs them."
+    }
+  ]
+}

@@ -38,7 +38,7 @@ def test_aws_key_detected_and_redacted(tmp_path):
     key = fake_token("AKIA", "1B2C3D4E5F6G7H8I")
     res = _scan(tmp_path, "config.py", f'AWS_KEY = "{key}"\n')
     f = _finding(res)
-    assert f is not None and f.threat_class == ThreatClass.RISKY_CONSTRUCT
+    assert f is not None and f.threat_class == ThreatClass.EXPOSURE
     # value never re-leaked: redacted, only a short prefix shown
     snippet = f.evidence[0].snippet
     assert key not in snippet
@@ -125,6 +125,28 @@ def test_placeholders_not_flagged(tmp_path):
     ):
         res = _scan(tmp_path, "f.py", val + "\n")
         assert _finding(res) is None, val
+
+
+def test_a_provider_token_of_one_repeated_character_is_a_placeholder(tmp_path):
+    """The prefix must not count towards "enough distinct characters to be real".
+
+    A redaction linter's own sample line, `"Token: ghp_" + 36 copies of one letter`, came back
+    as a live credential: five distinct characters in all, four of them `ghp_`. Its author was
+    right to call it an example. A real token's body is random; a body of one or two symbols
+    behind any provider prefix is a placeholder, whatever the prefix adds.
+    """
+    for prefix, body in (
+        ("ghp_", "a" * 36),
+        ("ghp_", "X" * 36),
+        ("github_pat_", "0" * 70),
+        ("sk-ant-", "z" * 40),
+        ("xoxb-", "1" * 30),
+    ):
+        line = f'SAMPLE = "Token: {fake_token(prefix, body)}"\n'
+        assert _finding(_scan(tmp_path, "redaction_linter.py", line)) is None, prefix + body[:4]
+    # And the real shape still counts: a random body behind the same prefix is a credential.
+    real = fake_token("ghp_", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ12")
+    assert _finding(_scan(tmp_path, "config.py", f'TOKEN = "{real}"\n')) is not None
 
 
 def test_secret_in_tests_demoted(tmp_path):
@@ -218,7 +240,7 @@ def test_publisher_registry_token_file_is_detected(tmp_path):
     res = _scan(tmp_path, ".mcpregistry_registry_token", f'{{"token":"{jwt}"}}')
     finding = _finding(res)
     assert finding is not None
-    assert finding.threat_class is ThreatClass.RISKY_CONSTRUCT
+    assert finding.threat_class is ThreatClass.EXPOSURE
     assert [e.file for e in finding.evidence] == [".mcpregistry_registry_token"]
 
 

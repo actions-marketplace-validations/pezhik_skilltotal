@@ -1,0 +1,28 @@
+{
+  "name": "skilltotal",
+  "displayName": "SkillTotal",
+  "version": "0.88.0",
+  "description": "Checks each package the agent is about to install and shows a line for every install, checked or not. Denies packages with malicious indicators and asks you about high-risk ones, look-alike names and anything it could not check (refused in CI).",
+  "author": {
+    "name": "SkillTotal",
+    "url": "https://www.skilltotal.ai"
+  },
+  "homepage": "https://www.skilltotal.ai",
+  "repository": "https://github.com/pezhik/skilltotal",
+  "license": "Apache-2.0",
+  "keywords": [
+    "security",
+    "mcp",
+    "supply-chain",
+    "static-analysis",
+    "prompt-injection"
+  ],
+  "mcpServers": {
+    "skilltotal": {
+      "command": "skilltotal",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

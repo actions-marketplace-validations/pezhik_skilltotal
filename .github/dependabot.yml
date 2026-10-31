@@ -8,3 +8,18 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci"
+    # One PR for all action bumps: github/codeql-action's init, analyze and upload-sarif must
+    # move together (a mixed pair fails the CodeQL run), and one review beats five.
+    groups:
+      github-actions:
+        patterns: ["*"]
+  # The hash-pinned tools the release build installs (.github/requirements/build.txt).
+  - package-ecosystem: "pip"
+    directory: "/.github/requirements"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "build"
+    groups:
+      build-tools:
+        patterns: ["*"]

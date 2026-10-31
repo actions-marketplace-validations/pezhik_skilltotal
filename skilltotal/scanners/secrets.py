@@ -13,7 +13,13 @@ import re
 
 from skilltotal.file_index import FileIndex
 from skilltotal.models import Evidence, Finding, NeedsReview, Severity, ThreatClass
-from skilltotal.scanners.base import MAX_EVIDENCE_PER_FINDING, RuleSpec, Scanner, ScanResult
+from skilltotal.scanners.base import (
+    MAX_EVIDENCE_SCANNED,
+    RuleSpec,
+    Scanner,
+    ScanResult,
+    concat_folded_spans,
+)
 
 CATEGORY = "secret_exposure"
 
@@ -59,6 +65,35 @@ _KNOWN: list[tuple[str, re.Pattern[str], int]] = [
     ),
 ]
 
+# Reading WALLET key material from the environment. A seed phrase, mnemonic or wallet private
+# key is meant to stay on the host (a wallet signs locally); reading one from an environment
+# variable is a sensitivity signal that, combined with network egress, is the credential-
+# exfiltration shape of the gadgethumans-mcp npm package (a WALLET_PRIVATE_KEY read from the
+# environment and POSTed in an HTTP header). Scoped to WALLET/SEED/MNEMONIC names so a plain
+# PRIVATE_KEY (JWT signer, SSH deploy key) is not swept in; it feeds the exfil combo
+# (scoring._SENSITIVE_DATA_IDS).
+# The surrounding identifier runs are BOUNDED (not ``[A-Z0-9_]*``): a static scanner must not be
+# made quadratic by a crafted ``process.env.`` followed by a megabyte of ``A``. 40 chars of
+# prefix/suffix covers any real env-var name around the wallet-material word.
+_ENV_KEYMAT_NAME = (
+    r"[A-Z0-9_]{0,40}(?:MNEMONIC|SEED_?PHRASE|SECRET_?PHRASE|WALLET_?PRIVATE_?KEY|WALLET_?SECRET|"
+    r"WALLET_?SEED|PRIVATE_?KEY_?MNEMONIC)[A-Z0-9_]{0,40}"
+)
+_ENV_KEYMAT_RE = re.compile(
+    r"process\.env\.(?:" + _ENV_KEYMAT_NAME + r")\b"
+    r"|process\.env\[\s*['\"](?:" + _ENV_KEYMAT_NAME + r")['\"]\s*\]"
+    r"|os\.environ(?:\.get)?\s*[\[(]\s*['\"](?:" + _ENV_KEYMAT_NAME + r")['\"]"
+    r"|os\.getenv\s*\(\s*['\"](?:" + _ENV_KEYMAT_NAME + r")['\"]"
+)
+# Evasion by aliasing the env object: `const e = process.env; ... e.WALLET_PRIVATE_KEY`. Resolve
+# the alias so the key read through it is still seen. JS/TS only (Python reads are AST-folded).
+_ENV_ALIAS = re.compile(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*process\.env\b")
+_ENV_JS_SUFFIXES = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+# Reading a key from the environment is a CODE behaviour; the same text in a markdown code block is
+# a documentation example. Scope the env-secret scan to code files so a SKILL.md / README example
+# is never counted as a real read.
+_ENV_CODE_SUFFIXES = _ENV_JS_SUFFIXES + (".py", ".pyw")
+
 # Generic: a secret-named variable assigned a long opaque string.
 _GENERIC = re.compile(
     r"(?i)(?:api[_-]?key|secret|token|password|passwd|access[_-]?key|auth[_-]?token|"
@@ -75,8 +110,26 @@ _PUBLIC_CHAIN_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 # unambiguous placeholder words — NOT generic hex/alpha runs, which occur in real tokens.
 _PLACEHOLDER = re.compile(
     r"(?i)example|your[_-]?|changeme|placeholder|dummy|sample|xxxx|<[^>]+>|redacted|"
-    r"\bfake\b|insert[_-]?(?:your|here)|\.\.\."
+    r"\bfake\b|insert[_-]?(?:your|here)|\.\.\.|"
+    # Values people type for tests and local defaults: `bg_fake_…`, `mock-api-key-for-testing`,
+    # `e2e-test-token`, `super_secret_password`, `change-this-to-a-random-secret`,
+    # `md_0123456789abcdef…` (a repeated `abcdef`). A generated credential spells none of these.
+    r"fake|mock|fixture|e2e|super[-_]?secret|change[-_]?(?:me|this)|"
+    r"(?-i:abcdef\w*abcdef|0123456789abcdef)|"
+    # The sequences people type into an example key (a payment-API key ending in abc123xyz789); a
+    # random token of this length holds one of them about once in a billion.
+    r"abc123|123456|xyz789|qwerty|"
+    r"not[-_]?a[-_]?real|(?:^|[-_])test[-_]"
 )
+
+
+_ENV_VAR_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){2,}$")
+_HUMAN_WORDS = re.compile(r"^[a-z]{2,}\d{0,4}(?:[-_.][a-z]{2,}\d{0,4}){2,}$")
+
+
+# The fixed prefix a provider puts in front of its tokens (`ghp_`, `github_pat_`, `sk-ant-`,
+# `xoxb-`): letters joined by `_`/`-`, ending in one. Only the body behind it is random.
+_PROVIDER_PREFIX = re.compile(r"^[A-Za-z]{1,12}(?:[_-][A-Za-z]{1,12}){0,3}[_-]")
 
 
 def _is_non_credential_value(value: str) -> bool:
@@ -90,8 +143,19 @@ def _is_non_credential_value(value: str) -> bool:
         return True
     if _PLACEHOLDER.search(value):
         return True
-    # Single repeated character (xxxxxxxx, 00000000) or too few distinct chars.
-    return len(set(value)) <= 4
+    # A name, not a value: `ENV_PRIVATE_KEY = "RECEIPT_SIGNING_KEY"` names the variable to read.
+    if _ENV_VAR_NAME.match(value):
+        return True
+    # Words joined by hyphens are typed by a person (`random-char-string-for-dev`,
+    # `mcp-agent-password`); a generated credential is not spelled that way.
+    if _HUMAN_WORDS.match(value):
+        return True
+    # Single repeated character (xxxxxxxx, 00000000) or too few distinct chars. Judged on the
+    # body behind a provider prefix as well as on the whole: `ghp_` followed by 36 copies of one
+    # letter has five distinct characters in all, four of them the prefix, and passed this test
+    # as a live token -- a redaction linter's own sample line, reported by its author (2026-09-24).
+    body = _PROVIDER_PREFIX.sub("", value, count=1)
+    return len(set(value)) <= 4 or (len(body) >= 8 and len(set(body)) <= 2)
 
 
 # Algolia DocSearch search-only keys are public by design (shipped in client-side docs search)
@@ -114,7 +178,8 @@ def _is_public_docsearch_key(value: str, context: str) -> bool:
 # GOCSPX secret without those markers stays a scored finding (a leaked web-app secret).
 _GOOGLE_OAUTH_PREFIX = "GOCSPX-"
 _INSTALLED_APP_CTX = re.compile(
-    r"(?i)urn:ietf:wg:oauth:2\.0:oob|device[_/]code|code_verifier|code_challenge|"
+    r"(?i)urn:ietf:wg:oauth:2\.0:oob|device[_/]code|code_verifier|code_challenge|bundled|"
+    r"default[_-]client|desktop[_ -]app|native[_ -]app|"
     r"http://(?:localhost|127\.0\.0\.1)|loopback|[\"']installed[\"']\s*[:=]"
 )
 
@@ -124,6 +189,28 @@ def _is_installed_app_oauth_secret(value: str, file_text: str) -> bool:
     return value.startswith(_GOOGLE_OAUTH_PREFIX) and bool(_INSTALLED_APP_CTX.search(file_text))
 
 
+# An OAuth client secret a distributed desktop/CLI client ships in obscured form, beside its public
+# client id: `appEncryptedClientSecret = "…"` next to `appClientID = "…"`. RFC 8252 (section 8.5)
+# says a secret compiled into an app given to many users is not confidential, and the providers
+# treat such clients as public. Both names must say so: the identifier holding the value names an
+# OAuth CLIENT secret stored encrypted/obscured, and the same file declares the client id. A key,
+# token or password is never matched, nor a plain `clientSecret = "…"` (a web app's confidential
+# secret), nor any provider-prefixed key or private key (those are the known-prefix rules above).
+_OBSCURED_CLIENT_SECRET_NAME = re.compile(
+    r"(?i)(?:encrypted|obscured|obfuscated|encoded)[_-]?(?:oauth[_-]?)?client[_-]?secret$"
+)
+_CLIENT_ID_DECL = re.compile(r"(?i)client[_-]?id\w*\s*[:=]\s*['\"][^'\"\s]{4,}['\"]")
+_IDENT_BEFORE = re.compile(r"[A-Za-z0-9_]{0,64}$")
+_NAME_AT = re.compile(r"[A-Za-z0-9_-]*")
+
+
+def _is_obscured_client_secret(text: str, start: int, end_of_name: int) -> bool:
+    """True if the assignment at ``start`` names an obscured OAuth client secret (see above)."""
+    head = _IDENT_BEFORE.search(text, max(0, start - 64), start)
+    name = (head.group(0) if head else "") + text[start:end_of_name]
+    return bool(_OBSCURED_CLIENT_SECRET_NAME.search(name)) and bool(_CLIENT_ID_DECL.search(text))
+
+
 # Client-side TELEMETRY ingestion keys are publishable by design (like a Sentry DSN, Algolia search
 # key, or GA measurement id): they are embedded in an open-source client to POST usage/crash
 # telemetry to the vendor's ingestion endpoint, and can only write to that firehose. Recognising the
@@ -131,7 +218,10 @@ def _is_installed_app_oauth_secret(value: str, file_text: str) -> bool:
 # snowflake-connector-python ships SFCTEST/SFCDEV/PROD keys next to a
 # `*.client-telemetry.<vendor>/enqueue` URL.
 _TELEMETRY_INGEST_CTX = re.compile(
-    r"(?i)client-telemetry|telemetry[\w.-]*\.[\w.-]+/(?:enqueue|ingest)|/telemetry/(?:enqueue|ingest)"
+    # Host labels bounded and split on their dots: `[\w.-]*\.[\w.-]+/` tried every dot of a long
+    # dotted run from every `telemetry` before it (quadratic).
+    r"(?i)client-telemetry|telemetry[\w-]{0,63}(?:\.[\w-]{0,63}){1,8}/(?:enqueue|ingest)"
+    r"|/telemetry/(?:enqueue|ingest)"
 )
 
 
@@ -158,13 +248,16 @@ def _is_public_analytics_key(value: str) -> bool:
 # material in scope. The adjacent naming requirement keeps ordinary base58 blobs out.
 _BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 _CHAIN_ADDRESS_CTX = re.compile(
-    r"(?i)solana|spl[_-]?token|program[_-]?id|mint|pubkey|public[_-]?key|wallet|address"
+    r"(?i)solana|spl[_-]?token|program[_-]?id|\bmint\b|pubkey|public[_-]?key|wallet|address"
 )
 
 
 def _is_public_chain_address(value: str, context: str) -> bool:
     """True for a base58 on-chain address (public identifier), not a keypair."""
-    return bool(_BASE58.match(value)) and bool(_CHAIN_ADDRESS_CTX.search(context))
+    if not _BASE58.match(value):
+        return False
+    # pump.fun mints end in "pump" by construction; they are passed around as a `token`.
+    return value.endswith("pump") or bool(_CHAIN_ADDRESS_CTX.search(context))
 
 
 # Test TLS/certificate fixtures: packages ship throwaway dummy certificate + private-key pairs to
@@ -182,6 +275,38 @@ def _is_test_certificate(relpath: str) -> bool:
     """True if ``relpath`` is a disposable test-certificate fixture (test-server key material)."""
     dirs = "/".join(relpath.lower().replace("\\", "/").split("/")[:-1])
     return any(t in dirs for t in _TEST_CERT_TESTISH) and any(c in dirs for c in _TEST_CERT_CERTISH)
+
+
+# A secret in a file that exists for tests: a fixture module, a mock, an end-to-end script, a test
+# runner's config, a `.dev.vars.test` env file, or an app kept under `testdata/`/`testbeds/` for the
+# project's own scanner to probe. Scoped to this rule: engine-wide test demotion deliberately
+# leaves code under `fixtures/` scanned, so a payload cannot hide there, but a password in a test
+# fixture is not a credential anyone ships.
+_TEST_SECRET_PATH = re.compile(
+    r"(?i)(?:^|/)(?:testdata|test[-_]data|testbeds?|minimal[-_]testbeds|fixtures?|mocks?)/|"
+    r"(?:^|[/._-])(?:fixtures?|mocks?|e2e)(?:[._-][\w.-]*)?\.\w+$|"
+    r"(?:^|/)(?:vitest|jest|playwright|cypress)\.config\.\w+$|(?:^|/)\.[\w.-]+\.test$"
+)
+# Configuration of a secret scanner lists values it must ignore; those are the opposite of leaks.
+_SECRET_SCANNER_CONFIGS = frozenset(
+    {".gitleaks.toml", ".gitguardian.yaml", ".gitguardian.yml", ".secrets.baseline",
+     ".talismanrc", ".trufflehogignore"}
+)
+# Keys a vendor has you put in the page: the Firebase web config, the Maps JavaScript API loader,
+# Paddle.js, the Cloudflare Web Analytics beacon, and the token an OpenAI app serves at
+# /.well-known/openai-apps-challenge to prove it owns its domain. Access is bound to the domain
+# or project, not to the secrecy of the string.
+_CLIENT_KEY_CTX = re.compile(
+    r"(?i)authDomain|messagingSenderId|GoogleService-Info|firebase(?:app|Config|\.initializeApp)|"
+    r"firebase[_-]?api[_-]?key|"
+    r"maps\.googleapis\.com/maps/api/js|Paddle\.(?:Initialize|Setup)|cloudflare[_-]?beacon|"
+    r"data-cf-beacon|cloudflareinsights|openai[-_]?apps[-_]?challenge"
+)
+
+
+def _is_client_key(relpath: str, context: str) -> bool:
+    """True for a key a vendor publishes in client code by design (see ``_CLIENT_KEY_CTX``)."""
+    return bool(_CLIENT_KEY_CTX.search(context) or _CLIENT_KEY_CTX.search(relpath))
 
 
 def _has_mixed_charset(value: str) -> bool:
@@ -249,19 +374,42 @@ class SecretsScanner(Scanner):
             severity=Severity.HIGH,
             title="Embedded secret / credential",
             description=(
-                "A hardcoded credential was detected in the component (e.g. a cloud access "
-                "key, provider API token, or private key). Shipping a live secret is a "
-                "supply-chain leak: anyone with the package can use it."
+                "A value shaped like a hardcoded credential was found in the component (e.g. a "
+                "cloud access key, provider API token, or private key). If it is live, anyone "
+                "with the package can use it."
             ),
             recommendation=(
-                "Remove the secret from the code, rotate it immediately, and load credentials "
-                "from the environment or a secrets manager at runtime."
+                "If it is a real credential, remove it from the code, rotate it, and load "
+                "credentials from the environment or a secrets manager at runtime. An example "
+                "value or a key that is public by design needs no action."
+            ),
+            capability=None,
+            threat_class=ThreatClass.EXPOSURE,
+            # A secret inside a comment is commented-out example code, and one inside a Python
+            # docstring is an example of a call (`Example: api_key='…'`), not a live shipped
+            # credential. Real embedded secrets are in code / value-strings, which are NOT
+            # demoted, so recall is preserved.
+            code_context="comments_and_docstrings",
+        ),
+        RuleSpec(
+            id="ST-SECRET-ENV",
+            category=CATEGORY,
+            severity=Severity.HIGH,
+            title="Reads wallet key material (private key / seed phrase) from the environment",
+            description=(
+                "The component reads a wallet private key, seed phrase or mnemonic from an "
+                "environment variable. That material is meant to stay on the host (a wallet signs "
+                "locally); reading it is a sensitivity signal, and combined with network egress it "
+                "is a credential-exfiltration path."
+            ),
+            recommendation=(
+                "Verify the key material is used only locally and is never sent off-host. Prefer a "
+                "signer that keeps the key in a wallet or HSM over passing it through an env var."
             ),
             capability=None,
             threat_class=ThreatClass.RISKY_CONSTRUCT,
-            # A secret inside a comment is commented-out example code, not a live shipped
-            # credential (e.g. ragflow's `#     OAuthConfig(client_secret="…")`). Real embedded
-            # secrets are in code / value-strings, which are NOT demoted, so recall is preserved.
+            # A mention inside a comment is not a live read; a value-string `"PRIVATE_KEY"` is the
+            # env var NAME being read, which IS the signal, so strings are not demoted.
             code_context="comments",
         ),
     ]
@@ -271,10 +419,16 @@ class SecretsScanner(Scanner):
         seen: set[tuple[str, int]] = set()
         docsearch_files: list[str] = []
         installed_oauth_files: list[str] = []
+        obscured_client_files: list[str] = []
         telemetry_files: list[str] = []
         test_cert_files: list[str] = []
+        test_secret_files: list[str] = []
+        client_key_files: list[str] = []
 
         for f in index.files:
+            if f.name.lower() in _SECRET_SCANNER_CONFIGS:
+                continue
+            test_file = bool(_TEST_SECRET_PATH.search(f.relpath))
             if f.name.lower() in _CREDENTIAL_FILES:
                 self._add_credential_file(f, evidence, seen)
                 # The whole file is one credential; the key/value patterns below have nothing
@@ -288,6 +442,15 @@ class SecretsScanner(Scanner):
                     if label == "Private key block" and _is_test_certificate(f.relpath):
                         if f.relpath not in test_cert_files:
                             test_cert_files.append(f.relpath)
+                        continue
+                    if test_file:
+                        if f.relpath not in test_secret_files:
+                            test_secret_files.append(f.relpath)
+                        continue
+                    window = f.text[max(0, m.start() - 300) : m.end() + 300]
+                    if label != "Private key block" and _is_client_key(f.relpath, window):
+                        if f.relpath not in client_key_files:
+                            client_key_files.append(f.relpath)
                         continue
                     self._add(f, m, value, evidence, seen)
             for m in _GENERIC.finditer(f.text):
@@ -307,11 +470,61 @@ class SecretsScanner(Scanner):
                     if f.relpath not in telemetry_files:
                         telemetry_files.append(f.relpath)
                     continue
+                if test_file:
+                    if f.relpath not in test_secret_files:
+                        test_secret_files.append(f.relpath)
+                    continue
+                if _is_client_key(f.relpath, window):
+                    if f.relpath not in client_key_files:
+                        client_key_files.append(f.relpath)
+                    continue
                 if _is_installed_app_oauth_secret(value, f.text):
                     if f.relpath not in installed_oauth_files:
                         installed_oauth_files.append(f.relpath)
                     continue
+                name_end = m.start() + len(_NAME_AT.match(m.group(0)).group(0))
+                if _is_obscured_client_secret(f.text, m.start(), name_end):
+                    if f.relpath not in obscured_client_files:
+                        obscured_client_files.append(f.relpath)
+                    continue
                 self._add(f, m, value, evidence, seen)
+
+        env_secret_ev: list[Evidence] = []
+        env_seen: set[tuple[str, int]] = set()
+
+        def _add_env(ev: Evidence) -> None:
+            key = (ev.file, ev.line_start)
+            if key not in env_seen:
+                env_seen.add(key)
+                env_secret_ev.append(ev)
+
+        # Only real code reads a key from the environment. The same `process.env.WALLET_PRIVATE_KEY`
+        # in a SKILL.md / README code block is a documentation EXAMPLE, not a read — and SKILL.md is
+        # deliberately kept in scope as an instruction surface, so it is not demoted as a doc. A
+        # crypto-agent project (e.g. affaan-m/ECC) ships such examples in its skill docs, and
+        # counting them as a secret read turned ordinary network use into a false exfil verdict.
+        for f in index.select(suffixes=_ENV_CODE_SUFFIXES):
+            for _m, ev in f.finditer(_ENV_KEYMAT_RE):
+                _add_env(ev)
+                if len(env_secret_ev) >= MAX_EVIDENCE_SCANNED:
+                    break
+            # Resolve `const e = process.env; e.WALLET_PRIVATE_KEY` so an aliased read is caught.
+            if f.suffix in _ENV_JS_SUFFIXES:
+                aliases = {m.group(1) for m in _ENV_ALIAS.finditer(f.text)}
+                for alias in aliases:
+                    alias_pat = re.compile(
+                        r"\b" + re.escape(alias) + r"\.(?:" + _ENV_KEYMAT_NAME + r")\b"
+                        r"|\b" + re.escape(alias) + r"\[\s*['\"](?:" + _ENV_KEYMAT_NAME + r")['\"]"
+                    )
+                    for _m, ev in f.finditer(alias_pat):
+                        _add_env(ev)
+        # Folded view: catch a split env-var name, `process.env['WALLET_' + 'PRIVATE_KEY']`.
+        for f, start, end in concat_folded_spans(
+            index, _ENV_KEYMAT_RE, suffixes=_ENV_JS_SUFFIXES
+        ):
+            if len(env_secret_ev) >= MAX_EVIDENCE_SCANNED:
+                break
+            _add_env(f.evidence_for_span(start, end))
 
         findings: list[Finding] = []
         if evidence:
@@ -323,9 +536,24 @@ class SecretsScanner(Scanner):
                     category=rule.category,
                     title=rule.title,
                     description=rule.description,
-                    evidence=evidence[:MAX_EVIDENCE_PER_FINDING],
+                    evidence=evidence[:MAX_EVIDENCE_SCANNED],
                     recommendation=rule.recommendation,
                     threat_class=rule.threat_class,
+                )
+            )
+
+        if env_secret_ev:
+            env_rule = next(r for r in self.rules if r.id == "ST-SECRET-ENV")
+            findings.append(
+                Finding(
+                    id=env_rule.id,
+                    severity=env_rule.severity,
+                    category=env_rule.category,
+                    title=env_rule.title,
+                    description=env_rule.description,
+                    evidence=env_secret_ev[:MAX_EVIDENCE_SCANNED],
+                    recommendation=env_rule.recommendation,
+                    threat_class=env_rule.threat_class,
                 )
             )
 
@@ -346,6 +574,35 @@ class SecretsScanner(Scanner):
                     file=test_cert_files[0],
                 )
             )
+        if test_secret_files:
+            shown = ", ".join(test_secret_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Secret-shaped value in a test file ({len(test_secret_files)})",
+                    reason=(
+                        "A secret-shaped value in a fixture, mock, end-to-end script, test-runner "
+                        "config or test data app. Such values drive the project's own tests; "
+                        f"flagged for review, not scored: {shown}."
+                    ),
+                    file=test_secret_files[0],
+                )
+            )
+        if client_key_files:
+            shown = ", ".join(client_key_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=f"Client-side key published by design ({len(client_key_files)})",
+                    reason=(
+                        "A key in a Firebase web config, a Maps JavaScript API loader, Paddle.js, "
+                        "a Cloudflare Web Analytics beacon or an OpenAI apps domain challenge. "
+                        "Vendors have these embedded in pages and bind them to a domain or "
+                        f"project; flagged for review, not scored: {shown}."
+                    ),
+                    file=client_key_files[0],
+                )
+            )
         if installed_oauth_files:
             shown = ", ".join(installed_oauth_files[:8])
             needs_review.append(
@@ -358,10 +615,29 @@ class SecretsScanner(Scanner):
                         "A GOCSPX- Google OAuth client secret in a file with installed-app flow "
                         "markers (loopback redirect / device code / PKCE / oob). For native "
                         "apps Google documents this value as not confidential (gcloud ships "
-                        "one), so it is flagged for review, not scored — verify it is not a "
+                        "one), so it is flagged for review, not scored - verify it is not a "
                         f"web-application secret: {shown}."
                     ),
                     file=installed_oauth_files[0],
+                )
+            )
+        if obscured_client_files:
+            shown = ", ".join(obscured_client_files[:8])
+            needs_review.append(
+                NeedsReview(
+                    category=CATEGORY,
+                    title=(
+                        f"Obscured OAuth client secret of a distributed app "
+                        f"({len(obscured_client_files)})"
+                    ),
+                    reason=(
+                        "An OAuth client secret stored in obscured form next to the app's public "
+                        "client id. A secret compiled into a desktop or command-line app that is "
+                        "given to many users is not confidential (RFC 8252, section 8.5), so it is "
+                        "flagged for review, not scored - verify it is not a web application's "
+                        f"secret: {shown}."
+                    ),
+                    file=obscured_client_files[0],
                 )
             )
         if telemetry_files:
@@ -373,8 +649,8 @@ class SecretsScanner(Scanner):
                     reason=(
                         "A secret next to a client-telemetry ingestion endpoint "
                         "(e.g. *.client-telemetry.<vendor>/enqueue). Client-side telemetry keys "
-                        "are publishable by design (like a Sentry DSN) — they can only write to "
-                        "the vendor's telemetry firehose — so it is flagged for review, not "
+                        "are publishable by design (like a Sentry DSN) - they can only write to "
+                        "the vendor's telemetry firehose - so it is flagged for review, not "
                         f"scored: {shown}."
                     ),
                     file=telemetry_files[0],

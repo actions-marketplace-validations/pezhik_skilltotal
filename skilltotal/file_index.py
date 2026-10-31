@@ -9,15 +9,21 @@ match. Centralizing traversal here means every scanner inherits identical, safe 
 
 from __future__ import annotations
 
+import ast
 import bisect
+import codecs
 import fnmatch
 import io
+import os
 import re
+import stat
 import tokenize
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from skilltotal import bounded_json
+from skilltotal.concat_normalize import fold_string_concats
 from skilltotal.models import Evidence
 from skilltotal.text_normalize import normalize_with_map
 
@@ -48,13 +54,25 @@ SKIP_DIRS: frozenset[str] = frozenset(
         ".mypy_cache",
         ".pytest_cache",
         ".idea",
-        ".vscode",
+        # `.vscode` is NOT skipped: a `tasks.json` with `runOn: folderOpen` runs a command when the
+        # folder is opened, and the Miasma npm worm (2026) shipped its re-infection script there.
         "site-packages",
         # Generated coverage reports: coverage.py / nyc render the project's OWN source as HTML
         # (double-counting every finding already scanned in the real source) plus scaffolding —
         # a build artifact, never first-party code (gcsfs ships coverage_html_report/).
         "htmlcov",
         "coverage_html_report",
+    }
+)
+
+
+# Names the walk passes over whatever they are (a file or a link named so, too), as it always
+# has: version control, caches and generated reports, and dependency trees. `env`, `venv`, `.venv`
+# and `site-packages` are not here: those are judged by what they hold (see skipped_dir_kind).
+_ALWAYS_SKIPPED_NAMES: frozenset[str] = frozenset(
+    {
+        ".git", ".hg", ".svn", "node_modules", "vendor", "__pycache__", ".tox", ".mypy_cache",
+        ".pytest_cache", ".idea", "htmlcov", "coverage_html_report",
     }
 )
 
@@ -101,32 +119,346 @@ def _is_minified(filename: str, text: str) -> bool:
     return len(text) / max(1, text.count("\n") + 1) > _MINIFIED_AVG_LINE
 
 
+_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]{0,200}")
+_MAP_PATH = re.compile(r"[A-Za-z0-9._/@+:~-]{0,300}")
+_VLQ = re.compile(r"[A-Za-z0-9+/,;=]*")
+# The keys of the source map format (version 3, plus the ignore-list and debug-id extensions).
+_SOURCE_MAP_KEYS = frozenset({
+    "version", "file", "sourceRoot", "sources", "names", "mappings", "sourcesContent",
+    "ignoreList", "x_google_ignoreList", "debugId", "debug_id",
+})
+
+
+def _is_codeless_source_map(filename: str, text: str) -> bool:
+    """True for a JavaScript source map that carries no code: nothing in it to analyze.
+
+    A source map cannot run (as JavaScript it is a syntax error, and only a debugger reads it).
+    One with only the format's own keys, no ``sourcesContent``, paths in ``sources``, identifiers
+    in ``names`` and a VLQ ``mappings`` string holds positions and names alone (TypeScript writes
+    them so), and a TypeScript SDK ships one per module: skipping them saves a quarter of such a
+    scan. Anything else in a ``.map`` is read like any file: source text, an extra key or an odd
+    string can hold code the package loads itself, and for a minified bundle the map is the
+    readable copy.
+    """
+    if not filename.lower().endswith(".map"):
+        return False
+    try:
+        data, cut = bounded_json.loads_cut(text)
+    except ValueError:  # not JSON: read it as a file
+        return False
+    if cut:  # nested past what any source map needs: read it as a file
+        return False
+    if not (isinstance(data, dict) and set(data) <= _SOURCE_MAP_KEYS):
+        return False
+    if any(data.get("sourcesContent") or []):
+        return False
+    sources, names = data.get("sources"), data.get("names") or []
+    paths = [*(sources if isinstance(sources, list) else [None]),
+             data.get("file") or "", data.get("sourceRoot") or ""]
+    ignored = [*(data.get("ignoreList") or []), *(data.get("x_google_ignoreList") or [])]
+    debug_id = str(data.get("debugId") or data.get("debug_id") or "")
+    return (
+        isinstance(data.get("mappings"), str) and bool(_VLQ.fullmatch(data["mappings"]))
+        and all(isinstance(p, str) and _MAP_PATH.fullmatch(p) for p in paths)
+        and isinstance(names, list)
+        and all(isinstance(n, str) and _IDENTIFIER.fullmatch(n) for n in names)
+        and all(isinstance(i, int) for i in ignored)
+        and bool(re.fullmatch(r"[0-9A-Fa-f-]{0,64}", debug_id))
+    )
+
+
+# SkillTotal's own outputs (`scan --sarif/--json --output`, `--write-baseline`). A report quotes the
+# detection patterns in its rule descriptions and the findings it reported, so read as component
+# content it made the next scan of the same folder report MALICIOUS. Recognised by content, never
+# by name: the whole file must parse as pure JSON (which runs nothing) with exactly the shape
+# SkillTotal writes. Strings that must appear near either end of each shape, checked before parsing.
+_OWN_OUTPUT_HINTS = ('"SkillTotal"', '"skilltotal_version"', '"suppressed"')
+_OWN_OUTPUT_PEEK = 4096
+_SARIF_KEYS = frozenset({"$schema", "version", "runs"})
+_SARIF_RUN_KEYS = frozenset({"tool", "taxonomies", "results", "properties"})
+_REPORT_KEYS = frozenset({
+    "component", "risk_score", "risk_level", "summary", "verdict", "capabilities", "traits",
+    "findings", "needs_review", "metadata",
+})
+_BASELINE_FINGERPRINT = re.compile(r"[0-9a-f]{16}")
+
+
+def is_skilltotal_output(text: str) -> bool:
+    """True if ``text`` is, in full, a SARIF log whose every run's tool is SkillTotal, a SkillTotal
+    JSON report (its exact top-level keys, with SkillTotal's version metadata), or a baseline
+    written by ``--write-baseline`` (``version`` and a list of fingerprints, nothing else)."""
+    if not text.lstrip().startswith("{"):
+        return False
+    ends = text[:_OWN_OUTPUT_PEEK] + text[-_OWN_OUTPUT_PEEK:]
+    if not any(hint in ends for hint in _OWN_OUTPUT_HINTS):
+        return False
+    try:
+        data, cut = bounded_json.loads_cut(text)
+    except ValueError:
+        return False
+    if cut or not isinstance(data, dict):
+        return False
+    keys = set(data)
+    if keys == {"version", "suppressed"}:
+        items = data["suppressed"]
+        return (
+            isinstance(data["version"], int) and isinstance(items, list)
+            and all(isinstance(i, str) and _BASELINE_FINGERPRINT.fullmatch(i) for i in items)
+        )
+    if keys <= _SARIF_KEYS and "runs" in keys:
+        runs = data["runs"]
+        return (
+            data.get("version") == "2.1.0" and isinstance(runs, list) and bool(runs)
+            and all(_is_skilltotal_run(run) for run in runs)
+        )
+    if keys == _REPORT_KEYS:
+        meta = data["metadata"]
+        return (
+            isinstance(meta, dict)
+            and isinstance(meta.get("skilltotal_version"), str)
+            and isinstance(meta.get("schema_version"), str)
+            and isinstance(meta.get("ruleset_version"), int)
+        )
+    return False
+
+
+def _is_skilltotal_run(run: object) -> bool:
+    if not (isinstance(run, dict) and set(run) <= _SARIF_RUN_KEYS):
+        return False
+    tool = run.get("tool")
+    driver = tool.get("driver") if isinstance(tool, dict) else None
+    return isinstance(driver, dict) and driver.get("name") == "SkillTotal"
+
+
 def is_build_output_path(relpath: str) -> bool:
     """True when the path sits under a build-output directory (``dist/``, ``build/``)."""
     return any(part in BUILD_OUTPUT_DIRS for part in relpath.replace("\\", "/").split("/"))
 
 
-def _is_skipped_dir(part: str, *, skip_build_output: bool = True) -> bool:
-    """True if a path segment names a directory that never holds first-party source.
+# Why the walk passed over a directory (see skipped_dir_kind). VCS, caches and generated reports
+# hold nothing a component runs; the other kinds hold code someone else wrote or a copy of the
+# component's own, and a report says it did not read them.
+SKIP_VCS = "vcs"
+SKIP_GENERATED = "generated"
+SKIP_DEPENDENCIES = "dependencies"
+SKIP_VENDORED = "vendored"
+SKIP_VIRTUALENV = "virtualenv"
+SKIP_BUILD_OUTPUT = "build_output"
+_VCS_DIRS = frozenset({".git", ".hg", ".svn"})
+_GENERATED_DIRS = frozenset(
+    {"__pycache__", ".mypy_cache", ".pytest_cache", ".idea", "htmlcov", "coverage_html_report"}
+)
+# `env`, `venv` and `.venv` are the conventional names of a Python virtual environment, and a
+# real one is third-party code. Skipped by name alone, they also hid a component's own
+# `lib/env/loader.js` (and `pkg/venv/x.py`): a payload filed there was never read. So a directory
+# is a virtual environment when it looks like one, whatever it is called.
+_VENV_NAMES = frozenset({"env", "venv", ".venv"})
+_INSTALL_LAYOUT = re.compile(r"^python\d+(?:\.\d+)?t?$")
 
-    Besides the exact ``SKIP_DIRS`` names, a ``vendored-*`` prefixed directory is a vendored
-    third-party tree by convention (numpy ships ``vendored-meson/`` — the meson build system,
-    complete with meson's own CI scripts), exactly the class ``vendor/`` already covers.
 
-    ``skip_build_output`` additionally skips ``BUILD_OUTPUT_DIRS``; the caller turns it off for a
-    published package artifact, where the build output IS the shipped code.
+def _is_virtualenv(path: Path, name: str) -> bool:
+    """True for a Python virtual environment (venv, virtualenv, conda) at ``path``.
+
+    ``pyvenv.cfg`` (venv and virtualenv 20+) or ``conda-meta/`` mark one under any name; the
+    conventional names also count with an activation script or a ``site-packages`` tree (older
+    virtualenv). Existence checks only: nothing is read.
     """
-    if skip_build_output and part in BUILD_OUTPUT_DIRS:
+    if "env" not in name.lower():
+        return False
+    try:
+        if (path / "pyvenv.cfg").is_file() or (path / "conda-meta").is_dir():
+            return True
+        if name not in _VENV_NAMES:
+            return False
+        if any(path.joinpath(*rel).is_file() for rel in (
+            ("bin", "activate"), ("Scripts", "activate"), ("Scripts", "activate.bat"),
+        )):
+            return True
+        if (path / "Lib" / "site-packages").is_dir():
+            return True
+        lib = path / "lib"
+        return lib.is_dir() and any(
+            _INSTALL_LAYOUT.match(p.name) and (p / "site-packages").is_dir()
+            for p in lib.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _in_install_layout(path: Path) -> bool:
+    """True for a ``site-packages`` directory where an interpreter installs packages:
+    ``lib/python3.12/site-packages`` or Windows' ``Lib/site-packages``."""
+    parent = path.parent
+    return parent.name == "Lib" or (
+        bool(_INSTALL_LAYOUT.match(parent.name)) and parent.parent.name in ("lib", "lib64")
+    )
+
+
+def skipped_dir_kind(path: Path, name: str, *, skip_build_output: bool = True) -> str | None:
+    """Why the walk does not enter the directory ``path`` (named ``name``), or None to enter it.
+
+    Version control, caches and generated reports are never component content. ``node_modules``
+    and vendored trees (``vendor/``, and ``vendored-*`` by convention: numpy ships
+    ``vendored-meson/``) are dependencies: the component's own behavior is what is analyzed, and a
+    Go project's vendored cloud SDKs once scored it on their credential-path code (wandb).
+    A virtual environment counts only when it is one, and
+    ``site-packages`` only where an interpreter installs into it; anywhere else those names are
+    ordinary folders. Build output is skipped for a repository and read for a published package.
+    Code a component loads from a skipped folder by a literal path is read anyway (see
+    ``skilltotal.loaded_code``).
+    """
+    if name in _VCS_DIRS:
+        return SKIP_VCS
+    if name in _GENERATED_DIRS:
+        return SKIP_GENERATED
+    if name == "node_modules":
+        return SKIP_DEPENDENCIES
+    if name == "vendor" or name.startswith("vendored-"):
+        return SKIP_VENDORED
+    if name == ".tox":
+        return SKIP_VIRTUALENV
+    if name == "site-packages":
+        return SKIP_DEPENDENCIES if _in_install_layout(path) else None
+    if _is_virtualenv(path, name):
+        return SKIP_VIRTUALENV
+    if skip_build_output and name in BUILD_OUTPUT_DIRS:
+        return SKIP_BUILD_OUTPUT
+    return None
+
+
+# A Windows reparse tag with this bit stands for another path: a symbolic link, a junction, a
+# mount point. Other reparse points (cloud-file placeholders, deduplicated files) are the file
+# itself, so a component in a synced folder is still read.
+_REPARSE_NAME_SURROGATE = 0x20000000
+
+
+def _stat_is_link(st: os.stat_result) -> bool:
+    """True for an ``lstat`` result that is a link rather than a file or directory of its own.
+
+    On Windows a junction is not a symbolic link (``S_ISLNK`` is false and Python < 3.12 has no
+    ``is_junction``); it shows as a reparse point whose tag stands for another path.
+    """
+    if stat.S_ISLNK(st.st_mode):
         return True
-    return part in SKIP_DIRS or part.startswith("vendored-")
+    attributes = getattr(st, "st_file_attributes", 0)
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT) and bool(
+        getattr(st, "st_reparse_tag", 0) & _REPARSE_NAME_SURROGATE
+    )
+
+
+def is_link(path: Path) -> bool:
+    """True when ``path`` itself is a symbolic link or a Windows junction (it is not followed)."""
+    try:
+        return _stat_is_link(os.lstat(path))
+    except (OSError, ValueError):
+        return False
+
+
+def is_regular_file(path: Path) -> bool:
+    """True when ``path`` is a regular file in its own right, not a link to one.
+
+    Manifest checks use this instead of ``exists()``: a ``package.json`` that is a link can point
+    at any file on the machine that runs the scan, and a directory of that name is no manifest.
+    """
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(st.st_mode) and not _stat_is_link(st)
+
+
+def _entry_is_link(entry: os.DirEntry) -> bool:
+    if entry.is_symlink():
+        return True
+    # A junction is visible only through its reparse data, which Windows hands over with the
+    # directory listing; elsewhere `is_symlink` is the whole answer and costs no extra call.
+    return os.name == "nt" and _stat_is_link(entry.stat(follow_symlinks=False))
+
+
+def walk_files(
+    root: Path,
+    *,
+    skip: Callable[[str], bool] | None = None,
+    skip_dir: Callable[[tuple[str, ...], Path], bool] | None = None,
+    on_skip: Callable[[tuple[str, ...], os.DirEntry], None] | None = None,
+    links: list[str] | None = None,
+    unreadable: list[str] | None = None,
+) -> Iterator[Path]:
+    """Every regular file under ``root``, never reached through a link.
+
+    A symbolic link or a Windows junction can point anywhere on the machine that runs the scan --
+    the home directory of whoever runs it -- so neither is entered nor read: its relative path
+    goes to ``links`` instead. A directory or file whose name ``skip`` rejects is passed over
+    without being entered, so a skipped ``node_modules`` (where package managers plant links) is
+    never walked at all. ``skip_dir`` judges a real directory by its relative path and location
+    (a virtual environment is one by its contents, not its name). Each entry passed over is
+    reported to ``on_skip``. A directory that cannot be listed goes to ``unreadable`` with a
+    trailing ``/``. FIFOs, sockets and devices are not yielded: they hold no content, and opening
+    a FIFO blocks. The walk keeps its own stack, so a deep tree cannot exhaust the recursion
+    limit.
+    """
+    pending: list[tuple[str, ...]] = [()]
+    while pending:
+        parts = pending.pop()
+        try:
+            with os.scandir(root.joinpath(*parts)) as listing:
+                entries = list(listing)
+        except OSError:
+            if unreadable is not None:
+                unreadable.append("/".join(parts) + "/" if parts else "./")
+            continue
+        for entry in entries:
+            rel = (*parts, entry.name)
+            if skip is not None and skip(entry.name):
+                if on_skip is not None:
+                    on_skip(rel, entry)
+                continue
+            try:
+                if _entry_is_link(entry):
+                    if links is not None:
+                        links.append("/".join(rel))
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = not is_dir and entry.is_file(follow_symlinks=False)
+            except OSError:
+                if unreadable is not None:
+                    unreadable.append("/".join(rel))
+                continue
+            if is_dir:
+                if skip_dir is not None and skip_dir(rel, Path(entry.path)):
+                    if on_skip is not None:
+                        on_skip(rel, entry)
+                    continue
+                pending.append(rel)
+            elif is_file:
+                yield Path(entry.path)
+
+
+def component_files(root: Path, *, skip_build_output: bool = True) -> Iterator[Path]:
+    """The files the index walk visits under ``root``, for a scanner that walks on its own (an
+    archive is not text, so it is not in the index): the same folders are passed over."""
+    return walk_files(
+        root,
+        skip=lambda name: name in _ALWAYS_SKIPPED_NAMES or name.startswith("vendored-"),
+        skip_dir=lambda rel, path: skipped_dir_kind(
+            path, rel[-1], skip_build_output=skip_build_output
+        ) is not None,
+    )
+
 
 # Directory segments and filename patterns that indicate non-shipped test code.
 _TEST_DIR_SEGMENTS: frozenset[str] = frozenset(
     {"test", "tests", "__tests__", "__mocks__", "spec", "specs", "e2e"}
 )
-# A compound segment that still names a test tree: cli-e2e-tests, integration-tests, unit_test,
-# api-spec. The `[-_]` boundary keeps ordinary words out (e.g. "latest" is not a test dir).
-_TEST_SEGMENT_RE = re.compile(r"(?:.*[-_])?(?:tests?|specs?|e2e)")
+# A compound segment that still names a test tree, in either order: cli-e2e-tests,
+# integration-tests, unit_test, api-spec (suffix form) and test-site, test_data, spec-helpers
+# (prefix form). Only the suffix form existed at first, so a directory a project builds *for* its
+# tests read as production code — firecrawl's `apps/test-site/` ships a deliberate
+# prompt-injection sample to exercise its own scraper, and that fixture scored as a malicious
+# indicator against the project.
+# The `[-_]` boundary on both sides is what keeps ordinary words out: "latest", "contest",
+# "protest", "testimonials" and "attestation" all still fail to match.
+_TEST_SEGMENT_RE = re.compile(r"(?:.*[-_.])?(?:tests?|specs?|e2e)|(?:tests?|specs?|e2e)[-_].*")
 # `^tests?\.\w+$`: a file literally named test.py / tests.py / test.ts is test scaffolding by
 # convention even outside a tests/ dir (ragflow's sdk/python/test.py carried a doc-example API
 # key that fed ST-COMBO-EXFIL). `^test(ing)?_?utils?\.`: a `testing_utils.py` / `test_utils.py`
@@ -134,8 +466,12 @@ _TEST_SEGMENT_RE = re.compile(r"(?:.*[-_])?(?:tests?|specs?|e2e)")
 # ships a hardcoded CI `hf_` token). The anchors keep ordinary names (contest.py, testimonials.py,
 # attest.js) out.
 _TEST_FILE_RE = re.compile(
-    r"\.test\.|\.spec\.|^test_|_test\.|^conftest\.py$|^tests?\.\w+$|^test(?:ing)?_?utils?\."
+    r"\.test\.|\.spec\.|^tests?[-_]|_test\.|^conftest\.py$|^tests?\.\w+$|^test(?:ing)?_?utils?\."
 )
+# `^tests?[-_]` covers the prefix form with either separator (`test-snapshot-budget.sh`,
+# `test_render.py`): a hyphenated test script at the repo root carried a literal "IGNORE
+# PREVIOUS INSTRUCTIONS" fixture and scored as a live directive. The `[-_]` boundary keeps
+# `testimonials.md` and `testament.txt` out, as it does for directory names.
 
 
 def is_test_path(relpath: str) -> bool:
@@ -158,6 +494,13 @@ _DATA_CORPUS_SEGMENTS: frozenset[str] = frozenset(
         "eval", "evals", "eval_datasets", "eval-datasets", "evaluation", "evaluations",
         "benchmark", "benchmarks", "datasets", "dataset",
         "golden", "goldens", "snapshots", "__snapshots__", "corpus", "corpora",
+        # Security-testing payload lists (`payloads/llm_testing/adversarial_prompts.txt`,
+        # `payloads/csp_bypass/waf_specific_bypasses.txt`): attack strings kept as data.
+        "payloads",
+        # Recorded research runs (`experiments/results/*.json`): an ASCII-smuggling study stores
+        # the model outputs it measured, hidden tag characters included, and those scored as a
+        # malicious indicator against the study itself. The experiment CODE is still scanned.
+        "experiments", "experiment",
     }
 )
 # Executable code suffixes. Evidence in these is NEVER treated as inert corpus data, even inside
@@ -171,19 +514,32 @@ _CODE_SUFFIXES: frozenset[str] = frozenset(
 )
 
 
+# Record-per-line and tabular formats are data wherever they live: nothing executes them and no
+# agent reads them as instructions. An `issues.jsonl` export at a repo root carried the text of a
+# prompt-injection *ticket* and scored as a live directive.
+_DATA_SUFFIXES: frozenset[str] = frozenset(
+    {".jsonl", ".ndjson", ".csv", ".tsv",
+     # Detection signatures describe attacks by nature and are never executed by the component.
+     ".yar", ".yara"}
+)
+
+
 def is_data_corpus_path(relpath: str) -> bool:
     """True if ``relpath`` is an inert data/eval/benchmark corpus file (not executed code).
 
     Requires BOTH a corpus directory segment AND a non-code file suffix, so reference data
     (``.yaml``/``.json``/``.jsonl``/``.csv``/``.md`` …) is demoted while any executable code in
-    the same tree is still scanned and scored.
+    the same tree is still scanned and scored. Record/tabular suffixes (``_DATA_SUFFIXES``) are
+    data regardless of directory.
     """
     parts = relpath.lower().split("/")
-    if not any(part in _DATA_CORPUS_SEGMENTS for part in parts[:-1]):
-        return False
     name = parts[-1]
     dot = name.rfind(".")
     suffix = name[dot:] if dot > 0 else ""
+    if suffix in _DATA_SUFFIXES:
+        return True
+    if not any(part in _DATA_CORPUS_SEGMENTS for part in parts[:-1]):
+        return False
     return suffix not in _CODE_SUFFIXES
 
 
@@ -238,6 +594,10 @@ def is_ci_path(relpath: str) -> bool:
     for i in range(len(parts) - 2):
         if parts[i] == ".github" and parts[i + 1] == "workflows":
             return True
+    # An action's metadata under .github/ (`./.github/actions/x/action.yml`) is the project's own
+    # CI helper as a rule; its run: steps are still read, and shown as needs_review.
+    if parts[-1] in ("action.yml", "action.yaml") and ".github" in parts[:-1]:
+        return True
     return parts[-1] in _CI_EXACT_NAMES
 
 
@@ -255,37 +615,187 @@ _DOC_KEYWORDS: frozenset[str] = frozenset(
         "license", "licence", "notice", "authors", "maintainers",
     }
 )
+# Release and legal records: never an instruction surface, even when the name says what they are a
+# record of (`RULES_CHANGELOG`, `PROMPT_HISTORY`). A subset of _DOC_KEYWORDS.
+_RECORD_KEYWORDS: frozenset[str] = frozenset(
+    {"changelog", "changes", "history", "license", "licence", "notice", "authors", "maintainers"}
+)
 _PROSE_SUFFIXES: frozenset[str] = frozenset({".md", ".mdx", ".rst", ".txt", ".adoc", ""})
+# The subset that is documentation by default (see is_doc_path); `.txt` deliberately not included.
+# (Distinct from `_MARKDOWN_SUFFIXES` further down, which serves a different purpose.)
+_DOC_BY_DEFAULT_SUFFIXES: frozenset[str] = frozenset({".md", ".mdx", ".rst", ".adoc"})
+# Name fragments that mark a markdown file as something an agent is meant to READ rather than a
+# human: such files keep full scrutiny. Matched as substrings of the `[._-]`-split stem.
+_INSTRUCTION_KEYWORDS: frozenset[str] = frozenset(
+    {"prompt", "instruction", "rule", "agent", "skill", "system", "persona", "guideline",
+     "policy", "policies", "context", "memory", "workflow", "directive", "command"}
+)
+# A prose file named for the ATTACK it discusses is documentation even when its name also carries
+# an instruction keyword: `prompt-injection-defense-002.md`, `prompt-monitoring.md` and
+# `advanced_attacks.txt` describe or list attacks, they do not issue them. Applies to `.txt` too,
+# where `attacks.txt` / `payloads.txt` are corpora while a bare `prompt.txt` stays in scope.
+_SECURITY_DOC_KEYWORDS: frozenset[str] = frozenset(
+    {"injection", "jailbreak", "attack", "payload", "defense", "defence", "threat", "security",
+     "audit", "monitoring", "detection", "vulnerab", "exploit", "redteam", "red-team"}
+)
+# Template suffixes that wrap a document: `README.md.j2`, `review-prompts.body.md.tmpl`. Stripped
+# before classification so the wrapped name decides.
+_TEMPLATE_SUFFIXES: tuple[str, ...] = (
+    ".j2", ".jinja", ".jinja2", ".tmpl", ".template", ".hbs", ".ejs", ".mustache",
+)
 # Exact filenames that are always documentation/metadata or ignore-files.
 _DOC_EXACT_NAMES: frozenset[str] = frozenset(
     {"pkg-info", "code_of_conduct.md", ".gitignore", ".dockerignore", ".npmignore",
      ".gcloudignore"}
 )
+# A syndication feed (RSS / Atom) publishes the project's release notes or posts for feed readers:
+# the same prose as a CHANGELOG, wrapped in XML. anthropics/claude-code ships its changelog as
+# `feed.xml`, and a release note naming `id_rsa` scored as credential access.
+_FEED_NAMES: frozenset[str] = frozenset({"feed.xml", "atom.xml", "rss.xml"})
+_FEED_SUFFIXES: tuple[str, ...] = (".rss", ".atom")
 # AI-instruction surfaces that ARE an attack target even though they are markdown/text: a
 # real injection lives here, so these are explicitly NOT treated as documentation.
 _INSTRUCTION_NAMES: frozenset[str] = frozenset(
     {
         "claude.md", "agents.md", "agent.md", "gemini.md", "skill.md", "cursor.md",
-        ".cursorrules", ".windsurfrules", "system_prompt.md", "system-prompt.md",
+        ".cursorrules", ".windsurfrules", ".clinerules", "copilot-instructions.md",
+        "system_prompt.md", "system-prompt.md",
     }
 )
 _INSTRUCTION_SUFFIXES: tuple[str, ...] = (".mdc",)
+# Folders whose files an agent loads as its rules: Cline's `.clinerules/`, Cursor's
+# `.cursor/rules/`, Windsurf's `.windsurf/rules/`. A `coding-style.md` there is read by the agent,
+# not by a person (see is_doc_path for the names that stay documentation, as in a skill).
+_INSTRUCTION_DIRS: tuple[tuple[str, ...], ...] = (
+    (".clinerules",), (".cursor", "rules"), (".windsurf", "rules"),
+)
 
 
-def is_doc_path(relpath: str) -> bool:
-    """True if ``relpath`` is human-facing documentation/metadata (not an instruction surface)."""
+def _in_instruction_dir(dirs: list[str]) -> bool:
+    return any(
+        tuple(dirs[i : i + len(seq)]) == seq
+        for seq in _INSTRUCTION_DIRS
+        for i in range(len(dirs) - len(seq) + 1)
+    )
+
+
+def is_instruction_path(relpath: str) -> bool:
+    """True if ``relpath`` is a file an agent loads as its instructions.
+
+    ``CLAUDE.md``, ``SKILL.md``, ``.cursorrules`` and the other names in ``_INSTRUCTION_NAMES``,
+    Cursor's ``.mdc`` rules, and any file in a rule folder (``.clinerules/``, ``.cursor/rules/``,
+    ``.windsurf/rules/``).
+    """
     parts = relpath.lower().split("/")
     name = parts[-1]
+    while name.endswith(_TEMPLATE_SUFFIXES):
+        name = name[: name.rindex(".")]
+    return (
+        name in _INSTRUCTION_NAMES
+        or name.endswith(_INSTRUCTION_SUFFIXES)
+        or _in_instruction_dir(parts[:-1])
+    )
+
+
+def skill_dirs(relpaths: Iterable[str]) -> frozenset[str]:
+    """Directories (``""`` for the root) holding a ``SKILL.md``: an agent reads what is in them."""
+    dirs = set()
+    for rel in relpaths:
+        head, _, name = rel.rpartition("/")
+        if name.lower() == "skill.md":
+            dirs.add(head.lower())
+    return frozenset(dirs)
+
+
+_AGENT_PROMPT_DIR_NAMES = ("agents", "commands")
+
+
+def agent_prompt_dirs(relpaths: Iterable[str]) -> frozenset[str]:
+    """Directories whose markdown an agent loads as a prompt, like a skill's (lower case).
+
+    A subagent file is the subagent's system prompt and its frontmatter ``description`` is how
+    the main agent picks it; a command file is the prompt a slash command runs. They live in
+    ``.claude/agents`` and ``.claude/commands`` (at any depth), and in a Claude Code plugin's
+    ``agents/`` and ``commands/`` beside its ``.claude-plugin/plugin.json``. A bare ``commands/``
+    folder with no plugin manifest is a CLI's documentation as often as not, so it is not one.
+    """
+    dirs = set()
+    for rel in relpaths:
+        parts = rel.lower().split("/")
+        for i in range(len(parts) - 2):
+            if parts[i] == ".claude" and parts[i + 1] in _AGENT_PROMPT_DIR_NAMES:
+                dirs.add("/".join(parts[: i + 2]))
+        if parts[-2:] == [".claude-plugin", "plugin.json"]:
+            root = "/".join(parts[:-2])
+            dirs.update(f"{root}/{d}" if root else d for d in _AGENT_PROMPT_DIR_NAMES)
+    return frozenset(dirs)
+
+
+def _under_skill(relpath: str, skills: frozenset[str]) -> bool:
+    return any(d == "" or relpath.startswith(d + "/") for d in skills)
+
+
+def is_doc_path(relpath: str, skills: frozenset[str] = frozenset()) -> bool:
+    """True if ``relpath`` is human-facing documentation/metadata (not an instruction surface).
+
+    ``skills`` are the directories holding a ``SKILL.md`` (see ``skill_dirs``). Markdown inside a
+    skill is not documentation by default: a skill tells the agent to read its ``references/``
+    files, so an injection there is issued to the agent, not described to a person.
+    """
+    parts = relpath.lower().split("/")
+    name = parts[-1]
+    while name.endswith(_TEMPLATE_SUFFIXES):
+        name = name[: name.rindex(".")]
     if name in _INSTRUCTION_NAMES or name.endswith(_INSTRUCTION_SUFFIXES):
         return False
     if name in _DOC_EXACT_NAMES:
         return True
-    if any(part in _DOC_DIR_SEGMENTS or part.endswith(".egg-info") for part in parts[:-1]):
+    # A feed inside a skill is something the skill may tell the agent to read, like its markdown.
+    if name in _FEED_NAMES or name.endswith(_FEED_SUFFIXES):
+        return not _under_skill(relpath.lower(), skills)
+    # Named for an attack -> documentation about it, whatever else the name says. Checked before
+    # the instruction keywords below and covers `.txt` corpora such as `advanced_attacks.txt`.
+    if any(kw in name for kw in _SECURITY_DOC_KEYWORDS) and (
+        name.endswith(tuple(_PROSE_SUFFIXES - {""}))
+    ):
+        return True
+    # Packaging metadata: an sdist's `*.egg-info/` and a wheel's `*.dist-info/` (whose METADATA
+    # repeats the README as the long description, like an sdist's PKG-INFO).
+    if any(part in _DOC_DIR_SEGMENTS or part.endswith((".egg-info", ".dist-info"))
+           for part in parts[:-1]):
         return True
     suffix = name[name.rindex("."):] if "." in name[1:] else ""
     if suffix not in _PROSE_SUFFIXES:
         return False
+    # Prose filed under an audit directory is an audit write-up (`audits/<run>/raw/OBS-006.txt`).
+    # Code there (lighthouse's `audits/*.js`) is excluded by the suffix check above.
+    if suffix and "audits" in parts[:-1]:
+        return True
     stem = name[: name.rindex(".")] if suffix else name
+    # Markdown-family prose is human-facing documentation unless its NAME says it is an
+    # instruction surface. Keying on a documentation keyword alone left `THREAT_MODEL.md`,
+    # `audit-report.md` and `breach-precedents.md` in scope, where their descriptions of attacks
+    # scored as live directives. The instruction check is a substring match on purpose: a
+    # `deployprompt.md` or `agentrules.md` stays in scope, which is the recall-safe direction.
+    # `.txt` and suffix-less files are excluded from this default: `prompt.txt` is a real
+    # instruction surface with no naming convention to rely on.
+    # A rule folder (`.clinerules/`, `.cursor/rules/`, `.windsurf/rules/`) is read by the agent
+    # the way a skill's folder is, so its markdown is not documentation by default either; a file
+    # named for an attack or for a record still is, as it is in a skill.
+    if (
+        suffix in _DOC_BY_DEFAULT_SUFFIXES
+        and not _under_skill(relpath.lower(), skills)
+        and not _in_instruction_dir(parts[:-1])
+    ):
+        words = re.split(r"[._-]", stem)
+        # A file whose name ENDS in a release/legal record word is that record, whatever it is a
+        # record of: the ruleset's own `RULES_CHANGELOG.md` quotes the attacks its rules detect,
+        # and reading `rules` as an instruction surface scored the scanner's repository as
+        # malicious. Only the last word counts and only record words, so `agent-readme.md` or
+        # `prompt-security.md` stay under full scrutiny (no wider than CHANGELOG.md itself).
+        if words[-1] in _RECORD_KEYWORDS:
+            return True
+        return not any(kw in word for word in words for kw in _INSTRUCTION_KEYWORDS)
     # Split on `.` too so a localized/variant doc keeps its keyword: README.zh-CN.md ->
     # ["readme","zh","cn"], CHANGELOG.fr.md -> ["changelog","fr"].
     return any(word in _DOC_KEYWORDS for word in re.split(r"[._-]", stem))
@@ -300,11 +810,42 @@ for _fstr_name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
         _STRING_TOKEN_TYPES.add(_fstr_type)
 
 
+# Sorted, merged copies of span lists, keyed by the list's id (the list is kept alongside so a
+# reused id is never mistaken for it). A linear walk per lookup was quadratic on a minified
+# bundle: 45,758 lookups over a 1.4 MB file took 23 of a 50-second scan (2026-10-15).
+_MERGED_SPANS: dict[int, tuple[list[tuple[int, int]], int, list[int], list[int]]] = {}
+_MERGED_SPANS_MAX = 256
+
+
+def _merged_spans(spans: list[tuple[int, int]]) -> tuple[list[int], list[int]]:
+    """``spans`` sorted and with overlaps merged, as parallel start and end lists (same union)."""
+    hit = _MERGED_SPANS.get(id(spans))
+    if hit is not None and hit[0] is spans and hit[1] == len(spans):
+        return hit[2], hit[3]
+    starts: list[int] = []
+    ends: list[int] = []
+    for start, end in sorted(spans):
+        if start >= end:
+            continue
+        if ends and start <= ends[-1]:
+            ends[-1] = max(ends[-1], end)
+        else:
+            starts.append(start)
+            ends.append(end)
+    if len(_MERGED_SPANS) >= _MERGED_SPANS_MAX:
+        _MERGED_SPANS.clear()
+    _MERGED_SPANS[id(spans)] = (spans, len(spans), starts, ends)
+    return starts, ends
+
+
 def _offset_in_spans(spans: list[tuple[int, int]] | None, offset: int) -> bool:
-    for start, end in spans or ():
-        if start <= offset < end:
-            return True
-    return False
+    if not spans:
+        return False
+    if len(spans) < 8:  # not worth sorting
+        return any(start <= offset < end for start, end in spans)
+    starts, ends = _merged_spans(spans)
+    i = bisect.bisect_right(starts, offset) - 1
+    return i >= 0 and offset < ends[i]
 
 
 # C-family languages whose `//` and `/* */` comments are demotable code-context (a pattern that
@@ -315,97 +856,454 @@ def _offset_in_spans(spans: list[tuple[int, int]] | None, offset: int) -> bool:
 # inside a Go/JS/Rust value-string is a pattern definition/description, not a live directive).
 _C_FAMILY_SUFFIXES: frozenset[str] = frozenset(
     {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".cc", ".cpp",
-     ".h", ".hpp"}
+     ".h", ".hpp",
+     # Same `//` and `/* */` comment syntax; a Swift `///` doc-comment describing what an
+     # automation "can exfiltrate" scored as a live prompt-injection directive without this.
+     ".swift", ".kt", ".kts", ".cs", ".scala", ".dart", ".m", ".mm"}
 )
 
 
-def _c_comment_spans(text: str) -> list[tuple[int, int]]:
-    """Char-spans of ``//`` line and ``/* */`` block comments in C-family source.
+# JavaScript-family suffixes, where `/` can also open a regular-expression literal.
+_JS_FAMILY_SUFFIXES: frozenset[str] = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"})
+# After one of these, a `/` starts a regex literal rather than a division.
+_JS_REGEX_PRECEDERS = frozenset("(,=:[!&|?{};+-*%<>~^")
+_JS_REGEX_KEYWORDS = frozenset(
+    {"return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw",
+     "yield", "await"}
+)
 
-    String-aware (skips ``'…'``/``"…"``/`` `…` `` with backslash escapes) so a ``//`` or ``/*``
-    inside a string literal is not mistaken for a comment. Best-effort and stdlib-only; template
-    ``${…}`` interpolation is treated as opaque string content (worst case: no demotion).
+
+def _js_regex_end(text: str, i: int) -> int | None:
+    """End offset of a JS regex literal opening at ``text[i] == "/"``, or None if it is not one.
+
+    A `/` opens a regex only where an expression may start: at the start of the file, after an
+    operator or opening bracket, or after a keyword such as ``return``. The literal ends at the
+    first unescaped `/` outside a ``[...]`` class; a newline first means it was a division.
     """
-    spans: list[tuple[int, int]] = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c in ("'", '"', "`"):
-            quote = c
-            i += 1
-            while i < n:
-                if text[i] == "\\":
-                    i += 2
-                    continue
-                if text[i] == quote:
-                    i += 1
-                    break
-                i += 1
+    j = i - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    after = text[i + 1 : i + 2]
+    if j >= 0 and text[j] == "<" and (after.isalpha() or after == ">"):
+        return None  # a JSX closing tag, `</div>` or `</>`
+    if j >= 0 and text[j] not in _JS_REGEX_PRECEDERS:
+        k = j
+        while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+            k -= 1
+        if text[k + 1 : j + 1] not in _JS_REGEX_KEYWORDS:
+            return None
+    n = len(text)
+    k = i + 1
+    in_class = False
+    while k < n:
+        ch = text[k]
+        if ch == "\n":
+            return None
+        if ch == "\\":
+            k += 2
             continue
-        if c == "/" and i + 1 < n:
-            nxt = text[i + 1]
-            if nxt == "/":
-                start = i
-                i += 2
-                while i < n and text[i] != "\n":
-                    i += 1
-                spans.append((start, i))
-                continue
-            if nxt == "*":
-                start = i
-                i += 2
-                while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
-                    i += 1
-                i = min(n, i + 2)
-                spans.append((start, i))
-                continue
-        i += 1
-    return spans
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            k += 1
+            while k < n and text[k].isalpha():
+                k += 1
+            return k
+        k += 1
+    return None
 
 
-def _c_string_spans(text: str) -> list[tuple[int, int]]:
-    """Char-spans of ``'…'``/``"…"``/`` `…` `` string literals in C-family source.
+def _c_code_spans(
+    text: str, suffix: str
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]]]:
+    """Char-spans of comments, string literals and JS regex literals, from one lexing pass.
 
-    The mirror image of :func:`_c_comment_spans`: comment-aware (skips ``//`` line and ``/* */``
-    block comments) so a quote inside a comment does not open a bogus string, and it RECORDS the
-    string spans instead of skipping them. Same best-effort escape handling and stdlib-only
-    approach; template ``${…}`` interpolation is treated as opaque string content (worst case: the
-    whole template counts as one string span). Used only by the ``strings_and_comments_all``
-    code-context policy (ST-PROMPT-INJECTION).
+    Comments are ``//`` lines and ``/* */`` blocks; strings are ``'…'``/``"…"``/`` `…` `` with
+    backslash escapes. Best-effort and stdlib-only. Three details keep one odd token from
+    desynchronising the rest of the file, which silently turned every later comment into code
+    and every later string into a live directive:
+
+    * a ``'`` or ``"`` string ends at an unescaped newline (none of these languages continue one
+      across lines), so an apostrophe in JSX text or a Rust lifetime cannot swallow the file;
+    * a triple double-quote opens a string (Kotlin, Swift, Scala, C#) that may span lines;
+    * in the JavaScript family a regex literal such as ``/'/g`` is skipped as a unit, so the
+      quote inside it does not open a string.
+
+    Template ``${…}`` interpolation is treated as opaque string content.
     """
-    spans: list[tuple[int, int]] = []
+    comments: list[tuple[int, int]] = []
+    strings: list[tuple[int, int]] = []
+    regexes: list[tuple[int, int]] = []
+    js = suffix in _JS_FAMILY_SUFFIXES
+    rust = suffix == ".rs"
+    go = suffix == ".go"
     i, n = 0, len(text)
     while i < n:
         c = text[i]
+        if rust and c == "r" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            raw = _RUST_RAW_OPEN.match(text, i)
+            if raw:
+                close = '"' + "#" * (len(raw.group(0)) - 2)
+                end = text.find(close, raw.end())
+                start, i = i, (n if end < 0 else end + len(close))
+                strings.append((start, i))
+                continue
+        if rust and c == "'":
+            char = _RUST_CHAR.match(text, i)
+            if char is None:
+                i += 1  # a lifetime such as 'a or 'static
+                continue
+        if c == '"' and text.startswith('"""', i):
+            start = i
+            end = text.find('"""', i + 3)
+            i = n if end < 0 else end + 3
+            strings.append((start, i))
+            continue
         if c in ("'", '"', "`"):
-            quote = c
             start = i
             i += 1
             while i < n:
-                if text[i] == "\\":
+                ch = text[i]
+                # A Go raw string (`...`) has no escapes: `C:\` ends at its backtick.
+                if ch == "\\" and not (go and c == "`"):
                     i += 2
                     continue
-                if text[i] == quote:
+                if ch == c:
                     i += 1
                     break
+                if ch == "\n" and c != "`" and not (rust and c == '"'):
+                    break
                 i += 1
-            spans.append((start, i))
+            strings.append((start, min(i, n)))
             continue
         if c == "/" and i + 1 < n:
             nxt = text[i + 1]
             if nxt == "/":
-                i += 2
+                start = i
                 while i < n and text[i] != "\n":
                     i += 1
+                comments.append((start, i))
                 continue
             if nxt == "*":
-                i += 2
-                while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
-                    i += 1
-                i = min(n, i + 2)
+                start = i
+                end = text.find("*/", i + 2)
+                i = n if end < 0 else end + 2
+                comments.append((start, i))
                 continue
+            if js:
+                end = _js_regex_end(text, i)
+                if end is not None:
+                    regexes.append((i, end))
+                    i = end
+                    continue
         i += 1
-    return spans
+    return comments, strings, regexes
+
+
+_RUST_RAW_OPEN = re.compile(r'r#*"')
+_RUST_CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+# Code sinks that execute their string argument (detection literals, never called here).
+_JS_EXEC_SINK = re.compile(
+    r"(?:\beval|\bnew\s+Function|\bFunction|\bsetTimeout|\bsetInterval|\bexecScript)\s*\(\s*$"
+)
+# Builtins only: `re.compile(r"...")` is a pattern, not code (a jailbreak-phrase filter scored).
+_PY_EXEC_SINK = re.compile(r"(?<![\w.])(?:exec|eval|compile)\s*\(\s*$")
+_SHELL_SHEBANG = re.compile(r"#!\S*(?:/|\s)(?:env\s+)?(?:ba|z|da|k)?sh\b")
+# Commands whose argument is text for a person to read, not something the line executes.
+_PRINT_COMMAND = re.compile(
+    r"(?:^|[;&|(]|\$\()\s*(?:echo|printf|print|puts|Write-Host|Write-Output|Write-Information|"
+    r"console\.(?:log|info|warn|error))\b[^;&|]*$"
+)
+
+
+def _prints(prefix: str) -> bool:
+    """True if the text before an argument on its line ends in an output command's arguments.
+
+    The command must follow the last `;`, `&` or `|` (nothing after it may contain one), so only
+    that part is searched: searching all of it from every `echo` of a crafted line was quadratic.
+    """
+    cut = max(prefix.rfind(";"), prefix.rfind("&"), prefix.rfind("|"))
+    return bool(_PRINT_COMMAND.search(prefix, max(cut, 0)))
+
+
+# The output of `echo` reaches a person unless the same command sends it on: `echo "…" | crontab -`
+# installs it, `echo "…" >> ~/.bashrc` writes it. A redirect to stderr (`>&2`, `2>`) still shows
+# it. Only the text up to the next `;` or `&` belongs to the command.
+_SENT_ON = re.compile(r"[^;&]*?(?:\|(?!\|)|(?<![0-9&>])>{1,2}(?!&))")
+_REDIRECT = re.compile(r"(?<![0-9&>])>{1,2}(?!&)")
+
+
+def _output_sent_on(rest: str) -> bool:
+    """True if the text after an output command's argument pipes or redirects its output."""
+    return bool(_SENT_ON.match(_QUOTED_ARG.sub(" ", rest)))
+
+
+def _redirect_target(prefix: str) -> bool:
+    """True if a redirect stands between the output command and the argument: the argument is
+    the file the output goes to (`echo "…" >> "$HOME/.bashrc"`), not text that is printed."""
+    cut = max(prefix.rfind(";"), prefix.rfind("&"), prefix.rfind("|"))
+    return bool(_REDIRECT.search(prefix, max(cut, 0)))
+_QUOTED_ARG = re.compile(r"""(["'`])(?:\\.|(?!\1)[^\\])*\1""")
+# A shell variable assigned a quoted value on its own line: `name="…"`, `export name='…'`,
+# `local name="…"`. The value ends at the next same quote (an escaped quote is rare in a hint, and
+# a value that does not close on the line is not read as one). Only a comment, `;` or a case arm's
+# `;;` may follow. A `case` arm's pattern may lead the line (`Linux) uv_hint="curl … | sh" ;;`): an
+# installer picks its hint per platform. Anything else after the value keeps the line in scope.
+_SHELL_ASSIGNMENT = re.compile(
+    r"[ \t]*(?:[A-Za-z0-9_*?.|\[\]-]{1,100}\)[ \t]*)?"
+    r"(?:(?:export|local|readonly|declare(?:[ \t]+-[A-Za-z]+)*)[ \t]+)?"
+    r"([A-Za-z_][A-Za-z0-9_]{0,100})=([\"'])"
+)
+_ASSIGNMENT_TAIL = re.compile(r"[ \t]*(?:;;?[ \t]*)?(?:#.*)?$")
+# JSX attributes whose value is text shown to a person.
+_JSX_UI_ATTRIBUTE = re.compile(
+    r"\b(?:placeholder|title|label|aria-label|aria-description|alt|helperText|hint|tooltip|"
+    r"description|subtitle|caption|emptyText|errorMessage)\s*=\s*\{?\s*$"
+)
+# Decorators whose function a model sees: its docstring becomes the tool/prompt description.
+_AGENT_FACING_DECORATORS = frozenset({"tool", "prompt"})
+_SAMPLING_CALLS = frozenset({"create_message"})
+# A file written against an MCP server library (FastMCP, the official SDK's server packages).
+# The shapes below are agent metadata only there: a pydantic `Field(description=...)` in any other
+# file is an ordinary model, and `@api.resource` is a REST route.
+_PY_MCP_SERVER = re.compile(r"\bfastmcp\b|\bmcp\.server\b")
+# In an MCP server file: a resource's docstring is its description, like a tool's.
+_MCP_AGENT_FACING_DECORATORS = frozenset({"resource"})
+# Calls whose keyword values an MCP SDK publishes to the client's model: the server's
+# `instructions`, the description/title/schema of a tool, prompt or resource built by hand
+# (`types.Tool(inputSchema={...})`), a pydantic `Field` that becomes a schema property, and the
+# text of a content block a handler returns.
+_MCP_METADATA_CALLS = frozenset(
+    {"FastMCP", "Server", "MCPServer", "Tool", "Prompt", "PromptArgument", "Resource",
+     "ResourceTemplate", "ToolAnnotations", "Field", "TextContent", "add_tool", "add_prompt",
+     "add_resource"}
+)
+_MCP_METADATA_KEYWORDS = frozenset(
+    {"instructions", "description", "title", "inputSchema", "input_schema", "outputSchema",
+     "output_schema", "examples", "default", "text"}
+)
+
+
+def _python_agent_facing_spans(
+    text: str, line_starts: list[int]
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Char-spans of Python strings a model reads, and of the functions that call sampling.
+
+    See ``IndexedFile.in_agent_facing_string`` and ``IndexedFile.sampling_regions``.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):  # MemoryError: parser stack
+        return [], []
+    lines = text.splitlines(keepends=True)
+
+    def offset(lineno: int, col_bytes: int) -> int:
+        # ast columns count UTF-8 bytes; the index counts characters.
+        line = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+        col = len(line.encode("utf-8")[:col_bytes].decode("utf-8", errors="ignore"))
+        return line_starts[lineno - 1] + col if 0 < lineno <= len(line_starts) else len(text)
+
+    def span(node: ast.AST) -> tuple[int, int]:
+        return (
+            offset(node.lineno, node.col_offset),  # type: ignore[attr-defined]
+            offset(node.end_lineno, node.end_col_offset),  # type: ignore[attr-defined]
+        )
+
+    def decorator_name(dec: ast.expr) -> str:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Attribute):
+            return target.attr
+        return target.id if isinstance(target, ast.Name) else ""
+
+    # A description kept in a module-level name (`HINT = "..." + "..."`, then
+    # `@mcp.tool(description=HINT)`) is the same text the model reads.
+    module_values = {
+        stmt.targets[0].id: stmt.value
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+    }
+    spans: list[tuple[int, int]] = []
+    regions: list[tuple[int, int]] = []
+    mcp_server = bool(_PY_MCP_SERVER.search(text))
+    decorators = _AGENT_FACING_DECORATORS | (_MCP_AGENT_FACING_DECORATORS if mcp_server else set())
+
+    def strings_in(value: ast.AST) -> None:
+        for sub in ast.walk(value):
+            if isinstance(sub, ast.JoinedStr) or (
+                isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+            ):
+                spans.append(span(sub))
+        if isinstance(value, ast.Name) and value.id in module_values:
+            strings_in(module_values[value.id])
+
+    for node in ast.walk(tree):
+        if mcp_server and isinstance(node, ast.Call):
+            name = decorator_name(node)
+            if name in _MCP_METADATA_CALLS:
+                for kw in node.keywords:
+                    if kw.arg in _MCP_METADATA_KEYWORDS:
+                        strings_in(kw.value)
+                # `FastMCP("name", "instructions")`: the second positional is the instructions.
+                if name == "FastMCP" and len(node.args) > 1:
+                    strings_in(node.args[1])
+            continue
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        facing = [d for d in node.decorator_list if decorator_name(d) in decorators]
+        if facing and mcp_server:
+            # The parameters' annotations and defaults become the tool's input schema: the text
+            # in `Annotated[str, "..."]`, `Field(description=...)`, `Literal[...]` and a default
+            # string is shown to the model as property descriptions, enum values and defaults.
+            args = node.args
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+                if arg.annotation is not None:
+                    strings_in(arg.annotation)
+            for default in (*args.defaults, *args.kw_defaults):
+                if default is not None:
+                    strings_in(default)
+        if facing:
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                spans.append(span(body[0].value))
+            for dec in facing:
+                if isinstance(dec, ast.Call):
+                    for kw in dec.keywords:
+                        if kw.arg in ("description", "title"):
+                            spans.append(span(kw.value))
+                            if isinstance(kw.value, ast.Name) and kw.value.id in module_values:
+                                spans.append(span(module_values[kw.value.id]))
+            # The tool's return value is exactly what an MCP client hands back to the model as
+            # the call result -- a poisoning phrase built there at runtime (not just in the
+            # static description) still reaches the agent (Deadbugz, August 2026: a server stays
+            # harmless for its first calls, then starts handing the agent credential-hunting
+            # instructions once a call-count trigger is hit).
+            for ret in ast.walk(node):
+                if not isinstance(ret, ast.Return) or ret.value is None:
+                    continue
+                for sub in ast.walk(ret.value):
+                    if isinstance(sub, ast.JoinedStr) or (
+                        isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                    ):
+                        spans.append(span(sub))
+        samples = any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in _SAMPLING_CALLS
+            for call in ast.walk(node)
+        )
+        if samples:
+            regions.append(span(node))
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.JoinedStr) or (
+                    isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                ):
+                    spans.append(span(sub))
+    return spans, regions
+
+
+# A JavaScript/TypeScript file written against an MCP server SDK (source or bundled output).
+_JS_MCP_SERVER = re.compile(
+    r"@modelcontextprotocol/sdk/server|\bMcpServer\b|\b(?:ListTools|ListPrompts|ListResources)"
+    r"RequestSchema\b|\bFastMCP\b"
+)
+# What sits right before a string literal the SDK publishes to the model, in such a file:
+# a `description:` / `title:` / `instructions:` value; a zod `.describe(...)` / `.default(...)`;
+# the description argument of `server.tool("name", "...")` and its prompt/resource siblings; an
+# element of an `enum: [...]`, `z.enum([...])` or `examples: [...]` array.
+_JS_META_BEFORE = re.compile(
+    r"""(?:\b|["'])(?:description|title|instructions)["']?\s*:\s*$"""
+    r"|\.(?:describe|default)\s*\(\s*$"
+    r"""|\.(?:tool|prompt|resource|registerTool|registerPrompt|registerResource)\s*\(\s*"""
+    r"""(?:"[^"\n]{0,200}"|'[^'\n]{0,200}'|`[^`]{0,200}`)\s*,\s*$"""
+)
+_JS_ARRAY_OPEN = re.compile(r"""(?:\benum["']?\s*:|\.enum\s*\(|\bexamples["']?\s*:)\s*$""")
+# The text of a content block (`{ type: "text", text: "..." }`): a prompt template or a tool result.
+_JS_TEXT_KEY = re.compile(r"""(?:\b|["'])text["']?\s*:\s*$""")
+_JS_TEXT_TYPE = re.compile(r"""\btype["']?\s*:\s*["']text["']""")
+_JS_CONCAT = re.compile(r"\s*\+\s*$")
+_JS_CONST = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$")
+_JS_LOOKBEHIND = 240
+_JS_CONCAT_LINKS = 16
+
+
+def _js_agent_facing(
+    text: str, spans: list[tuple[int, int]], k: int, names: dict[str, bool]
+) -> bool:
+    """True if the ``k``-th string literal of an MCP-server JS file is text the model reads.
+
+    Linear in a bounded look-behind: a string joined with ``+`` to such a string counts (up to
+    ``_JS_CONCAT_LINKS`` links), as does a constant later used as a description.
+    """
+    for _ in range(_JS_CONCAT_LINKS):
+        start = spans[k][0]
+        before = text[max(0, start - _JS_LOOKBEHIND) : start]
+        if _JS_META_BEFORE.search(before):
+            return True
+        if _JS_TEXT_KEY.search(before) and _JS_TEXT_TYPE.search(before[-120:]):
+            return True
+        bracket = before.rfind("[")
+        if bracket >= 0 and "]" not in before[bracket:] and _JS_ARRAY_OPEN.search(
+            before[:bracket]
+        ):
+            return True
+        const = _JS_CONST.search(before)
+        if const:
+            return _js_name_is_metadata(text, const.group(1), names)
+        # `"..." + "..."` / `` `...` + "..." ``: the string continues the one before it.
+        if k == 0 or not _JS_CONCAT.fullmatch(text, spans[k - 1][1], start):
+            return False
+        k -= 1
+    return False
+
+
+def _js_name_is_metadata(text: str, name: str, names: dict[str, bool]) -> bool:
+    """True if the constant ``name`` is used where the SDK publishes its value to the model."""
+    if name not in names:
+        ident = re.escape(name)
+        names[name] = bool(re.search(
+            r"""(?:(?:description|title|instructions)["']?\s*:\s*|\.describe\s*\(\s*|"""
+            r"""\.(?:tool|prompt|resource|registerTool|registerPrompt|registerResource)\s*\(\s*"""
+            r"""(?:"[^"\n]{0,200}"|'[^'\n]{0,200}')\s*,\s*)"""
+            + ident + r"(?![\w$])",
+            text,
+        ))
+    return names[name]
+
+
+def _python_docstring_spans(text: str, line_starts: list[int]) -> list[tuple[int, int]]:
+    """Char-spans of Python docstrings: string literals that stand alone as a statement.
+
+    A module, class or function docstring (and an attribute docstring under an assignment) is
+    an expression statement that evaluates a string and discards it -- documentation with the
+    syntax of a string. See ``IndexedFile.in_python_docstring``.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):  # MemoryError: parser stack
+        return []
+    lines = text.splitlines(keepends=True)
+
+    def offset(lineno: int, col_bytes: int) -> int:
+        # ast columns count UTF-8 bytes; the index counts characters.
+        if not 0 < lineno <= min(len(lines), len(line_starts)):
+            return len(text)
+        col = len(lines[lineno - 1].encode("utf-8")[:col_bytes].decode("utf-8", errors="ignore"))
+        return line_starts[lineno - 1] + col
+
+    return [
+        (offset(node.lineno, node.col_offset), offset(node.end_lineno, node.end_col_offset))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+        and node.end_lineno is not None
+        and node.end_col_offset is not None
+    ]
 
 
 # Rust unit tests live INLINE in the same .rs file as production code (gated by `#[cfg(test)]`
@@ -565,6 +1463,40 @@ def _rust_test_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+# A PowerShell here-string (`@"` … `"@` / `@'` … `'@`): its lines are a string's content, which a
+# script may later run (`Invoke-Expression $s`), so a `<#` inside one opens no comment.
+_PS_HERE_STRING = re.compile(r"@([\"'])[ \t]*\r?\n.*?\r?\n\1@", re.DOTALL)
+
+
+def _ps_block_comment_spans(text: str) -> list[tuple[int, int]]:
+    """Char-spans of PowerShell ``<# … #>`` block comments.
+
+    An opener inside a quoted string on its line or inside a here-string is text, not a comment
+    (``$s = "<#"`` must not turn the rest of a script into a comment), and an unclosed block
+    counts for nothing.
+    """
+    here_strings = [m.span() for m in _PS_HERE_STRING.finditer(text)] if "@" in text else []
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    while True:
+        start = text.find("<#", pos)
+        if start < 0:
+            return spans
+        line_head = text[text.rfind("\n", 0, start) + 1 : start]
+        if (
+            line_head.count('"') % 2
+            or line_head.count("'") % 2
+            or _offset_in_spans(here_strings, start)
+        ):
+            pos = start + 2
+            continue
+        end = text.find("#>", start + 2)
+        if end < 0:
+            return spans
+        spans.append((start, end + 2))
+        pos = end + 2
+
+
 def _unquoted_hash_index(line: str) -> int | None:
     """Index of the first shell comment ``#`` in ``line``, or None.
 
@@ -602,20 +1534,87 @@ def _is_hidden_codepoint(cp: int) -> bool:
     return cp < 0x20 and cp not in (0x09, 0x0A)  # C0 controls except tab/newline
 
 
+# The code points ``_is_hidden_codepoint`` accepts, as one character class, so they are found and
+# rendered in C. A Python loop over every character of every snippet did not keep up with a long
+# line full of matches. tests/test_long_line_matches.py checks the two agree on every code point.
+_HIDDEN_RANGES = (
+    (0x00, 0x08), (0x0B, 0x1F), (0x7F, 0x9F), (0xAD, 0xAD), (0x200B, 0x200F), (0x202A, 0x202E),
+    (0x2060, 0x2060), (0x2066, 0x2069), (0xFEFF, 0xFEFF), (0xE0000, 0xE007F),
+)
+# Built from numbers, so this source file holds no hidden characters itself.
+_HIDDEN_CODEPOINT = re.compile(
+    "[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in _HIDDEN_RANGES) + "]"
+)
+
+
 def neutralize_hidden(text: str) -> str:
     """Render hidden/deceptive code points as a visible ``<U+XXXX>`` token (display safety)."""
-    if not any(_is_hidden_codepoint(ord(c)) for c in text):
+    if not _HIDDEN_CODEPOINT.search(text):
         return text  # fast path: the vast majority of snippets are clean
-    return "".join(
-        f"<U+{ord(c):04X}>" if _is_hidden_codepoint(ord(c)) else c for c in text
-    )
+    return _HIDDEN_CODEPOINT.sub(lambda m: f"<U+{ord(m.group()):04X}>", text)
 
 
 # Files larger than this are not loaded as text (still recorded in stats).
 MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MiB
+# A VS Code extension runs one bundled entry point, routinely larger than MAX_FILE_BYTES (3-4 MB
+# for `extension.js`), so the engine reads its entry points up to this size (``keep_max_bytes``).
+# Scanning a minified bundle costs roughly 20 s of CPU per MB.
+MAX_ENTRY_POINT_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+# Compiled code a scanner of source cannot read. Shipped without the source beside it, it is a
+# place a payload can hide in plain sight (a .pyc dropped next to the SKILL.md), so the engine
+# reports it as not analyzed; beside its source it is a build artifact.
+BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo", ".class"})
+# Binary sniff window, git's convention: a NUL within the first 8,000 bytes marks a binary.
+# Checking the WHOLE file dropped bundled `dist/*.js` that carried a single NUL inside a string
+# literal deep in the file -- and with the file, every finding in it, including the MCP surface.
+_BINARY_SNIFF_BYTES = 8000
+# Code whose interpreter runs the file even with a NUL byte in it: Node reads a NUL inside a
+# comment or a string, Python's `site` runs the import lines of a .pth file whatever else it holds,
+# and a shell skips NULs. For these a NUL does not make the file binary: it is read as a space, so a
+# stray byte cannot buy a clean report, and every line stays where it was.
+_NUL_TOLERANT_SUFFIXES = frozenset(
+    {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".pth", ".sh", ".bash"}
+)
+
+
+# Byte-order marks of the wide Unicode encodings, longest first (a UTF-32 LE mark starts with the
+# UTF-16 LE one). Text in these is full of NUL bytes, and PowerShell, VBScript and cmd run such a
+# script as it is: read as text by its mark, a UTF-16 install.ps1 was skipped as binary and its
+# download-and-run never seen (security review, 2026-10-15).
+_WIDE_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
+def _sniffed_text(name: str, raw: bytes) -> str | None:
+    """The file's text, or None when the sniff says it is binary."""
+    for bom, encoding in _WIDE_BOMS:
+        if raw.startswith(bom):
+            return raw.decode(encoding, errors="replace")
+    if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
+        if Path(name).suffix.lower() not in _NUL_TOLERANT_SUFFIXES:
+            return None
+        raw = raw.replace(b"\x00", b" ")
+    return raw.decode("utf-8", errors="replace")
 
 # Maximum characters kept in an evidence snippet (protects against minified one-liners).
 MAX_SNIPPET_CHARS = 240
+
+
+def _snippet(text: str) -> str:
+    """``text`` as an evidence snippet: hidden code points made visible, cut to the limit.
+
+    Only the part that can be shown is rendered. Every code point renders as one character or
+    more, so the first MAX_SNIPPET_CHARS of the rendered text come from the first
+    MAX_SNIPPET_CHARS code points; rendering the rest of a long line is wasted, and with many
+    matches on one line it was quadratic.
+    """
+    snippet = neutralize_hidden(text[: MAX_SNIPPET_CHARS + 1])
+    if len(snippet) > MAX_SNIPPET_CHARS:
+        snippet = snippet[:MAX_SNIPPET_CHARS].rstrip() + " …"
+    return snippet
 
 
 @dataclass
@@ -641,6 +1640,33 @@ class IndexedFile:
     _c_string_spans_cache: list[tuple[int, int]] | None = field(
         default=None, repr=False, compare=False
     )
+    # Lazily-computed char-spans of JavaScript-family regex literals (/…/flags).
+    _c_regex_spans_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed char-spans of Python strings a model reads (tool docstrings, sampling
+    # prompts); see ``in_agent_facing_string``.
+    _agent_facing_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _sampling_cache: list[tuple[int, int]] | None = field(default=None, repr=False, compare=False)
+    # JavaScript: whether the file is an MCP server (None = not yet known), and per constant name
+    # whether it is used as a description; see ``in_agent_facing_string``.
+    _js_mcp_server: bool | None = field(default=None, repr=False, compare=False)
+    _js_metadata_names: dict[str, bool] = field(default_factory=dict, repr=False, compare=False)
+    # Per line: the quoted regions ``in_printed_command`` reads, and whether each one is printed
+    # (filled in when first asked); see ``_quoted_regions``.
+    _quoted_cache: dict[int, tuple[list[int], list[int], dict[int, bool]]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    # Per line: where its text starts and ends once surrounding whitespace is stripped.
+    _stripped_cache: dict[int, tuple[int, int]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    # Lazily-computed char-spans of Python docstrings; see ``in_python_docstring``.
+    _docstring_cache: list[tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
     # Lazily-computed char-spans of markdown fenced code blocks.
     _md_code_spans_cache: list[tuple[int, int]] | None = field(
         default=None, repr=False, compare=False
@@ -652,7 +1678,12 @@ class IndexedFile:
     # Lazily-computed de-obfuscation result: None until computed; (None,) once computed as
     # identity; ((norm, idx),) once computed with a real change. The 1-tuple wrapper
     # distinguishes "not yet computed" from "computed: identity".
-    _norm_cache: tuple[tuple[str, list[int]] | None] | None = field(
+    _norm_cache: tuple[tuple[str, Sequence[int]] | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-computed concat-folded view: None until computed; (None,) once computed as identity;
+    # ((folded, idx),) once computed with a real change. Same 1-tuple wrapper as _norm_cache.
+    _fold_cache: tuple[tuple[str, Sequence[int]] | None] | None = field(
         default=None, repr=False, compare=False
     )
 
@@ -668,6 +1699,19 @@ class IndexedFile:
             norm, idx = normalize_with_map(self.text)
             self._norm_cache = ((norm, idx),) if norm and norm != self.text else (None,)
         return self._norm_cache[0]
+
+    def concat_folded_or_none(self) -> tuple[str, Sequence[int]] | None:
+        """``(folded_text, index_map)`` with adjacent string-literal concatenations collapsed, or
+        None when folding is the identity (no ``"a" + "b"`` splicing — the common case).
+
+        Cached like ``normalized_or_none``: several scanners look for literals (credential paths,
+        secret-env names, client-config paths) that an attacker splits across concatenated string
+        literals, and each would otherwise re-fold the file.
+        """
+        if self._fold_cache is None:
+            folded, idx = fold_string_concats(self.text, self.suffix)
+            self._fold_cache = ((folded, idx),) if folded != self.text else (None,)
+        return self._fold_cache[0]
 
     @property
     def name(self) -> str:
@@ -720,17 +1764,23 @@ class IndexedFile:
         return _offset_in_spans(self._comment_spans, offset)
 
     def _ensure_sh_comment_spans(self) -> None:
-        """Record shell (#) comment char-spans once, for ``.sh``/``.bash``/``.zsh`` files."""
+        """Record shell (#) comment char-spans once, for ``.sh``/``.bash``/``.zsh`` files.
+
+        PowerShell also has ``<# … #>`` block comments, where a script documents its own usage
+        (``powershell -ExecutionPolicy Bypass -File setup.ps1`` in codex's setup script).
+        """
         if self._sh_comment_spans is not None:
             return
         spans: list[tuple[int, int]] = []
-        if self.suffix in (".sh", ".bash", ".zsh"):
+        if self.is_shell_like:
             offset = 0
             for line in self.text.splitlines(keepends=True):
                 hash_idx = _unquoted_hash_index(line)
                 if hash_idx is not None:
                     spans.append((offset + hash_idx, offset + len(line)))
                 offset += len(line)
+            if self.suffix in (".ps1", ".psm1"):
+                spans.extend(_ps_block_comment_spans(self.text))
         self._sh_comment_spans = spans
 
     def in_shell_comment(self, offset: int) -> bool:
@@ -745,6 +1795,11 @@ class IndexedFile:
         self._md_code_spans_cache = (
             _markdown_code_spans(self.text) if self.suffix in _MARKDOWN_SUFFIXES else []
         )
+
+    def markdown_code_spans(self) -> list[tuple[int, int]]:
+        """Char-spans of fenced code blocks (markdown files only; empty otherwise)."""
+        self._ensure_md_code_spans()
+        return list(self._md_code_spans_cache or [])
 
     def in_markdown_prose(self, offset: int) -> bool:
         """True if ``offset`` is markdown PROSE — inside a .md/.mdx file, outside any fenced block.
@@ -778,37 +1833,354 @@ class IndexedFile:
             return False
         return self._line_starts[line_no - 1] + hash_at <= offset
 
-    def _ensure_c_comment_spans(self) -> None:
-        """Record C-family (// and /* */) comment char-spans once, for C-family files only."""
+    def _ensure_c_code_spans(self) -> None:
+        """Record C-family comment and string-literal char-spans once, for C-family files only."""
         if self._c_comment_spans_cache is not None:
             return
-        self._c_comment_spans_cache = (
-            _c_comment_spans(self.text) if self.suffix in _C_FAMILY_SUFFIXES else []
-        )
+        if self.suffix in _C_FAMILY_SUFFIXES:
+            (
+                self._c_comment_spans_cache,
+                self._c_string_spans_cache,
+                self._c_regex_spans_cache,
+            ) = _c_code_spans(self.text, self.suffix)
+        else:
+            self._c_comment_spans_cache = []
+            self._c_string_spans_cache = []
+            self._c_regex_spans_cache = []
 
     def in_c_comment(self, offset: int) -> bool:
         """True if ``offset`` falls inside a C-family ``//`` or ``/* */`` comment.
 
         Returns False for non-C-family files, so callers can invoke it unconditionally.
         """
-        self._ensure_c_comment_spans()
+        self._ensure_c_code_spans()
         return _offset_in_spans(self._c_comment_spans_cache, offset)
-
-    def _ensure_c_string_spans(self) -> None:
-        """Record C-family string-literal char-spans once, for C-family files only."""
-        if self._c_string_spans_cache is not None:
-            return
-        self._c_string_spans_cache = (
-            _c_string_spans(self.text) if self.suffix in _C_FAMILY_SUFFIXES else []
-        )
 
     def in_c_string(self, offset: int) -> bool:
         """True if ``offset`` falls inside a C-family string literal ('…'/"…"/`…`).
 
         Returns False for non-C-family files, so callers can invoke it unconditionally.
         """
-        self._ensure_c_string_spans()
+        self._ensure_c_code_spans()
         return _offset_in_spans(self._c_string_spans_cache, offset)
+
+    def in_agent_facing_string(self, offset: int) -> bool:
+        """True if ``offset`` is inside a Python or JS/TS string that a model reads as text.
+
+        String literals are normally demoted as pattern definitions, but these are the
+        opposite: they are exactly what an MCP client hands to the model.
+
+        * the docstring of a function decorated as a tool or prompt (``@mcp.tool()``,
+          ``@server.prompt``) -- FastMCP publishes it as the description;
+        * a ``description=``/``title=`` keyword in that decorator;
+        * every string in a function that calls ``create_message`` -- MCP sampling, where the
+          server makes the client's model run a prompt the server wrote;
+        * a string returned by a tool/prompt function -- the call *result*, handed to the model
+          exactly like the static description. A tool can stay quiet on its first few calls and
+          only start returning agent-directed instructions once a runtime trigger fires; the
+          text is no less agent-facing for being built at call time instead of declared upfront.
+
+        In a file written against an MCP server library, also the rest of the metadata the SDK
+        publishes: Python ``@mcp.resource`` docstrings, the text in a tool parameter's
+        annotation or default (``Annotated[str, Field(description=...)]``), the keyword values
+        of ``FastMCP(instructions=...)``, ``Field(...)``, ``types.Tool(inputSchema=...)`` and
+        their siblings; JS/TS ``description:``/``title:``/``instructions:`` values, zod
+        ``.describe(...)``, ``enum``/``examples`` elements, the description argument of
+        ``server.tool/prompt/resource(...)`` and the text of a ``{type: "text"}`` block.
+        """
+        if self.suffix in _JS_FAMILY_SUFFIXES:
+            return self._js_agent_facing(offset)
+        if self.suffix not in (".py", ".pyw"):
+            return False
+        self._ensure_agent_facing()
+        return _offset_in_spans(self._agent_facing_cache, offset)
+
+    def _js_agent_facing(self, offset: int) -> bool:
+        if self._js_mcp_server is None:
+            self._js_mcp_server = bool(_JS_MCP_SERVER.search(self.text))
+        if not self._js_mcp_server:
+            return False
+        spans = self.c_string_spans()
+        k = bisect.bisect_right(spans, (offset, len(self.text) + 1)) - 1
+        if k < 0 or not spans[k][0] <= offset < spans[k][1]:
+            return False
+        return _js_agent_facing(self.text, spans, k, self._js_metadata_names)
+
+    def in_python_docstring(self, offset: int) -> bool:
+        """True if ``offset`` is inside a Python docstring (a string literal used as a statement).
+
+        A docstring documents the code beside it, like a comment; ``app.run(host="0.0.0.0")``
+        written in one is an example, not a bind. Returns False for non-Python files and for
+        source that does not parse.
+        """
+        if self.suffix not in (".py", ".pyw"):
+            return False
+        if self._docstring_cache is None:
+            self._docstring_cache = _python_docstring_spans(self.text, self._line_starts)
+        return _offset_in_spans(self._docstring_cache, offset)
+
+    def _ensure_agent_facing(self) -> None:
+        if self._agent_facing_cache is None:
+            self._agent_facing_cache, self._sampling_cache = _python_agent_facing_spans(
+                self.text, self._line_starts
+            )
+
+    def sampling_regions(self) -> list[tuple[int, int]]:
+        """Char-spans of code that asks the MCP client's model to run a server-written prompt.
+
+        Python: each function that calls ``create_message``. JavaScript/TypeScript: the text
+        around each ``createMessage(`` call, since the prompt is usually built a few lines above.
+        """
+        if self.suffix in (".py", ".pyw"):
+            if "create_message" not in self.text:
+                return []
+            self._ensure_agent_facing()
+            return list(self._sampling_cache or [])
+        if self.suffix in _JS_FAMILY_SUFFIXES:
+            return [
+                (max(0, m.start() - 4000), min(len(self.text), m.end() + 2000))
+                for m in re.finditer(r"\bcreateMessage\s*\(", self.text)
+            ]
+        return []
+
+    def string_is_executed(self, offset: int) -> bool:
+        """True if the string literal holding ``offset`` is passed straight to a code sink.
+
+        ``new Function("…")``, ``eval("…")``, ``setTimeout("…")`` and Python ``exec("…")`` run
+        their string argument, so what is inside that string is code, not a pattern or a label.
+        """
+        if self.suffix in (".py", ".pyw"):
+            self._ensure_code_spans()
+            spans = self._str_spans
+            sink = _PY_EXEC_SINK
+        elif self.suffix in _C_FAMILY_SUFFIXES:
+            self._ensure_c_code_spans()
+            spans = self._c_string_spans_cache
+            sink = _JS_EXEC_SINK
+        else:
+            return False
+        for start, end in spans or ():
+            if start <= offset < end:
+                return bool(sink.search(self.text, max(0, start - 60), start))
+        return False
+
+    def c_string_spans(self) -> list[tuple[int, int]]:
+        """Char-spans of the C-family string literals (``'…'`` / ``"…"`` / a `` `…` `` template,
+        delimiters included) in file order, from the file's one lexing pass: a quote or backtick
+        inside a comment or a regex literal never starts one. Empty for other files."""
+        self._ensure_c_code_spans()
+        return self._c_string_spans_cache or []
+
+    def c_code_view(self) -> str:
+        """The C-family source with comments, regex literals and the contents of string literals
+        blanked to spaces (quotes and newlines kept, so every offset and line number is the
+        original's). A pattern matched in it is code: a call named in a comment, a string or a
+        regex does not match, and brackets can be paired without minding quotes. Not cached."""
+        self._ensure_c_code_spans()
+        chars = list(self.text)
+
+        def blank(start: int, end: int) -> None:
+            for i in range(start, min(end, len(chars))):
+                if chars[i] != "\n":
+                    chars[i] = " "
+
+        for start, end in self._c_comment_spans_cache or ():
+            blank(start, end)
+        for start, end in self._c_regex_spans_cache or ():
+            blank(start, end)
+        for start, end in self._c_string_spans_cache or ():
+            # Keep the quotes; a ''' / """ triple-quoted literal keeps its first and last quote.
+            blank(start + 1, end - 1)
+        return "".join(chars)
+
+    def string_span_at(self, offset: int) -> tuple[int, int] | None:
+        """The char-span of the Python or C-family string literal holding ``offset``, if any."""
+        if self.suffix in (".py", ".pyw"):
+            self._ensure_code_spans()
+            spans = self._str_spans
+        elif self.suffix in _C_FAMILY_SUFFIXES:
+            self._ensure_c_code_spans()
+            spans = self._c_string_spans_cache
+        else:
+            return None
+        if not spans:
+            return None
+        # String literals never overlap, so the merged spans are the literals themselves.
+        starts, ends = _merged_spans(spans)
+        i = bisect.bisect_right(starts, offset) - 1
+        return (starts[i], ends[i]) if i >= 0 and offset < ends[i] else None
+
+    def in_printed_command(self, offset: int) -> bool:
+        """True if ``offset`` sits in a quoted string that an output command prints.
+
+        `echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"` and
+        `Write-Host "  powershell -c \"irm … | iex\""` show a person what to run; an installer
+        that prints its own instructions is not running them.
+        """
+        line_no = self.line_of_offset(offset)
+        col = offset - self._line_starts[line_no - 1]
+        starts, ends, printed = self._quoted_regions(line_no)
+        k = bisect.bisect_right(starts, col) - 1
+        if k < 0 or col >= ends[k]:
+            return False
+        if k not in printed:
+            line = self._line_text(line_no)
+            prefix = _QUOTED_ARG.sub(" ", line[: starts[k] - 1])
+            printed[k] = (
+                _prints(prefix) and not _redirect_target(prefix)
+                and not _output_sent_on(line[ends[k] + 1 :])
+            )
+        return printed[k]
+
+    def in_shell_assigned_hint(self, offset: int) -> bool:
+        """True if ``offset`` sits in the quoted value of a shell variable assignment
+        (``uv_hint="curl -LsSf … | sh"``) whose every use in the script is printed by an output
+        command (``echo "Install it with: $uv_hint"``), or that is never used.
+
+        Such a value is text shown to a person. A use anywhere else (``eval "$cmd"``,
+        ``bash -c "$cmd"``, ``$cmd`` as a command) keeps it in scope.
+        """
+        if not self.is_shell_like:
+            return False
+        line_no = self.line_of_offset(offset)
+        line = self._line_text(line_no)
+        col = offset - self._line_starts[line_no - 1]
+        m = _SHELL_ASSIGNMENT.match(line)
+        if m is None or col < m.end():
+            return False
+        close = line.find(m.group(2), m.end())
+        if close == -1 or col >= close or not _ASSIGNMENT_TAIL.match(line, close + 1):
+            return False
+        uses = re.compile(rf"\$(?:{m.group(1)}(?![A-Za-z0-9_])|\{{{m.group(1)}[^A-Za-z0-9_])")
+        return all(self._printed_at(use.start()) for use in uses.finditer(self.text))
+
+    def _printed_at(self, offset: int) -> bool:
+        """True if ``offset`` is an argument of an output command on its line (quoted or not)."""
+        if self.in_printed_command(offset):
+            return True
+        line_no = self.line_of_offset(offset)
+        prefix = self._line_text(line_no)[: offset - self._line_starts[line_no - 1]]
+        return _prints(_QUOTED_ARG.sub(" ", prefix))
+
+    def _quoted_regions(self, line_no: int) -> tuple[list[int], list[int], dict[int, bool]]:
+        """The closed quoted regions of one line, as parallel lists of [start, end) columns.
+
+        Read once per line: with many matches on one long line, reading it again for each match
+        was quadratic. A quote closes at the next same quote character, as before.
+        """
+        cached = self._quoted_cache.get(line_no)
+        if cached is None:
+            starts: list[int] = []
+            ends: list[int] = []
+            quote, start = "", -1
+            for k, ch in enumerate(self._line_text(line_no)):
+                if quote:
+                    if ch == quote:
+                        starts.append(start)
+                        ends.append(k)
+                        quote = ""
+                elif ch in ("'", '"', "`"):
+                    quote, start = ch, k + 1
+            cached = self._quoted_cache[line_no] = (starts, ends, {})
+        return cached
+
+    def in_js_regex(self, offset: int) -> bool:
+        """True if ``offset`` falls inside a JavaScript-family regex literal (``/…/flags``).
+
+        A phrase inside a regex is a pattern the code matches against, never text it emits.
+        Returns False for other files, so callers can invoke it unconditionally.
+        """
+        self._ensure_c_code_spans()
+        return _offset_in_spans(self._c_regex_spans_cache, offset)
+
+    def in_rendered_markup_text(self, offset: int) -> bool:
+        """True if ``offset`` is page text in HTML or JSX: what a browser renders for a person.
+
+        In ``.html``/``.htm`` that is everything outside ``<script>`` and ``<style>`` blocks and
+        outside tags. In ``.tsx``/``.jsx`` it is text between a closing ``>`` and the next ``<``
+        with no ``{``/``}`` between, found without leaving the current element. Used only for
+        prompt injection: a blog post explaining "ignore previous instructions" is a page, not
+        a directive to the agent running the component.
+        """
+        text = self.text
+        if self.suffix in (".html", ".htm"):
+            lowered = text.lower()
+            for tag in ("script", "style"):
+                open_at = lowered.rfind("<" + tag, 0, offset)
+                if open_at >= 0 and lowered.find("</" + tag, open_at, offset) < 0:
+                    return False
+            return text.rfind("<", 0, offset) <= text.rfind(">", 0, offset)
+        if self.suffix in (".tsx", ".jsx"):
+            if self.in_c_string(offset) or self.in_c_comment(offset) or self.in_js_regex(offset):
+                return False
+            back = max(text.rfind(ch, 0, offset) for ch in "<>{}")
+            ahead = [p for p in (text.find(ch, offset) for ch in "<>{}") if p >= 0]
+            return back >= 0 and text[back] == ">" and bool(ahead) and text[min(ahead)] == "<"
+        return False
+
+    def in_jsx_ui_attribute(self, offset: int) -> bool:
+        """True if ``offset`` is inside the string value of a UI text attribute in JSX.
+
+        ``placeholder="Paste the contents of ~/.codex/auth.json here"`` is an instruction to the
+        person filling in a form, not code that opens the file. An AI agent app carried exactly that
+        line and, next to an unrelated network call, synthesized a critical exfiltration finding.
+        Only attributes that hold text for a reader count; ``src``/``href``/``value`` do not.
+        """
+        if self.suffix not in (".tsx", ".jsx"):
+            return False
+        self._ensure_c_code_spans()
+        for start, end in self._c_string_spans_cache or ():
+            if start <= offset < end:
+                return bool(_JSX_UI_ATTRIBUTE.search(self.text, max(0, start - 40), start))
+        return False
+
+    def in_sql_comment(self, offset: int) -> bool:
+        """True if ``offset`` sits after an unquoted ``--`` on its line in a ``.sql`` file."""
+        if self.suffix != ".sql":
+            return False
+        line_no = self.line_of_offset(offset)
+        line = self._line_text(line_no)
+        col = offset - self._line_starts[line_no - 1]
+        in_quote = False
+        for k, ch in enumerate(line[:col]):
+            if ch == "'":
+                in_quote = not in_quote
+            elif not in_quote and line.startswith("--", k):
+                return True
+        return False
+
+    def in_shell_quoted(self, offset: int) -> bool:
+        """True if ``offset`` is inside a quoted argument on a shell or Makefile line.
+
+        A quoted string on a command line is data handed to a program. It is not text an agent
+        reads as an instruction: `scan "Ignore previous instructions"` demonstrates a scanner.
+        """
+        if not self.is_shell_like:
+            return False
+        line_no = self.line_of_offset(offset)
+        line = self._line_text(line_no)
+        col = offset - self._line_starts[line_no - 1]
+        quote = ""
+        for ch in line[:col]:
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in ("'", '"'):
+                quote = ch
+        return bool(quote)
+
+    @property
+    def is_shell_like(self) -> bool:
+        """Shell scripts and Makefiles, whose `#` comments and quoted arguments are not code."""
+        name = self.relpath.rsplit("/", 1)[-1].lower()
+        if self.suffix in (".sh", ".bash", ".zsh", ".mk", ".ps1", ".psm1") or name in (
+            "makefile",
+            "gnumakefile",
+        ):
+            return True
+        # A suffix-less script with a shell shebang (`cli/rustok`, `#!/bin/sh`): its `#` lines are
+        # comments too.
+        return self.suffix == "" and bool(_SHELL_SHEBANG.match(self.text[:200]))
 
     def _ensure_rust_test_spans(self) -> None:
         """Record inline Rust test-block char-spans once, for ``.rs`` files only."""
@@ -852,10 +2224,14 @@ class IndexedFile:
         # end_offset is exclusive; subtract 1 so a match ending at a newline does not
         # spill onto the next line.
         line_end = self.line_of_offset(max(start_offset, end_offset - 1))
-        lines = [self._line_text(n) for n in range(line_start, line_end + 1)]
-        snippet = neutralize_hidden("\n".join(lines).strip())
-        if len(snippet) > MAX_SNIPPET_CHARS:
-            snippet = snippet[:MAX_SNIPPET_CHARS].rstrip() + " …"
+        if line_start == line_end:
+            # Cut from the file text itself: copying a long line for each of its matches was
+            # quadratic. The snippet only ever reads the first MAX_SNIPPET_CHARS + 1 characters.
+            first, last = self._stripped_bounds(line_start)
+            snippet = _snippet(self.text[first : min(last, first + MAX_SNIPPET_CHARS + 1)])
+        else:
+            lines = [self._line_text(n) for n in range(line_start, line_end + 1)]
+            snippet = _snippet("\n".join(lines).strip())
         return Evidence(
             file=self.relpath,
             line_start=line_start,
@@ -864,6 +2240,28 @@ class IndexedFile:
             match_offset=start_offset,
         )
 
+    def line_bounds(self, start: int, end: int) -> tuple[int, int]:
+        """From the start of the line holding ``start`` to the newline at or after ``end``.
+
+        The same two offsets as ``text.rfind("\\n", 0, start) + 1`` and ``text.find("\\n", end)``
+        (the end of the text when there is no newline), read from the line index: scanning for
+        them again for each of many matches on one long line was quadratic.
+        """
+        first = self._line_starts[self.line_of_offset(start) - 1]
+        after = self.line_of_offset(end)
+        last = self._line_starts[after] - 1 if after < len(self._line_starts) else len(self.text)
+        return first, last
+
+    def _stripped_bounds(self, line_no: int) -> tuple[int, int]:
+        """Offsets of one line's text as ``strip()`` leaves it, worked out once per line."""
+        bounds = self._stripped_cache.get(line_no)
+        if bounds is None:
+            line = self._line_text(line_no)
+            start = self._line_starts[line_no - 1]
+            first = start + len(line) - len(line.lstrip())
+            bounds = self._stripped_cache[line_no] = (first, max(first, start + len(line.rstrip())))
+        return bounds
+
     def evidence_for_lines(self, line_start: int, line_end: int) -> Evidence:
         """Build Evidence from 1-based line numbers (used by AST-based scanners)."""
         line_start = max(1, line_start)
@@ -871,14 +2269,11 @@ class IndexedFile:
         # Cap the span so a call spanning many lines does not produce a huge snippet.
         line_end = min(line_end, line_start + 10, len(self._line_starts))
         lines = [self._line_text(n) for n in range(line_start, line_end + 1)]
-        snippet = neutralize_hidden("\n".join(lines).strip())
-        if len(snippet) > MAX_SNIPPET_CHARS:
-            snippet = snippet[:MAX_SNIPPET_CHARS].rstrip() + " …"
         return Evidence(
             file=self.relpath,
             line_start=line_start,
             line_end=line_end,
-            snippet=snippet,
+            snippet=_snippet("\n".join(lines).strip()),
         )
 
     def finditer(self, pattern: re.Pattern[str]) -> Iterator[tuple[re.Match[str], Evidence]]:
@@ -896,12 +2291,46 @@ class FileIndex:
         files: list[IndexedFile],
         stats: dict[str, int],
         minified: list[str] | None = None,
+        git_config: IndexedFile | None = None,
+        *,
+        links: list[str] | None = None,
+        unreadable: list[str] | None = None,
+        skipped_dirs: list[tuple[str, str]] | None = None,
+        skip_build_output: bool = True,
+        large: list[str] | None = None,
+        install_scripts: frozenset[str] = frozenset(),
+        own_outputs: list[str] | None = None,
+        exclude: tuple[str, ...] = (),
+        compiled: list[str] | None = None,
     ):
         self.root = root
         self.files = files
         self.stats = stats
+        # Relative paths of bytecode files (BYTECODE_SUFFIXES) the walk found; binary, so not read.
+        self.compiled = compiled or []
+        # `.git/config`, read for the GitSpawn check only and kept out of `files`: it belongs to
+        # whoever cloned the project (their remote URL, maybe with a token in it), not to what the
+        # component ships, so no other rule may treat it as component content.
+        self.git_config = git_config
         # Relative paths of shipped bundles that were deliberately not indexed (see _is_minified).
         self.minified = minified or []
+        # Relative paths of symbolic links and junctions that were not followed (see walk_files).
+        self.links = links or []
+        # Relative paths the walk found but could not read; a directory ends with "/".
+        self.unreadable = unreadable or []
+        # Directories the walk did not enter, as (relative path, kind); see skipped_dir_kind.
+        self.skipped_dirs = skipped_dirs or []
+        # Whether build output was set aside (a repository) or read (a published package).
+        self.skip_build_output = skip_build_output
+        # Relative paths of text files larger than MAX_FILE_BYTES, not read (binaries are not
+        # listed: nothing here reads them, whatever their size).
+        self.large = large or []
+        # Relative paths of the files npm runs at install time (see engine._install_script_files).
+        self.install_scripts = install_scripts
+        # Relative paths of SkillTotal's own reports and baselines, not read (is_skilltotal_output).
+        self.own_outputs = own_outputs or []
+        # The globs the walk was told to skip, honored by anything that reads files after it.
+        self.exclude = exclude
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -911,74 +2340,243 @@ class FileIndex:
         *,
         exclude: Iterable[str] | None = None,
         skip_build_output: bool = True,
+        always_index: Iterable[str] = (),
+        keep_minified: Iterable[str] = (),
+        keep_max_bytes: int = MAX_FILE_BYTES,
     ) -> FileIndex:
+        """Walk ``root`` once and load its text files.
+
+        ``always_index`` names files (relative POSIX paths) indexed even when minified: the
+        scripts a package runs at install time are the attack surface itself, whatever their
+        shape, so they are never set aside as a bundle. ``keep_minified`` files are read up to
+        ``keep_max_bytes`` instead of ``MAX_FILE_BYTES``.
+        """
         root = Path(root).resolve()
         files: list[IndexedFile] = []
         minified: list[str] = []
+        git_config: IndexedFile | None = None
         stats = {
             "indexed": 0,
             "skipped_binary": 0,
             "skipped_large": 0,
             "skipped_minified": 0,
+            "skipped_source_map": 0,
+            "skipped_own_output": 0,
             "total_seen": 0,
         }
         excludes = tuple(exclude or ())
+        always = frozenset(always_index)
+        # Read whatever their shape, but otherwise like any file (a package's entry points).
+        keep = frozenset(keep_minified)
+        links: list[str] = []
+        unreadable: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        large: list[str] = []
+        own_outputs: list[str] = []
+        compiled: list[str] = []
 
-        for path in cls._walk(root, excludes, skip_build_output=skip_build_output):
+        for path in cls._walk(root, excludes, skip_build_output=skip_build_output,
+                              links=links, unreadable=unreadable, skipped=skipped):
             stats["total_seen"] += 1
             try:
                 size = path.stat().st_size
             except OSError:
+                unreadable.append(path.relative_to(root).as_posix())
                 continue
-            if size > MAX_FILE_BYTES:
+            limit = MAX_FILE_BYTES
+            if size > limit and path.relative_to(root).as_posix() in keep:
+                limit = max(limit, keep_max_bytes)
+            if size > limit:
                 stats["skipped_large"] += 1
+                if cls._large_text(path):
+                    large.append(path.relative_to(root).as_posix())
                 continue
             try:
                 raw = path.read_bytes()
             except OSError:
+                unreadable.append(path.relative_to(root).as_posix())
                 continue
-            if b"\x00" in raw:  # crude but effective binary check
+            text = _sniffed_text(path.name, raw)  # git-style sniff; see the constant
+            if text is None:
                 stats["skipped_binary"] += 1
+                # Bytecode outside __pycache__ (which the walk never enters) is listed: the
+                # engine reports it as unanalyzed when no source file stands beside it.
+                if path.suffix.lower() in BYTECODE_SUFFIXES:
+                    compiled.append(path.relative_to(root).as_posix())
                 continue
-            text = raw.decode("utf-8", errors="replace")
             # Strip a leading UTF-8 BOM (common in Windows-authored configs). Left in, it breaks
             # JSON parsing of manifests (e.g. an MCP config → missed ST-MCP-* findings) and is
             # mis-flagged as hidden zero-width Unicode. It precedes line 1, so line offsets are
             # unaffected.
             if text.startswith("\ufeff"):
                 text = text[1:]
-            if _is_minified(path.name, text):
+            if path.relative_to(root).parts == (".git", "config"):
+                git_config = IndexedFile(
+                    path=path,
+                    relpath=".git/config",
+                    text=text,
+                    _line_starts=cls._compute_line_starts(text),
+                )
+                continue
+            relpath = path.relative_to(root).as_posix()
+            if relpath not in always and is_skilltotal_output(text):
+                stats["skipped_own_output"] += 1
+                own_outputs.append(relpath)
+                continue
+            if _is_minified(path.name, text) and relpath not in always and relpath not in keep:
                 stats["skipped_minified"] += 1
-                minified.append(path.relative_to(root).as_posix())
+                minified.append(relpath)
+                continue
+            if _is_codeless_source_map(path.name, text):
+                stats["skipped_source_map"] += 1
                 continue
             files.append(
                 IndexedFile(
                     path=path,
-                    relpath=path.relative_to(root).as_posix(),
+                    relpath=relpath,
                     text=text,
                     _line_starts=cls._compute_line_starts(text),
                 )
             )
             stats["indexed"] += 1
 
+        # A file npm runs at install is read even inside a folder the walk sets aside (`vendor/`, a
+        # bundled `node_modules/`): it runs on every install, whatever it is filed under.
+        for relpath in sorted(always - {f.relpath for f in files}):
+            if excludes and _matches_any(relpath, excludes):
+                continue
+            path = root / relpath
+            try:
+                if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+                    continue
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            text = _sniffed_text(path.name, raw)
+            if text is None:
+                continue
+            text = text.removeprefix("\ufeff")
+            files.append(IndexedFile(path=path, relpath=relpath, text=text,
+                                     _line_starts=cls._compute_line_starts(text)))
+            stats["indexed"] += 1
+
         files.sort(key=lambda f: f.relpath)
-        return cls(root, files, stats, sorted(minified))
+        return cls(root, files, stats, sorted(minified), git_config,
+                   links=sorted(links), unreadable=sorted(unreadable),
+                   skipped_dirs=sorted(skipped), skip_build_output=skip_build_output,
+                   large=sorted(large), install_scripts=always,
+                   own_outputs=sorted(own_outputs), exclude=excludes,
+                   compiled=sorted(compiled))
+
+    def with_files(
+        self, extra: list[IndexedFile], minified: list[str] | None = None
+    ) -> FileIndex:
+        """A copy of this index with ``extra`` files added (read outside the walk, e.g. code the
+        component loads from a folder the walk skipped) and ``minified`` bundles noted."""
+        files = sorted([*self.files, *extra], key=lambda f: f.relpath)
+        stats = dict(self.stats)
+        stats["indexed"] = stats.get("indexed", 0) + len(extra)
+        return FileIndex(
+            self.root, files, stats, sorted({*self.minified, *(minified or [])}), self.git_config,
+            links=self.links, unreadable=self.unreadable, skipped_dirs=self.skipped_dirs,
+            skip_build_output=self.skip_build_output, large=self.large,
+            install_scripts=self.install_scripts, own_outputs=self.own_outputs,
+            exclude=self.exclude, compiled=self.compiled,
+        )
+
+    @staticmethod
+    def read_file(root: Path, relpath: str) -> tuple[IndexedFile | None, str]:
+        """Read one file under ``root`` the way the walk does: ``(file, "")`` when it is text,
+        else ``(None, why)`` with why in "large", "binary", "minified", "unreadable"."""
+        path = root / relpath
+        try:
+            if path.stat().st_size > MAX_FILE_BYTES:
+                return None, "large"
+            raw = path.read_bytes()
+        except OSError:
+            return None, "unreadable"
+        text = _sniffed_text(path.name, raw)
+        if text is None:
+            return None, "binary"
+        text = text.removeprefix("\ufeff")
+        if _is_minified(path.name, text):
+            return None, "minified"
+        return IndexedFile(path=path, relpath=relpath, text=text,
+                           _line_starts=FileIndex._compute_line_starts(text)), ""
+
+    @staticmethod
+    def _large_text(path: Path) -> bool:
+        """Whether a file too large to read is text: the same sniff, on its first bytes."""
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(_BINARY_SNIFF_BYTES)
+        except OSError:
+            return True  # not even its start could be read: say so rather than nothing
+        return _sniffed_text(path.name, head) is not None
 
     @staticmethod
     def _walk(
-        root: Path, exclude: tuple[str, ...] = (), *, skip_build_output: bool = True
+        root: Path,
+        exclude: tuple[str, ...] = (),
+        *,
+        skip_build_output: bool = True,
+        links: list[str] | None = None,
+        unreadable: list[str] | None = None,
+        skipped: list[tuple[str, str]] | None = None,
     ) -> Iterator[Path]:
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(root)
-            if any(
-                _is_skipped_dir(part, skip_build_output=skip_build_output) for part in rel.parts
-            ):
-                continue
-            if exclude and _matches_any(rel.as_posix(), exclude):
-                continue
-            yield path
+        """The files to index: everything ``walk_files`` finds outside skipped directories and
+        ``exclude``, plus ``.git/config``. Links and unreadable paths that are not excluded are
+        appended to ``links`` / ``unreadable``."""
+
+        def excluded(relpath: str) -> bool:
+            return bool(exclude) and _matches_any(relpath.rstrip("/"), exclude)
+
+        found_links: list[str] = []
+        found_unreadable: list[str] = []
+        # `.git/config` is the one file under a skipped VCS directory whose own content is an
+        # auto-exec surface: `core.fsmonitor` names a command git runs on every `status`/`diff`,
+        # before an agent shows a trust prompt (GitSpawn, 2026). Everything else inside `.git`
+        # (objects, refs, hook samples, ...) is never walked.
+        dot_git = root / ".git"
+        if is_link(dot_git):
+            found_links.append(".git")
+        elif is_link(dot_git / "config"):
+            found_links.append(".git/config")
+        elif is_regular_file(dot_git / "config") and not excluded(".git/config"):
+            yield dot_git / "config"
+
+        # Names skipped whatever the entry is (as before: a link named `node_modules` is not
+        # reported as a link), and directories judged by what they hold (a virtual environment,
+        # an install's `site-packages`, build output).
+        def by_name(name: str) -> bool:
+            return name in _ALWAYS_SKIPPED_NAMES or name.startswith("vendored-")
+
+        def by_place(rel: tuple[str, ...], path: Path) -> bool:
+            return skipped_dir_kind(path, rel[-1], skip_build_output=skip_build_output) is not None
+
+        def note(rel: tuple[str, ...], entry: os.DirEntry) -> None:
+            if skipped is None:
+                return
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    return
+            except OSError:
+                return
+            relpath = "/".join(rel)
+            if excluded(relpath):
+                return
+            kind = skipped_dir_kind(Path(entry.path), rel[-1], skip_build_output=skip_build_output)
+            if kind is not None:
+                skipped.append((relpath, kind))
+
+        for path in walk_files(root, skip=by_name, skip_dir=by_place, on_skip=note,
+                               links=found_links, unreadable=found_unreadable):
+            if not excluded(path.relative_to(root).as_posix()):
+                yield path
+        if links is not None:
+            links.extend(rel for rel in found_links if not excluded(rel))
+        if unreadable is not None:
+            unreadable.extend(rel for rel in found_unreadable if not excluded(rel))
 
     @staticmethod
     def _compute_line_starts(text: str) -> list[int]:

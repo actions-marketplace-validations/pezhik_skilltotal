@@ -98,11 +98,23 @@ class TraitCrosswalk:
     emergent: bool = False
 
 
+# The 16 tactics of MITRE ATLAS (atlas.mitre.org, mitre-atlas/atlas-data ATLAS.yaml). A trait's
+# `atlas_tactics` may only name these: the CSA paper's own labels ("Adversarial Perception
+# Attacks", "Model Poisoning") are not ATLAS tactics and were shown as if they were.
+ATLAS_TACTICS: frozenset[str] = frozenset({
+    "Reconnaissance", "Resource Development", "Initial Access", "AI Model Access", "Execution",
+    "Persistence", "Privilege Escalation", "Defense Evasion", "Credential Access", "Discovery",
+    "Lateral Movement", "Collection", "AI Attack Staging", "Command and Control", "Exfiltration",
+    "Impact",
+})
+
 # Trait -> its crosswalk. The MAESTRO layers for the CSA trait categories are taken from the
 # paper's mapping table (section 3.6.1); Tool-Usage-derived traits are mapped to L3/L4 as a
 # documented SkillTotal extension (the CSA table covered 6 of 7 categories, omitting Tool
-# Usage). ATLAS tactics are populated only from the paper's explicit examples plus the direct
-# Exfiltration tactic for the exfil combo; other traits honestly carry none.
+# Usage). ATLAS tactics are reached through the ATLAS technique that fits the trait: LLM Prompt
+# Injection (AML.T0051) is Execution; poisoning an agent's context or tool data (AML.T0070,
+# AML.T0099) is Persistence; AI Supply Chain Compromise (AML.T0010) is Initial Access; the exfil
+# combinations are Exfiltration (AML.TA0010). Traits with no honest fit carry none.
 TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
     ComponentTrait.TOOL_SURFACE: TraitCrosswalk(
         title="Tool surface",
@@ -156,7 +168,7 @@ TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
         title="Delegated authentication",
         description=(
             "Authenticates tool/API calls with the end user's delegated OAuth/OIDC credentials "
-            "rather than a long-lived embedded service credential — a smaller blast radius."
+            "rather than a long-lived embedded service credential - a smaller blast radius."
         ),
         csa_trait="Tool Execution Context / User Delegated Credentials",
         csa_risk="Access-control boundary confusion (agent-level vs user-level operations)",
@@ -168,7 +180,7 @@ TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
         description=(
             "Authenticates with a short-lived, scoped, assumed identity (STS assumed role, cloud "
             "managed/workload identity, impersonated service account, projected K8s token, or a "
-            "dynamic-secret broker) — the smallest blast radius of the execution-context patterns."
+            "dynamic-secret broker) - the smallest blast radius of the execution-context patterns."
         ),
         csa_trait="Tool Execution Context / Least-Privilege Service Identity",
         csa_risk="Agent proliferation / permission sprawl if scopes are not curated",
@@ -184,7 +196,7 @@ TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
         csa_trait="Perception & Context / Contextual Perception",
         csa_risk="Context manipulation and poisoning",
         maestro_layers=("L2", "L5"),
-        atlas_tactics=("Adversarial Perception Attacks", "Model Poisoning"),
+        atlas_tactics=("Execution", "Persistence"),
     ),
     ComponentTrait.METADATA_INTEGRITY: TraitCrosswalk(
         title="Metadata integrity risk",
@@ -206,7 +218,7 @@ TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
         csa_trait="General Protections / Supply Chain",
         csa_risk="Supply-chain compromise via install-time execution or name confusion",
         maestro_layers=("L4",),
-        atlas_tactics=(),
+        atlas_tactics=("Initial Access",),
     ),
     ComponentTrait.UNSAFE_DESERIALIZATION: TraitCrosswalk(
         title="Unsafe deserialization",
@@ -227,7 +239,7 @@ TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
     ComponentTrait.EXFIL_CORRELATION: TraitCrosswalk(
         title="Sensitive-access + egress correlation",
         description=(
-            "Reads credential/sensitive data AND can reach the network — a "
+            "Reads credential/sensitive data AND can reach the network - a "
             "credential-exfiltration path when the two behaviors correlate."
         ),
         csa_trait="Tool Access Control / Broker-Mediated Access",
@@ -239,13 +251,13 @@ TRAIT_CROSSWALK: dict[ComponentTrait, TraitCrosswalk] = {
     ComponentTrait.INSTRUCTION_EXFIL_FLOW: TraitCrosswalk(
         title="Instruction-driven exfiltration flow",
         description=(
-            "An untrusted-instruction surface combined with file access and network egress — "
+            "An untrusted-instruction surface combined with file access and network egress - "
             "the 'lethal trifecta' for instruction-driven exfiltration."
         ),
         csa_trait="Perception & Context + Tool Access Control",
         csa_risk="Context manipulation escalated through tool egress",
         maestro_layers=("L2", "L5"),
-        atlas_tactics=("Adversarial Perception Attacks", "Exfiltration"),
+        atlas_tactics=("Execution", "Exfiltration"),
         emergent=True,
     ),
     ComponentTrait.MALWARE_CONVERGENCE: TraitCrosswalk(
@@ -271,15 +283,23 @@ TRAIT_BY_RULE: dict[str, tuple[ComponentTrait, ...]] = {
     "ST-SHELL-NODE": (_T.EXECUTION_AUTHORITY,),
     "ST-CMDI-PY": (_T.EXECUTION_AUTHORITY,),
     "ST-CMDI-NODE": (_T.EXECUTION_AUTHORITY,),
+    "ST-MCP-OAUTH-ENDPOINT-INJECTION": (_T.EXECUTION_AUTHORITY, _T.METADATA_INTEGRITY),
     "ST-TAINT-SHELL-PY": (_T.EXECUTION_AUTHORITY,),
     "ST-TAINT-EXEC-PY": (_T.EXECUTION_AUTHORITY,),
     "ST-DYN-PY": (_T.EXECUTION_AUTHORITY,),
     "ST-DYN-NODE": (_T.EXECUTION_AUTHORITY,),
     "ST-PTH-EXEC": (_T.EXECUTION_AUTHORITY,),
+    "ST-STARTUP-HOOK-EXEC": (_T.EXECUTION_AUTHORITY,),
+    "ST-PTH-IMPORT-EXEC": (_T.EXECUTION_AUTHORITY,),
+    "ST-CLIPPER": (_T.EXFIL_CORRELATION,),
     "ST-SHELL-EVASION": (_T.EXECUTION_AUTHORITY,),
     "ST-OBF-DECODE-EXEC": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
     "ST-OBF-DECODE-EXEC-PY": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
     "ST-OBF-DECODE-EXEC-SH": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
+    "ST-OBF-DYNAMIC-DECODE-EXEC": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
+    "ST-OBF-DECRYPT-EXEC": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
+    "ST-OBF-DECODE-SPAWN": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
+    "ST-PS-DOWNLOAD-EXEC": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
     # Filesystem.
     "ST-FS-PY-READ": (_T.FILESYSTEM_REACH,),
     "ST-FS-PY-WRITE": (_T.FILESYSTEM_REACH,),
@@ -289,6 +309,10 @@ TRAIT_BY_RULE: dict[str, tuple[ComponentTrait, ...]] = {
     "ST-NET-PY": (_T.NETWORK_EGRESS,),
     "ST-NET-NODE": (_T.NETWORK_EGRESS,),
     "ST-EMAIL-BCC-EXFIL": (_T.NETWORK_EGRESS,),
+    # A CI token egressed from a composite action: network egress delivered through the supply
+    # chain (the step runs on every consumer's runner).
+    "ST-ACTION-SECRET-EXFIL": (_T.NETWORK_EGRESS, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-WORKFLOW-HISTORY-EXFIL": (_T.NETWORK_EGRESS, _T.EMBEDDED_CREDENTIAL),
     "ST-EXPOSE-BIND": (_T.NETWORK_EXPOSURE,),
     "ST-EXPOSE-DEBUG": (_T.NETWORK_EXPOSURE,),
     # Credentials / sensitive data.
@@ -297,31 +321,78 @@ TRAIT_BY_RULE: dict[str, tuple[ComponentTrait, ...]] = {
     "ST-AUTH-DELEGATED": (_T.DELEGATED_AUTHENTICATION,),
     "ST-AUTH-SCOPED": (_T.SCOPED_IDENTITY,),
     "ST-SENS-PATH": (_T.EMBEDDED_CREDENTIAL,),
+    "ST-SECRET-ENV": (_T.EMBEDDED_CREDENTIAL,),
     "ST-SENS-PATH-PY": (_T.EMBEDDED_CREDENTIAL,),
     "ST-SENS-WORD": (_T.EMBEDDED_CREDENTIAL,),
     # Untrusted perception (prompt injection + hidden/smuggled instructions).
     "ST-PROMPT-INJECTION": (_T.UNTRUSTED_PERCEPTION,),
+    "ST-PROMPT-SPLIT-EXFIL": (_T.UNTRUSTED_PERCEPTION, _T.INSTRUCTION_EXFIL_FLOW),
     "ST-PROMPT-WEAK": (_T.UNTRUSTED_PERCEPTION,),
+    # The server writes the prompt the client's model runs: perception the user never sees, with
+    # the session's own authority behind it.
+    "ST-MCP-SAMPLING-INJECTION": (_T.UNTRUSTED_PERCEPTION, _T.EXECUTION_AUTHORITY),
+    "ST-MCP-SAMPLING-SYSPROMPT": (_T.UNTRUSTED_PERCEPTION, _T.EXECUTION_AUTHORITY),
     "ST-HIDDEN-UNICODE": (_T.METADATA_INTEGRITY, _T.UNTRUSTED_PERCEPTION),
     "ST-HIDDEN-UNICODE-AMBIG": (_T.METADATA_INTEGRITY, _T.UNTRUSTED_PERCEPTION),
+    "ST-HIDDEN-ANSI": (_T.METADATA_INTEGRITY, _T.UNTRUSTED_PERCEPTION),
     # Metadata integrity (poisoning / shadowing / falsified declaration).
     "ST-MCP-TOOL-POISONING": (_T.METADATA_INTEGRITY,),
     "ST-MCP-TOOL-SHADOWING": (_T.METADATA_INTEGRITY,),
     "ST-SKILL-CAP-MISMATCH": (_T.METADATA_INTEGRITY,),
+    "ST-MCP-ANNOTATION-MISMATCH": (_T.METADATA_INTEGRITY, _T.TOOL_SURFACE),
     # Tool surface (MCP).
     "ST-MCP-DETECTED": (_T.TOOL_SURFACE,),
     "ST-MCP-OVERBROAD-SCOPE": (_T.TOOL_SURFACE,),
     "ST-MCP-AUTO-APPROVE": (_T.TOOL_SURFACE,),
     "ST-MCP-DANGEROUS-TOOL": (_T.TOOL_SURFACE, _T.EXECUTION_AUTHORITY),
     "ST-MCP-SERVER-EXEC": (_T.TOOL_SURFACE, _T.EXECUTION_AUTHORITY),
+    "ST-MCP-SERVER-HIDDEN-EXEC": (_T.TOOL_SURFACE, _T.EXECUTION_AUTHORITY, _T.METADATA_INTEGRITY),
     # Deserialization.
     "ST-DESERIALIZE-PY": (_T.UNSAFE_DESERIALIZATION,),
+    "ST-PICKLE-REDUCE": (_T.UNSAFE_DESERIALIZATION, _T.EXECUTION_AUTHORITY),
     "ST-TAINT-DESERIAL-PY": (_T.UNSAFE_DESERIALIZATION,),
     # Supply chain.
     "ST-INSTALL-NPM": (_T.SUPPLY_CHAIN_PROVENANCE,),
+    "ST-NPM-INSTALL-PUBLISH": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
+    "ST-NPM-URL-DEP": (_T.SUPPLY_CHAIN_PROVENANCE,),
+    "ST-NPM-GIT-DEP": (_T.SUPPLY_CHAIN_PROVENANCE,),
+    "ST-AGENT-AUTO-APPROVE": (_T.EXECUTION_AUTHORITY,),
+    "ST-AGENT-API-REDIRECT": (_T.METADATA_INTEGRITY, _T.EXFIL_CORRELATION),
+    "ST-SKILL-FETCH-EXEC": (_T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-SKILL-FETCH-EXEC-HIDDEN": (_T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-MCP-ELICIT-SECRET": (_T.METADATA_INTEGRITY,),
+    "ST-SKILL-AUDIT-OVERRIDE": (_T.UNTRUSTED_PERCEPTION,),
+    "ST-SKILL-MEMORY-WRITE-HIDDEN": (_T.UNTRUSTED_PERCEPTION, _T.EXECUTION_AUTHORITY),
+    "ST-SKILL-ENCRYPTED-INSTRUCTIONS": (_T.UNTRUSTED_PERCEPTION, _T.EXECUTION_AUTHORITY),
+    "ST-HTML-FILE-URL-EXFIL": (_T.NETWORK_EGRESS, _T.UNTRUSTED_PERCEPTION),
+    "ST-INSTALL-GYP": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
+    "ST-AGENT-AUTORUN": (_T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-AGENT-AUTORUN-REMOTE": (_T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-AGENT-GITCONFIG-EXEC-REMOTE": (_T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-AGENT-CLI-BYPASS": (_T.EXECUTION_AUTHORITY,),
+    "ST-AGENT-CONFIG-INJECT": (_T.METADATA_INTEGRITY, _T.EXECUTION_AUTHORITY),
+    "ST-AGENT-CONFIG-PERSIST": (
+        _T.METADATA_INTEGRITY, _T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE,
+    ),
+    "ST-GIT-HOOK-PERSIST": (_T.EXECUTION_AUTHORITY, _T.SUPPLY_CHAIN_PROVENANCE),
+    "ST-SKILL-DYNAMIC-EXEC": (_T.EXECUTION_AUTHORITY,),
+    "ST-AGENT-CRED-HELPER-EXEC": (
+        _T.EXECUTION_AUTHORITY, _T.METADATA_INTEGRITY, _T.EMBEDDED_CREDENTIAL,
+    ),
+    "ST-AGENT-DOTENV-EXEC": (_T.EXECUTION_AUTHORITY, _T.METADATA_INTEGRITY),
+    "ST-PY-STDLIB-SHADOW": (_T.EXECUTION_AUTHORITY, _T.CODE_OBFUSCATION),
+    "ST-MCP-STATIC-AUTH-EXEC": (
+        _T.TOOL_SURFACE, _T.EXECUTION_AUTHORITY, _T.EMBEDDED_CREDENTIAL,
+    ),
+    "ST-AGENT-CLI-RELAY": (_T.EXECUTION_AUTHORITY, _T.NETWORK_EGRESS),
+    "ST-SKILL-DEP-REDIRECT": (_T.SUPPLY_CHAIN_PROVENANCE, _T.METADATA_INTEGRITY),
+    "ST-ARCHIVE-PASSWORD-EXTRACT": (_T.CODE_OBFUSCATION, _T.SUPPLY_CHAIN_PROVENANCE),
     "ST-INSTALL-NPM-PREPARE": (_T.SUPPLY_CHAIN_PROVENANCE,),
     "ST-INSTALL-PY": (_T.SUPPLY_CHAIN_PROVENANCE,),
     "ST-SHELL-PIPE-EXEC": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
+    "ST-SHELL-PIPE-EXEC-PY": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
+    "ST-SHELL-PIPE-EXEC-NODE": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
+    "ST-INSTALL-NPM-REMOTE-EXEC": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
     "ST-TYPOSQUAT": (_T.SUPPLY_CHAIN_PROVENANCE,),
     # Obfuscation (passive encoded blobs; no direct execution).
     "ST-OBF-BASE64-BLOB": (_T.CODE_OBFUSCATION,),
@@ -330,9 +401,21 @@ TRAIT_BY_RULE: dict[str, tuple[ComponentTrait, ...]] = {
     "ST-ENCRYPTED-ARCHIVE": (_T.CODE_OBFUSCATION,),
     # Emergent combinations (synthesized risky-construct findings).
     "ST-COMBO-EXFIL": (_T.EXFIL_CORRELATION,),
+    # One command or call that reads a credential (or the whole environment) and sends it:
+    # the read-sensitive-data-then-external-comms correlation in a single construct.
+    "ST-SECRET-EXFIL": (_T.EXFIL_CORRELATION, _T.NETWORK_EGRESS),
     "ST-FLOW-TRIFECTA": (_T.INSTRUCTION_EXFIL_FLOW,),
     "ST-CONVERGENCE": (_T.MALWARE_CONVERGENCE,),
     "ST-INSTALL-DROPPER": (_T.SUPPLY_CHAIN_PROVENANCE, _T.EXECUTION_AUTHORITY),
+    # Post-exploitation tactics. A way in for someone else is an inbound surface the component
+    # opens; a beacon is egress; persistence and a vendor-named entry run code again later.
+    "ST-POSTEX-REMOTE-ACCESS": (_T.NETWORK_EXPOSURE, _T.EXECUTION_AUTHORITY),
+    "ST-POSTEX-PERSIST": (_T.EXECUTION_AUTHORITY,),
+    "ST-POSTEX-MASQUERADE": (_T.EXECUTION_AUTHORITY, _T.METADATA_INTEGRITY),
+    "ST-POSTEX-BEACON": (_T.NETWORK_EGRESS,),
+    "ST-POSTEX-EVASION": (_T.EXECUTION_AUTHORITY,),
+    # Steps of several tactics converge, like independent malicious indicators do.
+    "ST-POSTEX-CHAIN": (_T.MALWARE_CONVERGENCE, _T.EXECUTION_AUTHORITY),
 }
 
 

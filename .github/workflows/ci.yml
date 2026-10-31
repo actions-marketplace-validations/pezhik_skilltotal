@@ -2,8 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # rc/v<version>: the release commit, pushed before the release calibration so this runs in
+    # parallel with it; the release gate then reads this run instead of waiting for main's.
+    branches: [main, "rc/**"]
   pull_request:
+  schedule:
+    # Weekly, with no commit needed: the journeys and the action job on GitHub's current runner
+    # images, pip and pipx, which change under a release that does not.
+    - cron: "17 6 * * 1"
 
 # Least privilege by default; jobs elevate only what they need (none here — read-only).
 permissions:
@@ -14,11 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
@@ -28,13 +34,107 @@ jobs:
       - name: Lint
         run: ruff check .
       - name: Test
-        run: pytest
+        # pytest-xdist, one worker per core: the suite runs about 2.5x faster, and the release
+        # gate waits for this job.
+        run: pytest -n auto
+
+  test-windows:
+    # The full unit suite once on Windows, where paths, line endings, console encodings and file
+    # locking differ from the Linux matrix above, and where many customers run the CLI and hook.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test
+        # pytest-xdist, one worker per core: the suite runs about 2.5x faster, and the release
+        # gate waits for this job.
+        run: pytest -n auto
+
+  journeys:
+    # Customer journeys (tests/journeys) against the wheel a customer installs: built here,
+    # installed with pipx as the README says, and driven as a pipeline, a developer machine and a
+    # security team drive it. Linux is where pipelines run, so it runs everything; Windows and macOS
+    # run the same journeys except the pre-commit one. The weekly run adds the live journeys, which
+    # scan pinned npm, PyPI and GitHub sources over the network.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the wheel and install it with pipx
+        run: |
+          python -m pip install --upgrade pip
+          pip install build pytest pre-commit pipx
+          python -m build --wheel --outdir dist .
+          python -m pipx install "$(ls dist/*.whl)"
+          echo "SKILLTOTAL_JOURNEY_CLI=$(python -m pipx environment --value PIPX_BIN_DIR)/skilltotal" >> "$GITHUB_ENV"
+      - name: Pre-commit journey on Linux
+        if: runner.os == 'Linux'
+        run: echo "SKILLTOTAL_JOURNEY_PRE_COMMIT=1" >> "$GITHUB_ENV"
+      - name: Live sources journey on the weekly run
+        if: github.event_name == 'schedule'
+        run: echo "SKILLTOTAL_JOURNEY_LIVE=1" >> "$GITHUB_ENV"
+      - name: Journeys
+        run: |
+          git config --global user.email ci@example.invalid
+          git config --global user.name ci
+          python -m pytest tests/journeys -rs
+
+  npm:
+    # The npm package is a thin runner for the Python engine: test its plan, run it end to end
+    # against the engine from this checkout, and check exactly which files it would publish.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install the engine
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Test the npm runner
+        working-directory: npm
+        # The runner prefers uvx/pipx, which fetch the PyPI release matching package.json: on a
+        # release commit that version is not published yet (its tag publishes it), and on any other
+        # commit they would test the last release, not this checkout. With only Python and Node on
+        # PATH, the end-to-end tests run the engine installed from this checkout above.
+        run: |
+          export PATH="$(dirname "$(command -v python)"):$(dirname "$(command -v node)"):/usr/bin:/bin"
+          npm test
+      - name: Check the packed file list
+        working-directory: npm
+        run: |
+          npm pack --dry-run --json > pack.json
+          python - <<'EOF'
+          import json
+          files = sorted(f["path"] for f in json.load(open("pack.json"))[0]["files"])
+          expected = ["LICENSE", "README.md", "bin/skilltotal.js", "lib/runner.js", "package.json"]
+          assert files == expected, files
+          EOF
 
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Install
@@ -44,10 +144,139 @@ jobs:
       - name: Static security scan (bandit)
         run: bandit -r skilltotal
 
+  action:
+    # `action.yml` is a shipped artifact -- it is what a Marketplace consumer runs -- and pytest
+    # cannot reach it. Exercise it end to end here, including the failure path, because the way
+    # this action breaks is by *passing* while reporting nothing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clean component passes the gate
+        id: clean
+        uses: ./
+        with:
+          source: tests/fixtures/clean_pkg
+          fail-on: high
+          upload-sarif: false          # this job is read-only; Code Scanning needs security-events
+          sarif-file: clean.sarif
+
+      - name: Assert the clean run reported and wrote SARIF
+        run: |
+          LEVEL='${{ steps.clean.outputs.risk-level }}'
+          SCORE='${{ steps.clean.outputs.risk-score }}'
+          echo "level=$LEVEL score=$SCORE"
+          [ "$LEVEL" = "low" ] || { echo "::error::expected low risk, got '$LEVEL'"; exit 1; }
+          [ "$SCORE" = "0" ] || { echo "::error::expected score 0, got '$SCORE'"; exit 1; }
+          [ -s clean.sarif ] || { echo "::error::no SARIF written"; exit 1; }
+
+      - name: A report written inside the scanned folder is not scanned (first run)
+        # A customer's workflow scans `.` and writes skilltotal.sarif into it. The second scan of
+        # the run, and every later run, must not read that report: its rule descriptions quote
+        # detection patterns and failed a clean repository (found in a customer-path test).
+        id: inside1
+        uses: ./
+        with:
+          source: tests/fixtures/clean_pkg
+          fail-on: high
+          upload-sarif: false
+          sarif-file: tests/fixtures/clean_pkg/skilltotal.sarif
+
+      - name: A report written inside the scanned folder is not scanned (second run)
+        id: inside2
+        uses: ./
+        with:
+          source: tests/fixtures/clean_pkg
+          fail-on: high
+          upload-sarif: false
+          sarif-file: tests/fixtures/clean_pkg/skilltotal.sarif
+
+      - name: Assert both runs stayed clean
+        run: |
+          for LEVEL in '${{ steps.inside1.outputs.risk-level }}' '${{ steps.inside2.outputs.risk-level }}'; do
+            [ "$LEVEL" = "low" ] || { echo "::error::own report was scanned: got '$LEVEL'"; exit 1; }
+          done
+          [ -s tests/fixtures/clean_pkg/skilltotal.sarif ] || { echo "::error::no SARIF written"; exit 1; }
+          [ ! -e skilltotal.json ] || { echo "::error::JSON report written into the workspace"; exit 1; }
+
+      - name: Risky component trips the gate
+        id: risky
+        continue-on-error: true
+        uses: ./
+        with:
+          source: tests/fixtures/malicious_npm_pkg
+          fail-on: high
+          upload-sarif: false
+          sarif-file: risky.sarif
+
+      - name: Assert the gate failed AND still reported the risk
+        # The second half is the regression that matters: the gate used to abort the scan step
+        # under `bash -e`, so the action failed the build (right answer) with empty outputs and a
+        # `numeric argument required` shell error (wrong reason, and no risk to report).
+        run: |
+          OUTCOME='${{ steps.risky.outcome }}'
+          LEVEL='${{ steps.risky.outputs.risk-level }}'
+          echo "outcome=$OUTCOME level=$LEVEL"
+          [ "$OUTCOME" = "failure" ] || { echo "::error::gate did not fail the step"; exit 1; }
+          [ -n "$LEVEL" ] || { echo "::error::outputs were empty when the gate tripped"; exit 1; }
+          # This fixture is high risk without a malicious indicator; the test repository's release
+          # gate checks the `malicious` verdict on a sample that has one.
+          case '${{ steps.risky.outputs.verdict }}' in high|critical|malicious) ;;
+            *) echo "::error::expected a risky verdict, got '${{ steps.risky.outputs.verdict }}'"; exit 1 ;; esac
+          [ -s risky.sarif ] || { echo "::error::no SARIF written for the risky component"; exit 1; }
+
+      - name: Report-only mode reports the same risk without failing
+        id: reportonly
+        uses: ./
+        with:
+          source: tests/fixtures/malicious_npm_pkg
+          fail-on: none
+          upload-sarif: false
+          sarif-file: reportonly.sarif
+
+      - name: Assert reporting is decoupled from the gate
+        run: |
+          LEVEL='${{ steps.reportonly.outputs.risk-level }}'
+          echo "level=$LEVEL"
+          [ "$LEVEL" = '${{ steps.risky.outputs.risk-level }}' ] \
+            || { echo "::error::fail-on changed the reported risk; it must only change the exit"; exit 1; }
+          case "$LEVEL" in low|'') echo "::error::expected a risky verdict, got '$LEVEL'"; exit 1 ;; esac
+
+      - name: An unknown fail-on level fails instead of switching the gate off
+        id: badlevel
+        continue-on-error: true
+        uses: ./
+        with:
+          source: tests/fixtures/malicious_npm_pkg
+          fail-on: hihg
+          upload-sarif: false
+          sarif-file: badlevel.sarif
+
+      - name: Assert the typo failed the job
+        run: |
+          [ '${{ steps.badlevel.outcome }}' = "failure" ] \
+            || { echo "::error::a misspelled fail-on level let the job pass"; exit 1; }
+
+      - name: Source text is passed as data, never run as shell
+        # A workflow may hand the action untrusted text (an issue title, a branch name). It reaches
+        # the shell only through env, so `$(…)` in it is a path that does not exist, not a command.
+        id: inject
+        continue-on-error: true
+        uses: ./
+        with:
+          source: "nothing-here-$(touch injected.txt)"
+          fail-on: none
+          upload-sarif: false
+          sarif-file: inject.sarif
+
+      - name: Assert nothing was executed
+        run: |
+          [ ! -e injected.txt ] || { echo "::error::the source input was executed as shell"; exit 1; }
+
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # full history so secret scanning covers all commits
       - name: Secret scan (gitleaks)
@@ -56,8 +285,12 @@ jobs:
         # initial commit has no parent).
         run: |
           GL=8.24.3
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GL}/gitleaks_${GL}_linux_x64.tar.gz" \
-            | tar -xz -C /tmp gitleaks
+          # The archive is checked against its published SHA-256 before anything in it runs.
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GL}/gitleaks_${GL}_linux_x64.tar.gz"
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  /tmp/gitleaks.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           # -c .gitleaks.toml allowlists this scanner's own fake-secret test fixtures
           # (production paths stay fully scanned).
           /tmp/gitleaks detect --source . --config .gitleaks.toml --redact -v --exit-code 1

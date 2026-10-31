@@ -11,12 +11,17 @@ engine invariant that every finding carries real file/line/snippet evidence.
 
 This is deterministic and dependency-free (stdlib ``unicodedata`` + a curated confusable table).
 It does NOT attempt semantic understanding, translation, or paraphrase detection — those need an
-LLM and live in the paid Deep Analysis layer, not here.
+LLM and belong to the paid SkillTotal Cloud service, not here.
 """
 
 from __future__ import annotations
 
+import re
 import unicodedata
+from array import array
+from collections.abc import Sequence
+
+_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
 
 # Characters removed entirely before matching: zero-width, bidi controls, and other format
 # characters used to splice or visually reorder text. Kept in sync with the smuggling set in
@@ -61,7 +66,7 @@ _CONFUSABLES = {
 }
 
 
-def normalize_with_map(text: str) -> tuple[str, list[int]]:
+def normalize_with_map(text: str) -> tuple[str, array[int]]:
     """Return ``(normalized_text, index_map)``.
 
     ``index_map[i]`` is the offset in ``text`` of the character that produced
@@ -73,25 +78,46 @@ def normalize_with_map(text: str) -> tuple[str, list[int]]:
     ``normalized == text`` as "nothing to fold" without touching the map. The fast path matters:
     the per-character loop below is orders of magnitude slower than ``str.isascii`` (one C scan),
     and scanning a large ordinary repo used to burn minutes normalizing plain-ASCII sources.
+
+    The map is an ``array('I')``, not a list. It holds one entry per character and is cached for
+    every non-ASCII file of a scan, so as a list of ints it cost ~36 bytes per character: a 22 MB
+    repository peaked at 338 MB, 180 MB of it these maps, and the hosted scan died at its 400 MB
+    cap with "may be too large". Packed, an entry is 4 bytes. The same file-level fast path applies
+    per character: an ASCII character is its own NFKD form, so it skips ``unicodedata`` entirely —
+    most non-ASCII files are ASCII but for a handful of characters.
     """
+    idx: array[int] = array("I")
     if text.isascii():
-        return text, []
+        return text, idx
+    # ASCII runs are copied in one piece (a C slice + a range), so the per-character work is
+    # spent only on the non-ASCII runs: a CJK document is still mostly ASCII markup, and the
+    # character loop over a 16 MB repository cost a minute of a hosted scan.
     out: list[str] = []
-    idx: list[int] = []
-    for j, ch in enumerate(text):
-        if ord(ch) in _REMOVABLE:
-            continue
-        folded = _CONFUSABLES.get(ch, ch)
-        # NFKD: full-width/compatibility forms -> ASCII, precomposed accents -> base + mark.
-        for d in unicodedata.normalize("NFKD", folded):
-            if unicodedata.combining(d):
-                continue  # drop diacritics (café -> cafe)
-            out.append(d)
-            idx.append(j)
+    pos = 0
+    for run in _NON_ASCII_RUN.finditer(text):
+        start, end = run.span()
+        if start > pos:
+            out.append(text[pos:start])
+            idx.extend(range(pos, start))
+        for j in range(start, end):
+            ch = text[j]
+            if ord(ch) in _REMOVABLE:
+                continue
+            folded = _CONFUSABLES.get(ch, ch)
+            # NFKD: full-width/compatibility forms -> ASCII, precomposed accents -> base + mark.
+            for d in unicodedata.normalize("NFKD", folded):
+                if unicodedata.combining(d):
+                    continue  # drop diacritics (café -> cafe)
+                out.append(d)
+                idx.append(j)
+        pos = end
+    if pos < len(text):
+        out.append(text[pos:])
+        idx.extend(range(pos, len(text)))
     return "".join(out), idx
 
 
-def original_span(index_map: list[int], start: int, end: int) -> tuple[int, int]:
+def original_span(index_map: Sequence[int], start: int, end: int) -> tuple[int, int]:
     """Map a ``[start, end)`` span on the normalized text to a span in the original text.
 
     ``end`` is exclusive; the original end is the origin of the last matched character + 1, so

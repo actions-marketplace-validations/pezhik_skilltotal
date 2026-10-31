@@ -10,8 +10,9 @@ for the measured recall/precision and the per-language coverage matrix.
 | Language | How | What is detected |
 |---|---|---|
 | **Python** (`.py`) | AST (`python_ast.py`) — alias/`from`-import aware, read-vs-write aware | shell/process exec, filesystem read/write, network egress, dynamic `eval`/`exec`/`compile`, unsafe deserialization, decode-and-exec, sensitive-path arguments, untrusted-input → exec/shell taint |
-| **Node / TypeScript** (`.js`/`.mjs`/`.cjs`/`.jsx`/`.ts`/`.tsx`) | declarative regex scanners | `child_process`/exec libs, `fs` read/write, `fetch`/axios/http/mailers, `eval`/`Function`/`vm`, command injection, npm lifecycle hooks |
-| **Shell** (`.sh`/`.bash`/`.zsh`) | regex scanners | `base64 -d \| bash`, `curl\|wget \| sh`, decode-and-exec, defense-evasion idioms |
+| **Node / TypeScript** (`.js`/`.mjs`/`.cjs`/`.jsx`/`.ts`/`.tsx`) | declarative regex scanners | `child_process`/exec libs, `fs` read/write, `fetch`/axios/http/mailers, `eval`/`Function`/`vm`, command injection, npm lifecycle hooks (and lifecycle scripts that download or decode code and run it), a download piped into a shell given to `exec`/`execSync` |
+| **Shell** (`.sh`/`.bash`/`.zsh`; PowerShell and batch for the same idioms) | regex scanners | `base64 -d \| bash`, `curl\|wget \| sh`, decode-and-exec, defense-evasion idioms |
+| **Post-exploitation** (JS/TS, Python, shell, PowerShell `.ps1`/`.psm1`, batch `.bat`/`.cmd`) | anchored regex (`scanners/postex.py`) | reverse tunnels and shells, planted SSH keys, tunnel clients with embedded credentials, remote login switched on, autostart entries (LaunchAgents, cron, systemd, scheduled tasks, Run keys, the Startup folder, shell profiles), entries named after the OS vendor, antivirus and Gatekeeper exclusions, cleared history and logs, host beacons |
 | **MCP manifests** (JSON) + **agent instruction surfaces** (`SKILL.md`/`AGENTS.md`) | JSON + markdown parsing | dangerous tools, server exec, tool poisoning/shadowing, auto-approve, over-broad scope, prompt injection |
 
 ## Cross-language (apply to every file regardless of language)
@@ -38,22 +39,3 @@ zero) positive-sample counts rather than hiding the gap.
 zero-dependency constraint rules out (Python’s is the only stdlib parser). The realistic path is
 regex-based heuristic scanners mirroring the Node.js ones — tractable but a deliberate, separately
 calibrated effort, not a quiet add-on.
-
-## Roadmap (free OSS) + SkillTotal Cloud depth (paid)
-
-Per the open-core boundary (`docs/open-core.md`), **all detection rules stay in the free OSS
-engine** — so the language work below is OSS. The paid **SkillTotal Cloud** layer sits *above*
-detection (deeper analysis and interpretation), it does not gate basic detection.
-
-**Free OSS engine — basic multi-language detection (planned):**
-1. Regex-based exec/network/deserialization scanners for **Go, Rust, Java** (the main non-Python/
-   non-Node AI-component languages), mirroring the Node.js scanner pattern, so the exfil combos can
-   fire there too. Java `ObjectInputStream` deserialization is the highest-priority single sink.
-2. Then **Ruby, PHP**.
-3. Each language ships with its own positive/negative samples in `tests/eval_corpus/` and must hold
-   the recall floor (`tests/test_efficacy_floor.py`) and the false-positive floor before release.
-
-**SkillTotal Cloud (paid) — multi-language depth, above the free detector:** cross-language
-semantic / dataflow taint analysis, sandbox-confirmed exploitability of a flagged sink, and
-interpretation/prioritization of multi-language findings. This is the “WHY it matters / WHAT
-HAPPENS WHEN RUN” layer — a Cloud differentiator that never removes detection from the OSS engine.

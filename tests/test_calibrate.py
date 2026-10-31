@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -228,3 +229,98 @@ def test_markdown_renders(tmp_path):
     md = calibrate.to_markdown(results, summary)
     assert "# SkillTotal calibration report" in md
     assert "benign false positives" in md
+
+
+def _two_row_dataset(tmp_path: Path) -> tuple[Path, Path, Path]:
+    a, b = tmp_path / "a", tmp_path / "b"
+    _write(a, "ok.py", "x = 1\n")
+    _write(b, "ok.py", "y = 2\n")
+    csv_path = tmp_path / "ds.csv"
+    csv_path.write_text(
+        "class,ecosystem,source,version,notes\n"
+        f"benign-baseline,local,{a},,one\n"
+        f"benign-baseline,local,{b},,two\n",
+        encoding="utf-8",
+    )
+    return csv_path, a, b
+
+
+def test_calibrate_reports_each_row_as_it_starts(tmp_path, capsys):
+    # The release script tails these lines to show how far the ~85-minute calibration has got.
+    csv_path, a, b = _two_row_dataset(tmp_path)
+    progress = io.StringIO()
+    calibrate.calibrate(csv_path, progress=progress)
+    assert progress.getvalue().splitlines() == [f"[1/2] {a}", f"[2/2] {b}"]
+    # Called as a library, without a stream, it stays quiet.
+    calibrate.calibrate(csv_path)
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
+def test_the_cli_streams_progress_to_stderr_and_the_report_to_stdout(tmp_path, monkeypatch, capsys):
+    csv_path, a, b = _two_row_dataset(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["calibrate.py", "--dataset", str(csv_path)])
+    calibrate.main()
+    captured = capsys.readouterr()
+    assert f"[1/2] {a}" in captured.err.splitlines()
+    assert f"[2/2] {b}" in captured.err.splitlines()
+    assert "[1/2]" not in captured.out
+    assert "# SkillTotal calibration report" in captured.out
+
+
+def test_parallel_rows_give_the_same_report_in_row_order(tmp_path):
+    # --jobs runs rows in worker processes; the report must not depend on it. Run as the CLI it is,
+    # since worker processes re-import the harness by its path.
+    import json
+    import subprocess  # nosec B404 - the harness itself, fixed argv
+
+    benign = tmp_path / "benign"
+    _write(benign, "ok.py", "def add(a, b):\n    return a + b\n")
+    evil = tmp_path / "evil"
+    _write(evil, "x.py", "import base64\nexec(base64.b64decode('cHJpbnQoMSk='))\n")
+    csv_path = tmp_path / "ds.csv"
+    csv_path.write_text(
+        "class,ecosystem,source,version,notes\n"
+        f"benign-baseline,local,{benign},,clean\n"
+        f"malicious,local,{evil},,decode-exec\n"
+        "malicious,npm,,,no source -> skipped\n"
+        "malicious,fixture,fixture:npm-trapdoor-stealer,,known stealer\n",
+        encoding="utf-8",
+    )
+    reports = {}
+    for jobs in (1, 3):
+        out = tmp_path / f"r{jobs}"
+        done = subprocess.run(  # nosec B603
+            [sys.executable, str(_CAL), "--dataset", str(csv_path), "--out", str(out),
+             "--jobs", str(jobs)],
+            capture_output=True, text=True, timeout=300, cwd=str(_CAL.parents[2]),
+        )
+        assert done.returncode == 0, done.stderr[-2000:]
+        assert done.stderr.count("[") >= 4  # one progress line per row
+        reports[jobs] = json.loads(out.with_suffix(".json").read_text(encoding="utf-8"))
+    timing = {"seconds", "fetch_seconds", "scan_seconds"}
+    for report in reports.values():  # wall time differs between runs; nothing else may
+        report["summary"].pop("scan_seconds", None)
+        report["results"] = [{k: v for k, v in r.items() if k not in timing}
+                             for r in report["results"]]
+    assert reports[1] == reports[3]
+    classes = [r["cls"] for r in reports[3]["results"]]
+    assert classes == ["benign-baseline", "malicious", "malicious", "malicious"]
+
+
+def test_progress_goes_to_a_file_when_asked(tmp_path):
+    import subprocess  # nosec B404 - the harness itself, fixed argv
+
+    benign = tmp_path / "benign"
+    _write(benign, "ok.py", "def add(a, b):\n    return a + b\n")
+    csv_path = tmp_path / "ds.csv"
+    csv_path.write_text(f"class,ecosystem,source,version,notes\nbenign-baseline,local,{benign},,clean\n",
+                        encoding="utf-8")
+    progress = tmp_path / "progress.txt"
+    done = subprocess.run(  # nosec B603
+        [sys.executable, str(_CAL), "--dataset", str(csv_path), "--progress", str(progress)],
+        capture_output=True, text=True, timeout=300, cwd=str(_CAL.parents[2]),
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert progress.read_text(encoding="utf-8").startswith("[1/1] ")
+    assert "[1/1]" not in done.stderr

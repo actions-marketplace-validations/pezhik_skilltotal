@@ -9,12 +9,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import jsonschema  # a dev dependency: missing, the contract test fails rather than skips
 import pytest
 
 from skilltotal import REPORT_SCHEMA_VERSION, RULESET_VERSION
 from tests.conftest import analyze_fixture
-
-jsonschema = pytest.importorskip("jsonschema")
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "docs" / "report.schema.json"
 FIXTURES = [
@@ -37,6 +36,43 @@ def test_schema_is_valid_jsonschema():
 @pytest.mark.parametrize("name", FIXTURES)
 def test_report_validates_against_schema(name):
     report = analyze_fixture(name).to_dict()
+    jsonschema.validate(instance=report, schema=_schema())
+
+
+def test_a_report_with_a_baseline_from_a_config_validates(tmp_path, capsys):
+    # Schema 1.9: metadata.baseline, metadata.baseline_suppressed_count and
+    # metadata.config_applied.baseline.
+    from skilltotal.cli import main
+
+    root = Path(__file__).resolve().parent / "fixtures" / "malicious_npm_pkg"
+    main(["scan", str(root), "--write-baseline", str(tmp_path / "bl.json"), "--no-config"])
+    config = tmp_path / ".skilltotal.toml"
+    config.write_text('baseline = "bl.json"\n', encoding="utf-8")
+    capsys.readouterr()
+    main(["scan", str(root), "--json", "--config", str(config)])
+    report = json.loads(capsys.readouterr().out)
+    assert report["metadata"]["config_applied"]["baseline"] == "bl.json"
+    assert report["metadata"]["baseline_suppressed_count"] > 0
+    assert report["metadata"]["baseline"] == str(tmp_path / "bl.json")
+    jsonschema.validate(instance=report, schema=_schema())
+
+
+def test_a_report_whose_baseline_hides_a_malicious_indicator_validates(tmp_path, capsys):
+    # Schema 1.10: metadata.baseline_suppressed_malicious.
+    from skilltotal.cli import main
+
+    root = tmp_path / "pkg"
+    root.mkdir()
+    # A decode-and-eval dropper (inert payload: console.log(1)), a malicious indicator.
+    (root / "index.js").write_text(
+        'eval(Buffer.from("Y29uc29sZS5sb2coMSk=", "base64").toString());\n', encoding="utf-8"
+    )
+    baseline = tmp_path / "bl.json"
+    main(["scan", str(root), "--write-baseline", str(baseline), "--no-config"])
+    capsys.readouterr()
+    main(["scan", str(root), "--json", "--baseline", str(baseline), "--no-config"])
+    report = json.loads(capsys.readouterr().out)
+    assert report["metadata"]["baseline_suppressed_malicious"]
     jsonschema.validate(instance=report, schema=_schema())
 
 

@@ -15,6 +15,7 @@ from skilltotal.scoring import (
     COMBO_FINDING_ID,
     CONVERGENCE_FINDING_ID,
     INSTALL_DROPPER_FINDING_ID,
+    POSTEX_CHAIN_FINDING_ID,
     TRIFECTA_FINDING_ID,
 )
 from skilltotal.typosquatting import TYPOSQUAT_FINDING_ID
@@ -29,7 +30,7 @@ _COMBO_RULE = RuleSpec(
     title="Sensitive-data access combined with network egress",
     description=(
         "Raised when a component references credential/secret locations and can also reach "
-        "the network — together a credential-exfiltration path."
+        "the network - together a credential-exfiltration path."
     ),
     recommendation="Verify secrets read from disk are never transmitted off-host without consent.",
     capability=None,
@@ -43,10 +44,10 @@ _SKILL_MISMATCH_RULE = RuleSpec(
     id=SKILL_MISMATCH_FINDING_ID,
     category="least_privilege",
     severity=Severity.HIGH,
-    title="Skill does more than its declared tools allow",
+    title="Skill does more than its declared tools cover",
     description=(
-        "Raised when an Agent Skill's declared allowed-tools do not cover a dangerous capability "
-        "its bundled code actually exercises (undeclared-capability / least-privilege violation)."
+        "Raised when an Agent Skill's bundled code exercises a dangerous capability that its "
+        "declared allowed-tools do not cover (an undeclared capability)."
     ),
     recommendation="Align allowed-tools with actual behavior, or remove the undeclared capability.",
     capability=None,
@@ -62,7 +63,7 @@ _TRIFECTA_RULE = RuleSpec(
     title="Untrusted-instruction surface with file access and network egress",
     description=(
         "Raised when a component combines a prompt-injection surface with the ability to read "
-        "files and reach the network — the 'lethal trifecta' for instruction-driven exfiltration."
+        "files and reach the network - the 'lethal trifecta' for instruction-driven exfiltration."
     ),
     recommendation="Remove the injectable surface or constrain untrusted-input-driven I/O.",
     capability=None,
@@ -95,7 +96,7 @@ _TYPOSQUAT_RULE = RuleSpec(
     title="Package name closely resembles a popular package (possible typosquatting)",
     description=(
         "Raised when an npm/PyPI package name is one or two character edits from a well-known "
-        "popular package — the classic typosquatting / name-confusion supply-chain vector."
+        "popular package - the classic typosquatting / name-confusion supply-chain vector."
     ),
     recommendation="Confirm the package name, publisher, and repository are the ones you intend.",
     capability=None,
@@ -111,11 +112,30 @@ _INSTALL_DROPPER_RULE = RuleSpec(
     title="Install-time hook paired with a dropper payload",
     description=(
         "Raised when an install/build hook co-occurs with a decode-and-execute payload or "
-        "credential access — the install-time dropper pattern behind supply-chain compromises."
+        "credential access - the install-time dropper pattern behind supply-chain compromises."
     ),
     recommendation="Inspect the install hook and its payload; do not install until understood.",
     capability=None,
     threat_class=ThreatClass.RISKY_CONSTRUCT,
+)
+
+
+# Post-exploitation chain, synthesized in scoring from RuleSpec.tactic. Unlike the combinations
+# above it is a MALICIOUS_INDICATOR; threat_class must match the finding.
+_POSTEX_CHAIN_RULE = RuleSpec(
+    id=POSTEX_CHAIN_FINDING_ID,
+    category="post_exploitation",
+    severity=Severity.CRITICAL,
+    title="Steps of an intrusion chain in one component",
+    description=(
+        "Raised when a component's code performs steps of two or more post-exploitation tactics "
+        "(remote access, persistence, defense evasion, command and control), one of them remote "
+        "access or command and control."
+    ),
+    recommendation="Treat the component as malicious; undo what each step added on machines "
+                   "that ran it.",
+    capability=None,
+    threat_class=ThreatClass.MALICIOUS_INDICATOR,
 )
 
 
@@ -128,9 +148,19 @@ def get_rules() -> list[RuleSpec]:
         _TRIFECTA_RULE,
         _CONVERGENCE_RULE,
         _INSTALL_DROPPER_RULE,
+        _POSTEX_CHAIN_RULE,
     ]
     return sorted(rules, key=lambda r: r.id)
 
 
-def rules_as_dicts() -> list[dict[str, str]]:
-    return [r.to_dict() for r in get_rules()]
+def unknown_rule_hint(rule_id: str, known: list[str] | None = None) -> str:
+    """How to fix a rule id no rule has, for an error or a note: "did you mean ST-X?" when an id
+    is close, else a pointer to the rule list. ``known`` (the sorted ids) saves listing them again.
+    """
+    import difflib
+
+    if known is None:
+        known = [r.id for r in get_rules()]
+    close = difflib.get_close_matches(rule_id.upper(), known, n=1)
+    return f"did you mean {close[0]}?" if close else "see `skilltotal rules list`"
+

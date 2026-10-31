@@ -9,11 +9,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from skilltotal.cli import EXIT_FAIL_ON_HIGH, EXIT_OK, main
 from skilltotal.config import load_config
 
 # A single high-severity capability finding (ST-DYN-PY) and nothing else.
 DYN_ONLY = "eval(user_input)\n"
+# A single high-severity risky construct (ST-DESERIALIZE-PY) and nothing else. The severity gate
+# counts risky constructs; a capability on its own never trips it (tests/test_fail_on_gate.py).
+PICKLE_ONLY = "import pickle\nobj = pickle.loads(blob)\n"
 
 
 def _component(tmp_path: Path, code: str = DYN_ONLY) -> Path:
@@ -37,8 +42,7 @@ def test_policy_table_parses_valid_actions(tmp_path: Path):
         '[policy]\n'
         '"ST-SHELL-PIPE-EXEC" = "block"\n'
         '"ST-DYN-PY" = "WARN"\n'          # actions are case-insensitive
-        '"ST-SENS-WORD" = "ignore"\n'
-        '"ST-BOGUS" = "explode"\n',       # unknown action -> dropped, not fatal
+        '"ST-SENS-WORD" = "ignore"\n',
     )
     c = load_config(p)
     assert c.policy == {
@@ -46,6 +50,15 @@ def test_policy_table_parses_valid_actions(tmp_path: Path):
         "ST-DYN-PY": "warn",
         "ST-SENS-WORD": "ignore",
     }
+
+
+def test_an_unknown_policy_action_is_an_error_not_a_dropped_rule(tmp_path: Path):
+    # Dropped, a misspelled `block` left the rule unblocked while the gate looked configured.
+    from skilltotal.config import ConfigError
+
+    p = _config(tmp_path, '[policy]\n"ST-BOGUS" = "explode"\n')
+    with pytest.raises(ConfigError, match="block, warn or ignore"):
+        load_config(p)
 
 
 def test_ignored_rules_merges_ignore_list_and_policy(tmp_path: Path):
@@ -68,7 +81,7 @@ def test_block_trips_gate_without_fail_on(tmp_path: Path, capsys):
 
 
 def test_warn_exempts_rule_from_severity_gate(tmp_path: Path, capsys):
-    root = _component(tmp_path)
+    root = _component(tmp_path, PICKLE_ONLY)
 
     # Control: the high-severity finding trips --fail-on high.
     code = main(["scan", str(root), "--fail-on", "high"])
@@ -76,11 +89,11 @@ def test_warn_exempts_rule_from_severity_gate(tmp_path: Path, capsys):
     assert code == EXIT_FAIL_ON_HIGH
 
     # With a warn policy the same finding is reported but no longer gates.
-    cfg = _config(tmp_path, '[policy]\n"ST-DYN-PY" = "warn"\n')
+    cfg = _config(tmp_path, '[policy]\n"ST-DESERIALIZE-PY" = "warn"\n')
     code = main(["scan", str(root), "--fail-on", "high", "--config", str(cfg), "--json"])
     out = capsys.readouterr().out
     assert code == EXIT_OK
-    assert "ST-DYN-PY" in {f["id"] for f in json.loads(out)["findings"]}
+    assert "ST-DESERIALIZE-PY" in {f["id"] for f in json.loads(out)["findings"]}
 
 
 def test_warn_does_not_shield_other_rules(tmp_path: Path, capsys):
@@ -90,7 +103,7 @@ def test_warn_does_not_shield_other_rules(tmp_path: Path, capsys):
     cfg = _config(tmp_path, '[policy]\n"ST-DYN-PY" = "warn"\n')
     code = main(["scan", str(root), "--fail-on", "high", "--config", str(cfg)])
     capsys.readouterr()
-    assert code == EXIT_FAIL_ON_HIGH  # ST-SHELL-PY (high) still gates
+    assert code == EXIT_FAIL_ON_HIGH  # ST-CMDI-PY (high, a risky construct) still gates
 
 
 def test_policy_ignore_suppresses_finding(tmp_path: Path, capsys):

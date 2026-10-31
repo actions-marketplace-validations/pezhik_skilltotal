@@ -7,37 +7,56 @@ capability engine share a single source of truth.
 
 from __future__ import annotations
 
+from skilltotal.scanners.agent_approval import AgentApprovalScanner
+from skilltotal.scanners.agent_config import AgentConfigScanner
 from skilltotal.scanners.base import RuleSpec, Scanner
+from skilltotal.scanners.clipper import ClipperScanner
+from skilltotal.scanners.config_exec import ConfigExecScanner
+from skilltotal.scanners.dependency_redirect import DependencyRedirectScanner
 from skilltotal.scanners.dynamic_code import DynamicCodeScanner
 from skilltotal.scanners.email_exfil import EmailExfilScanner
 from skilltotal.scanners.encrypted_archive import EncryptedArchiveScanner
 from skilltotal.scanners.exposure import ExposureScanner
 from skilltotal.scanners.filesystem import FilesystemScanner
+from skilltotal.scanners.html_file_exfil import HtmlFileExfilScanner
 from skilltotal.scanners.install_scripts import InstallScriptsScanner
 from skilltotal.scanners.invisible_unicode import InvisibleUnicodeScanner
 from skilltotal.scanners.mcp import McpScanner
+from skilltotal.scanners.mcp_annotations import McpAnnotationScanner
+from skilltotal.scanners.mcp_elicitation import McpElicitationScanner
+from skilltotal.scanners.mcp_pinning import McpPinningScanner
 from skilltotal.scanners.network import NetworkScanner
+from skilltotal.scanners.npm_supply import NpmSupplyScanner
 from skilltotal.scanners.oauth_auth import OAuthAuthScanner
+from skilltotal.scanners.oauth_discovery import OAuthDiscoveryInjectionScanner
 from skilltotal.scanners.obfuscation import ObfuscationScanner
+from skilltotal.scanners.postex import PostExploitationScanner
 from skilltotal.scanners.prompt_surface import PromptSurfaceScanner
 from skilltotal.scanners.pth_exec import PthExecScanner
 from skilltotal.scanners.python_ast import PythonAstScanner
 from skilltotal.scanners.scoped_identity import ScopedIdentityScanner
+from skilltotal.scanners.secret_exfil import SecretExfilScanner
 from skilltotal.scanners.secrets import SecretsScanner
 from skilltotal.scanners.sensitive_paths import SensitivePathScanner
 from skilltotal.scanners.shell_evasion import ShellEvasionScanner
 from skilltotal.scanners.shell_exec import ShellExecScanner
 from skilltotal.scanners.shell_script import ShellScriptScanner
+from skilltotal.scanners.skill_directives import SkillDirectivesScanner
+from skilltotal.scanners.skill_fetch_exec import SkillFetchExecScanner
+from skilltotal.scanners.stdlib_shadow import StdlibShadowScanner
+from skilltotal.scanners.workflow_exfil import WorkflowExfilScanner
 
 SCANNERS: list[Scanner] = [
     PythonAstScanner(),
     ShellExecScanner(),
     ShellScriptScanner(),
     ShellEvasionScanner(),
+    PostExploitationScanner(),
     FilesystemScanner(),
     SensitivePathScanner(),
     NetworkScanner(),
     OAuthAuthScanner(),
+    OAuthDiscoveryInjectionScanner(),
     ScopedIdentityScanner(),
     InstallScriptsScanner(),
     DynamicCodeScanner(),
@@ -50,6 +69,21 @@ SCANNERS: list[Scanner] = [
     ExposureScanner(),
     EncryptedArchiveScanner(),
     EmailExfilScanner(),
+    SecretExfilScanner(),
+    AgentConfigScanner(),
+    ConfigExecScanner(),
+    StdlibShadowScanner(),
+    ClipperScanner(),
+    NpmSupplyScanner(),
+    AgentApprovalScanner(),
+    SkillFetchExecScanner(),
+    SkillDirectivesScanner(),
+    McpPinningScanner(),
+    McpElicitationScanner(),
+    McpAnnotationScanner(),
+    DependencyRedirectScanner(),
+    WorkflowExfilScanner(),
+    HtmlFileExfilScanner(),
 ]
 
 

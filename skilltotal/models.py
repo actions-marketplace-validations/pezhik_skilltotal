@@ -95,9 +95,13 @@ class ThreatClass(str, Enum):
     # Signals of deliberate deception / hidden execution (drives the malware verdict):
     # tool poisoning, prompt injection, decode-and-exec, hidden unicode instructions.
     MALICIOUS_INDICATOR = "malicious_indicator"
-    # Dangerous, likely-unintentional constructs: hardcoded secrets, command injection,
-    # unsafe deserialization, network exposure. A real risk regardless of author intent.
+    # Dangerous, likely-unintentional constructs: command injection, unsafe deserialization,
+    # network exposure, a credential read next to egress. A real risk regardless of author intent.
     RISKY_CONSTRUCT = "risky_construct"
+    # A credential the component ships: a hardcoded key, a private key, a packed .env file. That is
+    # the author's leak -- whoever holds the package can use the key -- not a risk the component
+    # poses to the machine it runs on, so it is reported with its evidence and never scored.
+    EXPOSURE = "exposure"
     # Neutral capability surface (can exec / read fs / reach network). Informational.
     CAPABILITY = "capability"
 
@@ -168,6 +172,64 @@ class Finding:
         }
 
 
+# The needs_review title for a script the package runs at install time that could not be read
+# (too large, binary, missing). The install guard keys on it: an install it cannot see is not
+# called clean.
+UNANALYZED_INSTALL_SCRIPT = "Install script not analyzed"
+
+# The needs_review title for a component in which no file could be analyzed at all. The install
+# guard keys on it too: a scan that read nothing vouches for nothing.
+NOTHING_READ = "Nothing in this component could be read"
+
+# The needs_review title for code the component loads by a literal path from a folder the walk
+# skips (`require("./vendor/x.js")`) that could not be read (too large, unreadable): it runs, and
+# nothing in it was checked.
+UNANALYZED_LOADED_CODE = "Code loaded from a skipped folder not analyzed"
+
+# The needs_review title naming the folders the walk passed over (dependencies, vendored code,
+# virtual environments, a repository's build output). Informational: such folders are expected in
+# a working tree, and code the component loads from them was read.
+SKIPPED_FOLDERS = "Folders not analyzed"
+
+# The needs_review title listing SkillTotal's own reports and baselines found in the component and
+# set aside (file_index.is_skilltotal_output). Informational: they are the scanner's output, not a
+# part of the component left unanalyzed.
+OWN_OUTPUTS_SKIPPED = "SkillTotal output files not analyzed"
+
+# The needs_review title listing compiled code (Python bytecode, Java class files) shipped with no
+# source file beside it. Bytecode is never read, so a payload shipped only as a .pyc is invisible
+# to every scanner that reads source; the note makes it a gap the gate and the hook see.
+COMPILED_WITHOUT_SOURCE = "Compiled code shipped without source"
+
+# The needs_review titles that say a file, or a part of one, was not analyzed: what
+# `scan --fail-on-unanalyzed` fails on. Every other note is a signal to read, not a gap in the scan.
+UNANALYZED_TITLES = frozenset({
+    UNANALYZED_INSTALL_SCRIPT,
+    NOTHING_READ,
+    COMPILED_WITHOUT_SOURCE,
+    "Files could not be read",
+    "Files too large to analyze",
+    "Links not followed",
+    "Archive entries not extracted",
+    "Minified bundle not analyzed",
+    "Code in languages not analyzed for behavior",
+    "Unparseable Python file",
+    "Unparseable potential MCP manifest",
+    "Deeply nested JSON partly analyzed",
+    UNANALYZED_LOADED_CODE,
+    "MCP server bundle not analyzed",
+    "Frontmatter partly analyzed",
+    "Environment sends partly analyzed",
+})
+
+
+def finding_counts(findings: list[Finding]) -> tuple[int, int]:
+    """(risk findings, capability findings). A capability is what a component can do; it is never
+    scored and never gates, so "5 finding(s)" for five of them read as risk that is not there."""
+    capability = sum(f.threat_class is ThreatClass.CAPABILITY for f in findings)
+    return len(findings) - capability, capability
+
+
 @dataclass
 class NeedsReview:
     """A low-confidence or un-evidenced signal that must NOT affect the score.
@@ -190,17 +252,6 @@ class NeedsReview:
             "file": self.file,
             "line": self.line,
         }
-
-
-@dataclass
-class CapabilityEvidence:
-    """A detected capability together with the evidence that proves it."""
-
-    capability: Capability
-    evidence: list[Evidence]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"evidence": [e.to_dict() for e in self.evidence]}
 
 
 @dataclass

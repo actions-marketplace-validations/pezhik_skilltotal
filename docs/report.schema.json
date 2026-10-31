@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://skilltotal.dev/schemas/report-1.5.json",
+  "$id": "https://www.skilltotal.ai/schemas/report-1.10.json",
   "title": "SkillTotal Report",
-  "description": "Machine-readable contract for skilltotal.models.Report.to_dict(). Report schema version 1.5 (1.4 + traits: a behavioral trait fingerprint with a CSA/MAESTRO/ATLAS crosswalk, descriptive only and never scored). Consumers (e.g. the web app) should validate against this; a breaking change here corresponds to a major engine version bump.",
+  "description": "Machine-readable contract for skilltotal.models.Report.to_dict(). Report schema version 1.10 (1.9 + metadata.baseline_suppressed_malicious); each field notes the version that added it. Consumers (e.g. the web app) should validate against this; a breaking change here corresponds to a major engine version bump.",
   "type": "object",
   "required": [
     "component",
@@ -51,7 +51,26 @@
         "reasons": { "type": "array", "items": { "type": "string" } },
         "malicious_indicators": { "type": "integer", "minimum": 0 },
         "risky_constructs": { "type": "integer", "minimum": 0 },
-        "capabilities": { "type": "integer", "minimum": 0 }
+        "exposed_secrets": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Findings of threat class exposure: shipped credentials, reported and never scored (added in 1.6)."
+        },
+        "capabilities": { "type": "integer", "minimum": 0 },
+        "unanalyzed_code": {
+          "type": "object",
+          "description": "Shipped source files per language whose behavior (shell, network, file access, dynamic code) is not analyzed yet, e.g. {\"Go\": 12}. Present only when such files exist; a low-level headline then says the analysis was partial (added in 1.7).",
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        },
+        "unanalyzed_files": {
+          "type": "object",
+          "description": "Shipped (non-test) code files that were not read at all, counted by reason: too_large (over the size cap) and minified (a bundle without a readable copy beside it). Present only when such files exist; a low-level headline then says the analysis was partial, and the score is unchanged (added in 1.8).",
+          "additionalProperties": false,
+          "properties": {
+            "too_large": { "type": "integer", "minimum": 1 },
+            "minified": { "type": "integer", "minimum": 1 }
+          }
+        }
       }
     },
     "capabilities": {
@@ -88,7 +107,37 @@
         "files_skipped_large": { "type": "integer" },
         "scanners_run": { "type": "array", "items": { "type": "string" } },
         "findings_by_severity": { "type": "object" },
-        "suppressed_count": { "type": "integer" }
+        "suppressed_count": { "type": "integer" },
+        "baseline_suppressed_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Added in 1.9. Present only when a baseline was applied: how many of the suppressed evidence occurrences it suppressed (the rest were inline skilltotal:ignore markers)."
+        },
+        "baseline_suppressed_malicious": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Added in 1.10. Present only when the applied baseline suppressed evidence of a malicious-indicator rule: those rule ids, sorted. The verdict and the exit-code gates no longer see them."
+        },
+        "baseline": {
+          "type": "string",
+          "description": "Added in 1.9. Present only when scan applied a baseline file (--baseline, or baseline in .skilltotal.toml): its path."
+        },
+        "config_applied": {
+          "type": "object",
+          "description": "Present only when scan applied a .skilltotal.toml: its path and how many excludes, ignored rules and policy entries it set, plus the gates it sets and (added in 1.9) the baseline it names (optional, backward compatible).",
+          "required": ["path", "exclude", "ignore", "policy"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "exclude": { "type": "integer", "minimum": 0 },
+            "ignore": { "type": "integer", "minimum": 0 },
+            "policy": { "type": "integer", "minimum": 0 },
+            "fail_on": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+            "fail_on_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "baseline": { "type": "string" }
+          }
+        }
       },
       "required": ["skilltotal_version", "schema_version", "ruleset_version"],
       "additionalProperties": true
@@ -139,8 +188,8 @@
         "recommendation": { "type": "string" },
         "threat_class": {
           "type": "string",
-          "enum": ["malicious_indicator", "risky_construct", "capability"],
-          "description": "Reading axis next to severity (added in 1.3)."
+          "enum": ["malicious_indicator", "risky_construct", "exposure", "capability"],
+          "description": "Reading axis next to severity (added in 1.3; exposure added in 1.6: a shipped credential, reported and never scored)."
         },
         "owasp": {
           "type": "array",

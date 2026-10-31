@@ -42,11 +42,25 @@ def test_multiline_match_span(tmp_path: Path):
 
 def test_skips_dependency_and_vcs_dirs(tmp_path: Path):
     _write(tmp_path, "node_modules/dep/x.js", "fetch('http://x')\n")
-    _write(tmp_path, ".git/config", "secret\n")
+    _write(tmp_path, ".git/objects/ab/cdef1234", "binary git object\n")
+    _write(tmp_path, ".git/hooks/pre-commit.sample", "#!/bin/sh\necho sample\n")
     _write(tmp_path, "src/app.js", "fetch('http://y')\n")
     index = FileIndex.build(tmp_path)
     rels = {f.relpath for f in index.files}
     assert rels == {"src/app.js"}
+
+
+def test_git_config_is_the_one_file_read_inside_dot_git(tmp_path: Path):
+    # `.git/config` is read on its own (GitSpawn, 2026: `core.fsmonitor` in this file is a
+    # command git runs automatically) but kept out of `files`: it is the cloning user's
+    # environment, not component content, so no other rule may see it. Every other path under
+    # `.git` stays skipped.
+    _write(tmp_path, ".git/config", "[core]\n\tfsmonitor = true\n")
+    _write(tmp_path, ".git/hooks/pre-commit.sample", "#!/bin/sh\necho sample\n")
+    _write(tmp_path, ".git/objects/ab/cdef1234", "binary git object\n")
+    index = FileIndex.build(tmp_path)
+    assert index.files == []
+    assert index.git_config is not None and index.git_config.text.startswith("[core]")
 
 
 def test_skips_vendored_dependency_tree(tmp_path: Path):
@@ -71,6 +85,23 @@ def test_skips_binary(tmp_path: Path):
     assert index.stats["skipped_binary"] == 1
 
 
+def test_nul_byte_deep_in_a_bundle_is_not_binary(tmp_path: Path):
+    """Only a NUL in the sniff window marks a binary; one buried in a 100 KB bundle does not.
+
+    Bundled `dist/*.js` sometimes carries a literal NUL inside a string. The whole-file check
+    dropped such files entirely, and with them every finding they held -- two of fourteen MCP
+    servers the registry survey failed to detect were lost this way.
+    """
+    deep = ("x = 1;\n" * 2000).encode() + b'const s = "\x00";\n'  # NUL well past 8,000 bytes
+    (tmp_path / "bundle.js").write_bytes(deep)
+    (tmp_path / "real.bin").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    index = FileIndex.build(tmp_path)
+    rels = {f.relpath for f in index.files}
+    assert "bundle.js" in rels
+    assert "real.bin" not in rels
+    assert index.stats["skipped_binary"] == 1
+
+
 def test_snippet_truncation(tmp_path: Path):
     long_line = "x" * 1000 + "TARGET"
     _write(tmp_path, "c.txt", long_line)
@@ -79,3 +110,33 @@ def test_snippet_truncation(tmp_path: Path):
     _f, _m, ev = next(iter(index.search(pat)))
     assert ev.snippet.endswith("…")
     assert len(ev.snippet) <= 242
+
+
+def test_span_lookup_matches_a_plain_walk_on_unsorted_and_overlapping_spans():
+    """The span lookup bisects a sorted, merged copy (a linear walk took 23 s of a 50 s scan of a
+    1.4 MB bundle); it must answer exactly what walking the original list answers."""
+    import random
+
+    from skilltotal.file_index import _offset_in_spans
+
+    rng = random.Random(7)
+    for _ in range(300):
+        spans = []
+        for _ in range(rng.randrange(0, 40)):
+            start = rng.randrange(0, 500)
+            spans.append((start, start + rng.randrange(-3, 30)))  # some empty or inverted
+        for offset in range(-2, 540, 3):
+            expected = any(start <= offset < end for start, end in spans)
+            assert _offset_in_spans(spans, offset) is expected, (spans, offset)
+
+
+def test_a_string_span_lookup_returns_the_literal(tmp_path):
+    from skilltotal.file_index import FileIndex
+
+    (tmp_path / "a.js").write_text(
+        "".join(f'const s{i} = "value {i}";\n' for i in range(50)), encoding="utf-8")
+    f = next(x for x in FileIndex.build(tmp_path).files if x.relpath == "a.js")
+    at = f.text.index("value 37")
+    start, end = f.string_span_at(at)
+    assert f.text[start:end].strip("\"'") == "value 37"
+    assert f.string_span_at(f.text.index("const s37")) is None

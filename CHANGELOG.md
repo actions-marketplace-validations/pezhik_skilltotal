@@ -4,6 +4,1779 @@ All notable changes to the SkillTotal engine. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); the project uses
 [SemVer](https://semver.org). See `RULES_CHANGELOG.md` for detection-rule changes.
 
+## [0.88.0]
+
+Ruleset 87 checks MCP tool annotations against the code that implements the tool. Report schema
+1.10 is unchanged. `RULES_CHANGELOG.md` (ruleset 87) has the detection details.
+
+### Added
+- `ST-MCP-ANNOTATION-MISMATCH` (medium, risky construct): an MCP tool declares `readOnlyHint: true`
+  while its handler writes or deletes files, sends a PUT, PATCH or DELETE request, or runs a
+  command it is handed or a written-out command from a mutating list (`rm`, `git push`,
+  `npm install` and others). It also fires when a tool declares `destructiveHint: false` while its
+  handler deletes files or sends a DELETE request. Clients use these hints to decide which calls
+  run without asking. The rule reads TypeScript, JavaScript and Python servers. Only the handler's
+  own body is read, so a helper function it calls is not followed.
+
+### Changed
+- `ST-FS-NODE-WRITE` also matches `fs.rmdir` and `fs.rmdirSync`.
+
+## [0.87.0]
+
+`inventory` and `guard --installed` now check installed editor extensions, report risk that an
+update added (`--state`), and accept reviewed false positives from a file (`--accept`). A VS Code
+extension is scanned as a component type of its own. Ruleset 86 adds six post-exploitation rules.
+Report schema 1.10 is unchanged. `RULES_CHANGELOG.md` (ruleset 86) has the detection details.
+
+### Added
+- Editor extensions in `inventory` and `guard --installed`: the extension folders of VS Code, VS
+  Code Insiders, Cursor, Windsurf and VSCodium, their remote-server folders (`~/.vscode-server`,
+  `~/.vscodium-server`, `~/.cursor-server`) and the folder `VSCODE_EXTENSIONS` names. Each folder
+  with its own `package.json` is one component, named `publisher.name@version`; folders the editor
+  marked for deletion in `.obsolete` are left out. An editor extension blocks on malicious
+  indicators and on the reasons that always block (an unread install script, nothing readable),
+  not on its risk level, unless `--block-on` is given. It is never checked for typosquatting,
+  because an editor installs it by its `publisher.name` id, not by the name in its `package.json`.
+- `--no-extensions` on `inventory` and `guard --installed` leaves editor extensions out.
+- `--state FILE` on `inventory` and `guard --installed`: each run records every component's
+  version and the fingerprints of its risk findings, and reports drift, a component whose version
+  changed and that gained risk findings. Drift that adds a malicious indicator or a high or
+  critical risky construct blocks at any `--block-on` level. It shows as a `drift:` line, a `drift`
+  object in the JSON and a `skilltotal:drift` property in the AI-BOM. The first run only records.
+  A file that is not a state file, or a state file that cannot be written, exits 1.
+- `--accept FILE` on `guard <source>`, `guard --installed` and `inventory`: each entry accepts the
+  listed finding fingerprints for one component at one exact version and needs a reason; `expires`
+  and `accepted_by` are optional. Accepted evidence is removed before scoring and stays visible
+  (`[ACCEPTED]` and an `Accepted  :` line in the text, `accepted` in the JSON, `skilltotal:accepted`
+  in the AI-BOM). Every run warns on stderr about an accepted malicious indicator, an expired entry
+  and a stale entry. An invalid file (an unknown key, an empty reason, a malformed fingerprint or
+  date) exits 1 before anything is scanned.
+- `--write-accept FILE` drafts accept entries for what the run blocks (`guard`) or flags
+  (`inventory`), each with an empty reason a reviewer must fill in, and exits 0. It adds to an
+  existing accept file and never overwrites another file.
+- Component type `vscode_extension`: a `package.json` that declares `engines.vscode`, at the root
+  or in the `extension/` folder of an unpacked `.vsix`. Its build output is read, and the entry
+  points its own `package.json` names are read up to 8 MiB (2 MiB for other files) even when
+  minified. A minified entry point is judged like build output: capabilities and the
+  post-exploitation rules count, and other risk findings in it go to `needs_review`.
+- Post-exploitation rules `ST-POSTEX-REMOTE-ACCESS`, `ST-POSTEX-PERSIST`, `ST-POSTEX-MASQUERADE`,
+  `ST-POSTEX-BEACON` and `ST-POSTEX-EVASION`, and the synthesized `ST-POSTEX-CHAIN` (two tactics
+  in one component, one of them remote access or command and control). New scanner `postex`.
+- `RuleSpec.tactic` names the post-exploitation tactic a rule's finding is a step of. Existing
+  persistence, evasion and relay rules declare theirs. It is not part of the report.
+- Engine API: `analyze()` and `analyze_directory()` take an optional `suppressed_out` dict, which
+  receives the fingerprint and rule id of each finding the `suppress` set removed. The default
+  behavior is unchanged.
+
+### Changed
+- A baseline or accept-file fingerprint now also suppresses `ST-TYPOSQUAT` and
+  `ST-SKILL-CAP-MISMATCH`, the findings synthesized from a component's name and declared tools. A
+  combination finding still follows its inputs: it disappears when they are suppressed.
+- `ST-CONVERGENCE` no longer counts `ST-POSTEX-CHAIN` as a second malicious indicator.
+- An `echo` whose output is piped or redirected (`echo "..." | crontab -`, `echo "..." >> ~/.bashrc`)
+  is no longer read as a command printed for a person. This applies to every rule that sets
+  printed commands aside.
+- A local or git VS Code extension is no longer checked for typosquatting against npm names. An
+  `npm:` source still is.
+- `guard --block-on` defaults per component kind with `--installed` (`high`, and `malicious` for
+  editor extensions); `guard <source>` still defaults to `high`. Its help text names the reasons
+  that block at every level.
+- `inventory` with nothing installed says "No installed AI components (MCP servers, plugins,
+  skills or editor extensions) found."
+- The detection-efficacy corpus has 158 malicious and 120 benign samples (8 and 6 added for
+  post-exploitation), all flagged and none a false positive.
+- Docs: the README has a "Choose your path" table; `docs/cli.md` has a section and a flag table
+  per command and lists every archive type (`.mcpb`, `.dxt`, `.whl`, `.vsix`, `.tar.bz2`,
+  `.tar.xz`); new `docs/installed-components.md` (discovery, editor extensions, drift, daily and
+  fleet checks, AI-BOM) and `docs/accepting-findings.md` (every way to accept a finding, compared);
+  `docs/report-schema.md` documents the diff, guard and inventory JSON and the AI-BOM properties;
+  `docs/configuration.md` says which commands read `.skilltotal.toml` and lists every environment
+  variable; `docs/ci.md` has a workflow for reviewing dependency upgrades with `diff`.
+
+### Fixed
+- Docs: `scan` exits 0 without a gate flag only when `.skilltotal.toml` sets no gate either.
+  `guard --block-on malicious` also blocks on an unread install script, a component with nothing
+  readable and a look-alike name. The pre-commit hook without `args` only reports. The CLI form of
+  the action's default gate is `--fail-on-default high`, not `--fail-on-high`, which overrides the
+  config.
+
+## [0.86.0]
+
+Ruleset 85 adds `ST-SKILL-ENCRYPTED-INSTRUCTIONS` and `ST-HTML-FILE-URL-EXFIL`. Report schema 1.10 is unchanged.
+
+### Added
+- `ST-SKILL-ENCRYPTED-INSTRUCTIONS`: a skill paragraph that has the agent decrypt a block with a key from an env file or environment variable and follow the result.
+- `ST-HTML-FILE-URL-EXFIL`: an HTML page that reads a `file:///` URL and sends data out in the same page.
+
+## [0.85.1]
+
+A file built to slow the clipboard-hijacker check no longer stalls a scan. Ruleset 84 is unchanged: no detection rule changed. Report schema 1.10 is unchanged.
+
+### Fixed
+- `ST-CLIPPER` tried to start a variable name at every `$` inside a long run of identifier characters such as `const$const$...`, so its time grew with the square of the line's length. A 16,000-character line in a file that writes the clipboard and tests an address took about 14 seconds. A name now starts only where no identifier character precedes it. What the rule finds is unchanged.
+- Three timing tests now measure CPU time instead of wall time, so parallel test workers no longer make them fail.
+
+## [0.85.0]
+
+Ruleset 84 adds `ST-SKILL-AUDIT-OVERRIDE` and `ST-SKILL-MEMORY-WRITE-HIDDEN`. Report schema 1.10 is unchanged.
+
+### Added
+- `ST-SKILL-AUDIT-OVERRIDE`: a skill paragraph addressed to scanners or auditors that asks for a safe verdict.
+- `ST-SKILL-MEMORY-WRITE-HIDDEN`: a skill instruction to write into an agent memory file while hiding it from the user.
+
+## [0.84.1]
+
+A git command that times out no longer leaves a scan waiting on Windows. Ruleset 83 is unchanged: no detection rule changed. Report schema 1.10 is unchanged.
+
+### Fixed
+- On Windows, a git command that timed out while scanning a git URL could keep the scan waiting with no limit. Python's `subprocess.run` kills the program on timeout, then reads its output to the end with no limit. Git for Windows' `git.exe` is a launcher, so killing it leaves the real git, `git-remote-https` and a credential helper running with the same output pipe. The read after the kill is now bounded too (about 5 seconds), so the clone, fetch and checkout timeouts hold.
+- `tests/manual_eval/calibrate.py` looked up a git row's commit with `git ls-remote` without `GCM_INTERACTIVE=never`. A deleted or private repository then waited for a Git Credential Manager login. It now uses the engine's own non-interactive git environment and the same bounded run.
+
+## [0.84.0]
+
+A baseline that hides a malicious indicator now says so. Ruleset 83 is unchanged: no detection rule
+changed. Report schema 1.10 adds one optional field.
+
+### Changed
+- When a baseline removes evidence of a malicious-indicator rule, the scan names the rule ids in
+  three places: the text report's `Baseline` line, a warning on stderr, and the JSON report's
+  `metadata.baseline_suppressed_malicious`. The verdict and the exit-code gates still do not see
+  the suppressed evidence. A baseline that accepts only other findings, such as
+  `child_process.exec`, adds no warning and no field.
+- `tests/manual_eval/calibrate.py` can cache results with `--cache-dir`. The cache key is the
+  engine's own files plus the component's exact version, so a rerun with an unchanged engine
+  replays the rows it already scanned. Each row records how long it took, and `--previous REPORT`
+  starts the slowest rows first.
+- A test scans this repository and fails if the scan finds a malicious indicator in it.
+- The release build pins setuptools 84.1.0, which fixes a path escape in legacy wheel installs on
+  Windows (a GitHub security advisory).
+
+### Report schema 1.10
+- New optional field: `metadata.baseline_suppressed_malicious`, the sorted ids of the
+  malicious-indicator rules whose evidence the applied baseline removed. See
+  `docs/report-schema.md`.
+
+## [0.83.0]
+
+Ruleset 83 stops three rules from reading a security tool's own guards and patterns as an attack.
+Before this release, a scan of this repository rated it malicious (critical, 100/100). It now rates
+low. Each rule still fires on the construct it was written for. Report schema 1.9 is unchanged.
+`RULES_CHANGELOG.md` (ruleset 83) has the details.
+
+### Fixed
+- `ST-OBF-DECODE-EXEC-SH` no longer fires on a shell comment that names the idiom
+  (`# ... | base64 -d | sh`). As with `ST-SHELL-PIPE-EXEC`, a match in a comment goes to
+  needs-review.
+- `ST-AGENT-AUTORUN-REMOTE` no longer counts a fetch-and-run or decode-and-run idiom that appears
+  only in a comment of the script a hook runs. A match in a string literal still counts.
+- `ST-SENS-PATH-PY` no longer reads a regex that names credential paths and is built by
+  concatenation (`r"(?i)~/\.aws|" + rest`) as a credential path built from segments. A path built
+  onto the home directory still fires, and so does the `ST-COMBO-EXFIL` that rests on it.
+
+### Changed
+- CI runs pytest in parallel (`pytest -n auto`; pytest-xdist is in the dev dependencies) and also
+  runs on `rc/**` branches. `tests/manual_eval/calibrate.py` writes progress lines to a file with
+  `--progress FILE`.
+
+## [0.82.0]
+
+Ruleset 82 narrows two ruleset-81 rules that flagged ordinary package code. The attack shapes they
+were written for still fire. Report schema 1.9 is unchanged. `RULES_CHANGELOG.md` (ruleset 82) has
+the details.
+
+### Fixed
+- `ST-PY-STDLIB-SHADOW` no longer flags `exec` of a string literal that only imports or defines a
+  function, or code that reads its own `sys.modules[__name__]` entry. Only a write to `sys.modules`
+  counts as re-exporting the real module.
+- `ST-MCP-STATIC-AUTH-EXEC` no longer treats a `"Bearer <token>"` or `"Bearer $MY_TOKEN"`
+  placeholder as a hard-coded token.
+
+## [0.81.0]
+
+Ruleset 81 adds five rules for AI-tooling attack techniques. Each one is a high-severity malicious
+indicator with a positive sample in the eval corpus and a benign look-alike that stays clean.
+Report schema 1.9 is unchanged. `RULES_CHANGELOG.md` (ruleset 81) has the detection details.
+
+### Added
+- `ST-AGENT-CRED-HELPER-EXEC`: a distributable config (a provider card, a profile bundle, a shipped
+  `settings.json`) whose Claude Code credential helper fetches and runs code, or reads a credential
+  and sends it off the host.
+- `ST-AGENT-DOTENV-EXEC`: a per-agent `.env` whose sandbox or proxy-command variable carries shell
+  metacharacters, which the launcher runs on the host before the sandbox starts.
+- `ST-PY-STDLIB-SHADOW`: a Python file named after a standard-library module that runs a shell,
+  network or dynamic-exec call at import time, or re-exports the real module through `sys.modules`.
+- `ST-MCP-STATIC-AUTH-EXEC`: an MCP server that runs host commands behind a hard-coded token.
+- `ST-WORKFLOW-HISTORY-EXFIL`: a GitHub Actions workflow that searches for provider-key prefixes and
+  posts what it finds off GitHub.
+- New scanners `config_exec`, `stdlib_shadow` and `workflow_exfil` implement these rules.
+
+### Changed
+- A small set of CI-config rules (`engine._CI_SCORED_RULES`) keep their `.github/workflows/`
+  evidence scored instead of demoting it, because that workflow runs on the scanned repository's
+  own CI with its secrets.
+
+## [0.80.0]
+
+Ruleset 80 adds five rules. Each one is a high-severity malicious indicator with a positive sample
+in the eval corpus and at least one honest look-alike that stays clean. Report schema 1.9 is
+unchanged. `RULES_CHANGELOG.md` (ruleset 80) lists the detection changes.
+
+### Added
+- `ST-STARTUP-HOOK-EXEC`: a `sitecustomize.py` or `usercustomize.py` module that starts a process,
+  forks, opens a network connection, or decodes or deserializes a payload. CPython imports these
+  modules at every interpreter start, which makes them the same startup-persistence vector as an
+  auto-executing `.pth` file (`ST-PTH-EXEC`).
+- `ST-OBF-DECODE-SPAWN`: a JavaScript or TypeScript file that decodes an embedded blob and launches
+  node, python or PowerShell with an inline-code flag (`-e`, `-c`, `-Command`, ...). The decoded
+  code is as hidden from review as it would be under `eval(atob(...))`.
+- `ST-PROMPT-SPLIT-EXFIL`: a skill or agent prompt whose procedure has the agent read a credential
+  location, send data to an external URL and hide that send from the user. The three steps are in
+  separate sentences.
+- `ST-MCP-OAUTH-ENDPOINT-INJECTION`: an OAuth 2.0 / OpenID Connect discovery document with shell
+  metacharacters in an endpoint, `issuer` or `jwks_uri` value. A client that opens or fetches that
+  value through a shell would run the command.
+- `ST-MCP-SAMPLING-SYSPROMPT`: an MCP sampling request whose server-supplied `systemPrompt` carries
+  instruction-override or jailbreak wording. Sampling runs on the client's model, so the server gets
+  to decide what the user's model becomes.
+
+## [0.79.2]
+
+Ruleset 79 and report schema 1.9 are unchanged.
+
+### Added
+- `SKILLTOTAL_GITHUB_TOKEN` sets a GitHub token for the size check that runs before a GitHub
+  repository is cloned. Without a token GitHub allows 60 of these requests an hour per address.
+  Past that, the check was skipped and only the size limit during the clone itself applied, so
+  an oversized repository was downloaded before it was refused. With a token the limit is 5000
+  requests an hour. The token is sent only to `api.github.com`, never along a redirect. A
+  fine-grained token with no permissions is enough.
+
+### Security
+- Development dependencies now require virtualenv 21.14.9 or later (CVE-2026-113722,
+  CVE-2026-113725, CVE-2026-113726). The engine still has no runtime dependencies.
+
+## [0.79.1]
+
+Ruleset 79 and report schema 1.9 are unchanged.
+
+### Added
+- Four new samples in the eval corpus model the bypass shapes from the Trail of Bits post "The sorry
+  state of skill distribution" (June 2026) and the Cloud Security Alliance note that followed:
+  instructions smuggled in Unicode tag characters inside `SKILL.md`; a credential read and upload
+  moved out of `SKILL.md` into a reference file plus a helper script; a base64 blob decoded and
+  executed from `setup.py`; and an npm `postinstall` that reads credential files and posts them.
+  All four are synthetic and inert. The efficacy report now counts 134 malicious and 94 benign
+  samples, and recall and precision stay at 100%.
+
+## [0.79.0]
+
+Ruleset 79 and report schema 1.9 are unchanged.
+
+### Added
+- Compiled code shipped without its source is reported as not analyzed. A `.pyc`, `.pyo` or
+  `.class` file with no `.py` or `.java` of the same name beside it used to be counted in
+  `files_skipped_binary` and nothing more: the report had no note, the log no line, and the
+  verdict stayed low. It now produces a coverage note ("Compiled code shipped without source")
+  naming the files, the verdict reads "Partially analyzed", `--fail-on-unanalyzed` fails on it,
+  and the Claude Code hook treats the package as partly analyzed. Bytecode is never read, so a
+  payload shipped only as bytecode is now a named gap in the report. Bytecode beside its source
+  is a build artifact and stays silent.
+
+### Changed
+- `scan` always writes what it could not read to the log (`Not everything was analyzed: ...`),
+  not only when `--fail-on-unanalyzed` is set. With `--json` or `--sarif` stdout carries only
+  the report, so a file the scan did not read would otherwise pass unnoticed. The gate itself
+  stays opt-in. The GitHub Action turns the line into a warning annotation.
+
+## [0.78.1]
+
+Ruleset 79 and report schema 1.9 are unchanged.
+
+### Changed
+- The Claude Code plugin is served from the `stable` branch. That branch moves to a release tag
+  only after the release is published, so installs and updates no longer pick up plugin changes
+  merged to `main` before a release. The install commands are unchanged. The plugin is fetched
+  over https, so it needs no GitHub ssh key. `docs/plugin.md` shows how a team holds the plugin
+  at one release.
+
+### Fixed
+- A whole repository scanned by its git URL, with no `package.json` or `pyproject.toml` to name
+  it, is now reported under the repository's name. Before, it was reported as `repo`, the name of
+  the temporary checkout folder.
+
+### Release checks
+- A tag publishes to PyPI only after CI passed on its commit, including the unit tests on Windows
+  and the journeys on Linux, Windows and macOS.
+- Before publishing, the exact wheel and sdist are installed into clean environments on Linux,
+  Windows and macOS with Python 3.10 and 3.14, and the journeys run against them.
+- New tests: a baseline written by 0.78.0 still matches; no shipped rule id disappears; SARIF
+  output validates against the SARIF 2.1.0 schema; the MCP server works through the installed
+  command; every `skilltotal` command in the docs parses; the engine imports only the standard
+  library.
+
+## [0.78.0]
+
+Ruleset 79. Report schema 1.9 is unchanged. `RULES_CHANGELOG.md` (ruleset 79) lists the
+detection changes.
+
+### Added
+- `skilltotal diff --fail-on-unanalyzed` exits 2 when the new version has a part the scan could not
+  analyze and the old version did not. A finding can disappear when its file becomes too large,
+  minified or unparseable, and `--fail-on-new` alone let that pass. The diff JSON lists these parts
+  as `coverage_gaps_added`, the text report lists them under "Not analyzed in the new version
+  only", and the MCP server's `diff_components` summary adds them to `not_checked`.
+- New `needs_review` notes for analysis that stopped at a limit. Each counts as unanalyzed for
+  `--fail-on-unanalyzed` and for the install hook:
+  - "Install script not analyzed": reading what `package.json` runs at install time stopped after
+    200 files, 64 words of a command or 2,000 nested packages. Because the note uses this title,
+    `guard` and the hook do not call such an install clean;
+  - "Frontmatter partly analyzed": a skill or subagent frontmatter is longer than 2,000 lines, so
+    hooks or MCP servers declared further down were not read;
+  - "Environment sends partly analyzed": a JavaScript file has more `process.env` uses, or more
+    calls around them, than the environment-send check follows.
+- Code loaded by a literal path from a skipped folder is reported as not analyzed when it is a
+  native binary (a `.node` addon) or a file excluded with `--exclude`. An excluded file loaded
+  this way is no longer read.
+
+### Changed
+- `skilltotal diff` counts repeated evidence. When the new version repeats a line the old version
+  already had in the same file, the second copy is added evidence and can trip `--fail-on-new`.
+- `skilltotal diff` prints a console notice when a side was read from a saved `--json` report.
+  That side was not scanned: its findings are taken as the file states them.
+- The "Folders not analyzed" note now says when a package the component loads by name (a bundled
+  dependency) was not read.
+- The MCP server's tool descriptions are more detailed. `list_rules` says when to use it, that it
+  reads the bundled rule list offline, that `ids` and `query` must both match, and that no match
+  returns `[]`. `scan_component` says what it downloads and gives an example of each kind of source.
+
+### Security
+- The install hook treats cmd's `%NAME%` and `!NAME!` variables as words the shell fills in.
+  `set V=install & npm %V% x` and `npm install %P%` used to pass without a check; the hook now
+  asks about them, as it does for `$V` in bash. It also asks about `uv pip $V x` and `uv tool $V x`.
+- `guard` prints the component's name, version, type, verdict and reasons on one line each.
+  Before, a newline in a package name could print a line of the package's choosing above the
+  decision.
+- Error messages that quote outside text (a git server's `remote:` lines, a registry's answer)
+  show control characters and CI workflow commands (`::error::`, `##[...]`) as plain text.
+
+## [0.77.0]
+
+Ruleset 78 and report schema 1.9 are unchanged: no detection rule changed.
+
+### Added
+- Per-rule samples in the detection benchmark. Recall is judged per sample, so it cannot measure
+  a rule that does not flag a sample on its own. Most rules behind the OWASP class counts in the
+  MCP registry survey are like that: `ST-MCP-DANGEROUS-TOOL` and `ST-MCP-SERVER-EXEC`, which
+  produce 99.2% of the AST03 rule hits there, are capability rules that score zero.
+  `tests/eval_corpus/rules/<rule>/` now holds 45 samples for 17 rules: `fires/` samples that must
+  trigger the rule and `silent/` look-alikes that must not. They cover the 15 rules behind the
+  survey's class counts, plus `ST-AGENT-AUTO-APPROVE` and `ST-MCP-OVERBROAD-SCOPE`, the two AST03
+  rules that had fired on no sample. `tests/test_efficacy_floor.py` fails when a sample
+  misses its expectation or when a rule behind a survey class count has no samples. Raised by
+  @ossumpossum in OWASP/www-project-agentic-skills-top-10#94.
+- `docs/efficacy-report.{md,json}`: a rule coverage table (`rule_coverage` and `rule_misses` in
+  the JSON). For each rule mapped to an OWASP class it gives the malicious and benign samples the
+  rule fired on and the results of its own samples. 53 of the 63 mapped rules fire on at least one
+  sample, and the report names the other 10. Recall and precision are computed as before, on the
+  same 130 malicious and 94 benign samples.
+
+### Changed
+- `docs/mcp-registry-survey.md` links the efficacy report shipped with 0.49.0, the engine the
+  survey finished with. That report has no AST03 sample, and the survey's class counts count rule
+  presence, which its recall does not measure.
+
+## [0.76.0]
+
+Ruleset 78. Report schema 1.9 is unchanged.
+
+### Added
+- `ST-CLIPPER` also catches a clipper that leaves the clipboard write to its caller. Such code
+  returns a fixed address when the clipboard text matches an address pattern, and any other text
+  unchanged. The rule reads the address even when it is spliced from fragments.
+- `ST-COMBO-EXFIL` pairs a credential read and a network call in two languages again, but only
+  when the code links the two programs. Either the file with the credential read writes a
+  staging file that the sending file reads, or one of the two files starts the other by name.
+  The linking line is added to the evidence. `RULES_CHANGELOG.md` (ruleset 78) has the details.
+
+### Changed
+- `docs/language-scope.md`: detection for Go, Rust, Java, Ruby and PHP is planned, with no date
+  set.
+
+## [0.75.0]
+
+Ruleset 77. Report schema 1.9 is unchanged.
+
+### Fixed
+- Three false positives on a Go command-line tool that scored `high` with a critical
+  `ST-COMBO-EXFIL`. `RULES_CHANGELOG.md` (ruleset 77) has the details:
+  - `ST-SENS-PATH` no longer reports a credential path in the help text of a Go option, a
+    multi-line raw string held by a help field such as `Help:`, `Long:` or `Usage:`.
+  - `ST-COMBO-EXFIL` needs the credential reference and the network call in code of the same
+    language, or one of them in a shell script, markdown or configuration file.
+  - An OAuth client secret stored in obscured form next to the app's public client id goes to
+    `needs_review` instead of `ST-SECRET-EMBEDDED`.
+- Go raw strings are read without escapes, so a raw string that ends in a backslash
+  (`` `C:\` ``) no longer runs on into the code and comments after it.
+
+## [0.74.0]
+
+Ruleset 76 and report schema 1.9 are unchanged: no detection rule changed.
+
+### Added
+- Scanning through a company registry mirror (Artifactory, Nexus, Verdaccio, devpi).
+  `SKILLTOTAL_NPM_REGISTRY` (an npm-protocol registry) and `SKILLTOTAL_PYPI_INDEX` (a PyPI-style
+  JSON API, `<base>/pypi/<name>/json`) send `npm:` and `pypi:` sources, `--provenance` and the
+  hook's release lookups to the mirror. `SKILLTOTAL_REGISTRY_TOKEN` is sent as
+  `Authorization: Bearer` to the mirror's own scheme and host only: never to the public
+  registries, never along a redirect to another host, never into a report or an error. The URL
+  must be https (plain http only to localhost) with no user name, password, query or fragment.
+  Download URLs must stay on the mirror or the public registry's file host, and redirects to
+  plain http are refused. A scan through a mirror gets a `needs_review` note, "Fetched through a
+  registry mirror". Unset, nothing changes. The report schema is unchanged.
+- Claude Code plugin: an install whose configured registry (environment, `.npmrc`, `pip.conf`,
+  tool config files) is that mirror is checked through it instead of counting as unchecked. Any
+  other custom registry, a mirror set only as an extra index, and a registry named on the command
+  line stay unchecked as before (asked about; denied in CI unless `registry` is allowed). Only
+  mirror checks get the mirror settings and the token, and their verdicts are cached separately.
+  For Python the index is the one the running installer reads: pip/pipx use `PIP_INDEX_URL` and
+  `pip.conf`, uv/uvx use `UV_DEFAULT_INDEX`, `UV_INDEX_URL` and uv's files. A mirror that only
+  the other installer reads leaves the package on PyPI. When the hook cannot tell which
+  installer runs (poetry, pdm, pipenv, or pip and uv in one command reading different indexes),
+  the package stays unchecked.
+
+### Fixed
+- Plugin: every URL of a `pip.conf` `extra-index-url` or `find-links` line is read, not only the
+  first, so `extra-index-url = https://pypi.org/simple https://other.example` counts as a custom
+  index.
+
+## [0.73.0]
+
+Ruleset 76, report schema 1.9. Fixes from a review of the CLI, the GitHub Action, the plugin and
+the MCP server in daily use, and from a security review of the engine, the plugin and the Action.
+No rule was added or removed. The ruleset changes because the scan now reads files it used to
+skip or read only by regex (see `RULES_CHANGELOG.md`).
+
+Behaviour changes to know about:
+- A `pypi:` source is scanned as a wheel whenever the release has one: the pure-Python wheel
+  first, then a platform wheel in a fixed order (Linux x86-64, Windows x64, macOS). The sdist is
+  scanned only when the release has no wheel. The choice depends on the release alone, so the
+  same source gives the same report on any machine. A `needs_review` note names the file scanned
+  and how many other files were not read.
+- With `--output FILE`, the console now gets a short summary and the full report goes only to the
+  file.
+- Abbreviated options are refused: `--out` no longer means `--output`.
+- An inline `skilltotal:ignore` marker no longer hides a malicious indicator.
+- The MCP tools `scan_component` and `diff_components` answer with a summary unless you pass
+  `detail: "full"`, and a local path must be absolute.
+- The plugin has three new `SKILLTOTAL_ALLOW_UNCHECKED` kinds (`remote`, `container`,
+  `registry`). In CI, an MCP server added by URL or from a container image is now denied unless
+  its kind is allowed.
+
+### Performance
+- Evidence lookups use a binary search, so a package with a 1.4 MB JavaScript bundle scans in
+  about 25 seconds instead of 60, with the same report. A first-time hook check of such a package
+  now fits the plugin's 60-second limit.
+
+### Security
+Fixes from a security review.
+
+Scanning:
+- A path in a scanned manifest that names another host or drive (`\\host\share`, `C:\...`,
+  `//host/...`) is never resolved, so a component cannot make the scan open a network share.
+- A package's entry points (`main`, `module`, `browser`, `bin`, `exports`) are read even when
+  they look minified or are padded to look like a bundle. Other minified files are still set
+  aside.
+- Scripts saved as UTF-16 or UTF-32 with a byte-order mark are read as text.
+- Patterns that slowed down on crafted lines now run in linear time. Two were cubic: `iex`
+  followed by a long run of blanks (42 s for 1,000) and `@mcp.tool` followed by blank lines (34 s
+  for 500). Several others were quadratic. The gap between the parts of a matched command is
+  limited to 1,000 characters on one line.
+- A crafted `pyproject.toml` no longer stalls the scan: for a file over 16 KB, only the
+  `[project]` table is read. A `.skilltotal.toml` nested thousands deep is a config error
+  (exit 1) instead of a traceback.
+- On Python 3.12+, Python nested deeper than the default recursion limit (a 1,000-term
+  `1+1+...`) is analyzed by the AST instead of the regex fallback. A file too deep even to parse
+  gets a `needs_review` note, "Python file too deeply nested to analyze", and its matches are
+  kept.
+- An archive is refused on every system when two members would be one file on Windows or macOS
+  (names that differ in case, Unicode composition, trailing dots or spaces, `::$DATA`, or `\` vs
+  `/`), when a member names a Windows device (`NUL.py`, `CON`, `COM1`), or when a tar member name
+  holds a character Windows cannot store. The report does not depend on where the scan runs.
+- A ZIP whose central directory declares more than the size limit is not opened. A broken ZIP
+  never stops the scan.
+- At most once a day, a scan removes temporary folders older than six hours that killed scans
+  left behind.
+
+Output:
+- A report, baseline or SARIF file is never written through a linked folder (symlink or
+  junction) below the working directory.
+- `diff`, `guard --installed` and `inventory` print each field taken from a report or a config
+  file on one line, with newlines, escapes and bidi controls shown as `<U+XXXX>`.
+- Text output breaks up GitHub workflow commands (`::cmd::` at the start of a line, `##[`) found
+  in snippets, so a scanned file cannot issue one in a CI log.
+- A baseline path that is not a file is an error (exit 1) instead of a hang.
+
+Sources:
+- `--staged` reads staged files as raw blobs (`git cat-file`), so no LFS download, clean or
+  smudge filter, fsmonitor or hook runs. A staged symlink is not written out. An index path that
+  could escape the temporary copy, or that Windows cannot hold, is refused.
+- `inventory` and `guard --installed` do not follow a project skill that links to a folder
+  outside the project.
+- On Linux and macOS, the npm wrapper looks for `uvx` and the other runners only in absolute
+  `PATH` folders, so an empty or `.` entry cannot run a program committed to the scanned
+  repository.
+
+GitHub Action:
+- Workflow commands are switched off from the action's first line, so an input with a newline
+  cannot forge `::error::` or another command.
+- The job summary and the PR comment name the config file applied. A pull request that changes
+  `.skilltotal.toml` gets a warning, since it can change the gate it is judged by.
+- The sticky PR comment is updated only when the bot wrote it.
+- Escaped text in the summary and the comment cannot turn into an issue link (`#12`, `GH-7`).
+- A SARIF folder that is a link is refused.
+
+Claude Code plugin:
+- `npx` checks follow what npm runs. In a workspace member, the workspace root's
+  `node_modules/.bin` counts. Only the extensionless program counts, so a planted `next.cmd`
+  alone does not. If the hook cannot match the workspace list, the package is checked.
+- `.npmrc` is read the way npm reads it: the last key wins, and quoted keys and values, sections
+  and comments are handled. The user's `prefix` and `globalconfig` are followed to the global
+  `.npmrc`, and a workspace member reads the workspace root's file. The registry is left unknown
+  for a file over the read limit, a project `.npmrc` that sets `userconfig`, `globalconfig` or
+  `prefix`, or a key built from a variable. The hook then asks, and CI denies the install.
+- `.yarnrc`, `.yarnrc.yml`, `bunfig.toml`, `pnpm-workspace.yaml`, `uv.toml` and `[tool.uv]` in
+  `pyproject.toml` are read when the command runs that tool.
+- An npm dist-tag set in `.npmrc` or `npm_config_tag` picks the release checked
+  (`npm:x@next`). If the scan cannot ask for that tag, the hook asks.
+- More command forms are read: PowerShell `& (...)`, `corepack pm@version`, `pnpm --package`
+  before `dlx`, `volta run`, `nvm exec`, `fnm exec`, `cross-env`, `aws-vault exec`, `mise exec`
+  and `wsl`. A package installed through a runner that loads variables (`dotenv`, `direnv`,
+  `op run`, `doppler run`, `devbox`, `nix-shell`, `mise`, `wsl`) is treated as coming from a
+  configured registry, since one can be set there: the hook asks, and CI denies it unless
+  `registry` is allowed. An install command given to an unknown program is asked about, and CI
+  denies it.
+- A line with thousands of parentheses or words is read in milliseconds. Past a limit it is not
+  read, and an installer named in it is asked about.
+- When the plugin cleans up a check's temporary folder, it never changes permissions through a
+  link or on a file that has another hard link (a local `git clone` hard-links files to the
+  source).
+
+MCP server:
+- A local path that is a network share, a device path or an NTFS stream is refused. The home
+  folder is refused under another name too (a link to it, or a short 8.3 name).
+
+### CLI
+- `--output FILE`: the console gets the verdict, the risk, the counts, any gate lines and
+  `Full report: FILE`. The folder is checked before the scan starts; if it is missing, the scan
+  stops with "does not exist; create it first" instead of failing after a long scan. The same
+  check applies to `--write-baseline` and `diff --output`.
+- Abbreviated options are refused on every command.
+- The summary counts risk and capability findings apart: "2 risk finding(s), 1 capability
+  finding(s) (not scored)". The text report heads its list "Findings (2 risk, 1 capability, not
+  scored):".
+- `inventory --project DIR` and `guard --installed --project DIR` exit 1 when `DIR` does not
+  exist. Before, they checked nothing there and exited 0.
+- `inventory` flags every component `guard --installed` would block, such as a look-alike name,
+  an install script it could not read or a scan that read nothing. Its JSON adds `guard`,
+  `guard_reasons`, `remote` and `this_tool` to each item.
+- SkillTotal's own MCP server (`skilltotal mcp`, `python -m skilltotal mcp`, or run through uvx,
+  npx or pipx) counts as checked ("this scanner"). A server reached at a URL is listed as
+  "remote (not scannable)" instead of as a failure, and is still unchecked: `guard --installed`
+  exits 1 without `--allow-unchecked`.
+- On PowerShell, a trailing backslash before a closing quote (`'.\my dir\'`) joins the next
+  arguments into the path. A failed scan now says so.
+- Rule titles, descriptions and recommendations are plain ASCII.
+
+### Suppression and baselines
+- An inline `skilltotal:ignore` marker never hides a malicious indicator. The finding stays, and a
+  `needs_review` note, "Inline ignore does not apply to malicious indicators", says how to accept
+  it: a baseline, or `warn` under `[policy]` in `.skilltotal.toml`.
+- A marker that names an unknown rule id gets a `needs_review` note that suggests the closest id.
+- For an `npm:`, `pypi:`, git or archive source, the hint on accepting a false positive suggests
+  a baseline or `[policy]`, since markers count only in a local folder.
+- `--write-baseline` warns on stderr when the baseline accepts a malicious indicator.
+- The text report has a `Baseline  :` line with the number of occurrences the baseline
+  suppressed. A baseline set in `.skilltotal.toml` is also named on the `Config    :` line.
+
+### Report schema 1.9
+- New optional fields: `metadata.baseline` (the baseline file applied),
+  `metadata.baseline_suppressed_count` (how many suppressed occurrences it accounts for) and
+  `metadata.config_applied.baseline`. See `docs/report-schema.md`.
+
+### GitHub Action
+- Each run writes a job summary: the verdict, the risk score and the gate result, the gate lines
+  that tripped, a table of risk findings (severity, rule, file:line and title; up to 20, then a
+  count), the capabilities, and how many findings a baseline or inline marker suppressed. A
+  tripped gate also shows as an error annotation.
+- With `comment-on-pr: 'true'`, the pull request comment has the same content in short: the top
+  five risk findings with file:line, and a link to the workflow run. It is updated in place.
+- With `fail-on` empty and no gate in `.skilltotal.toml`, the log names the gate
+  `fail-on high (action default)`.
+- A usage, config or fetch error fails the job as "SkillTotal could not run the scan (exit 1):
+  ...", not as a tripped gate.
+- `sarif-file`: a missing folder is created. If the SARIF report cannot be written, the action
+  warns and skips the upload; the gate still decides the job.
+- For an `npm:` or `pypi:` source, the SARIF report is made from the same release the gate
+  scanned, even if a new one is published in between.
+- A `version` older than the action's own engine gives a warning.
+
+### Claude Code plugin
+- New `SKILLTOTAL_ALLOW_UNCHECKED` kinds: `remote` (an MCP server reached at a URL), `container`
+  (an MCP server run from a container image) and `registry` (a named package from a configured
+  registry or mirror). A CI job behind a company mirror can allow `registry` without setting
+  `SKILLTOTAL_STRICT=0`.
+- Custom registries are found in the project's and the user's `.npmrc`, in pip's config files and
+  in more environment variables (`npm_config_*registry`, `YARN_REGISTRY`, `BUN_CONFIG_REGISTRY`,
+  `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`, `UV_DEFAULT_INDEX`, `UV_INDEX` and others). A scoped
+  registry counts only for its scope. The console line shows only the registry's host.
+- Remote and container MCP servers get a console line, and CI denies them unless their kind is
+  allowed.
+- A CLI older than the plugin that cannot judge a command now says so in the console, and CI
+  denies the command. Without the CLI, decoded commands (`base64 -d | sh`,
+  `powershell -EncodedCommand`, `FromBase64String`, `certutil -decode`) also get the "not on
+  PATH" line.
+- `skilltotal hook claude-code --help` describes the event, `--protocol`, the settings and the
+  exit codes.
+
+### MCP server
+- `scan_component` and `diff_components` take `detail`: `"summary"` (the default) or `"full"`.
+  The summary holds the verdict, the decision, the risk, why (each finding with up to three
+  locations and a short snippet, risk findings first), the capability names, counts, up to five
+  notes to check by hand, what the scan does not cover and the engine version. For a package
+  with a 1.4 MB bundle it is about 4 KB instead of 27 KB.
+- `list_rules` takes `ids` and `query` filters.
+- A local path must be absolute. The home folder, any folder above it and a filesystem root are
+  refused, and `~` is not expanded.
+- Two requests run at a time, and `ping` is answered at once. A cancelled request gets no answer;
+  a scan already running finishes in the background. A line that is not valid UTF-8 gets a parse
+  error.
+- MCP protocol version 2025-11-25 is supported, and the tools have titles.
+- A size-limit error says to set the variable in the `env` of the server's entry in the MCP client
+  config, and suggests scanning a subfolder URL.
+- On start, the server removes its own temporary folders older than six hours, left by a scan
+  that was killed.
+
+### Release build
+- Tests and `twine check` run in their own jobs. The build job installs only hash-pinned build
+  tools (`.github/requirements/build.txt`) and builds without isolation. The gitleaks download is
+  checked against its SHA-256. The package metadata uses PEP 639 (`License-Expression:
+  Apache-2.0`).
+
+## [0.72.0]
+
+Ruleset 75. See `RULES_CHANGELOG.md`.
+
+### Detection
+- An npm install script can run a shell script shipped in the package
+  (`"postinstall": "bash install.sh"`). If that script downloads code and pipes it into a shell,
+  SkillTotal now reports the same malicious indicator as for a download written into
+  `package.json` itself. Before, this indirect form scored low.
+
+## [0.71.0]
+
+Ruleset 74. See `RULES_CHANGELOG.md`.
+
+### Detection
+- An install hint that a script keeps in a shell variable inside a `case` arm and only prints,
+  such as `Linux) uv_hint="curl ... | sh" ;;`, is no longer reported as a download-and-run
+  command. Ruleset 73 already handled the same hint on a line of its own.
+
+## [0.70.1]
+
+Ruleset 73 and report schema 1.8 are unchanged. No detection changes in this release.
+
+### CLI and GitHub Action
+- When a severity gate trips, the gate line now says why the finding counts. For example:
+  `gate: --fail-on high tripped by ST-DESERIALIZE-PY (app.py:2), severity high`. If a finding
+  trips any level, the line ends in `..., a malicious indicator`. The gate checks the severity of
+  each finding and ignores the headline score, so a report headed "low risk (20/100)" can still
+  trip `--fail-on high`. Earlier versions did not explain this in the gate line.
+
+### Inventory
+- `inventory` and `guard --installed` now read the `managed-mcp.json` file that an organization
+  deploys for Claude Code. It lives in `/etc/claude-code`,
+  `/Library/Application Support/ClaudeCode` or `C:\Program Files\ClaudeCode`. The file uses the
+  same format as `.mcp.json`, and its servers load for every user on the machine. These system
+  paths are read only on a real run. A test that passes its own home folder never reads them.
+
+### Tests
+- The GitHub Action step test is skipped when the `python` on PATH is older than 3.11, because
+  the step runs `python -P` and Python 3.10 does not support that flag. The action itself always
+  sets up Python 3.12.
+
+## [0.70.0]
+
+Ruleset 73 and report schema 1.8. Fixes from a review that used SkillTotal the way a DevSecOps
+engineer would: on a workstation, in CI and behind an AI coding agent. See `RULES_CHANGELOG.md`.
+
+### Detection
+- An npm install script that downloads code and pipes it into a shell, or decodes data and runs
+  it, is a malicious indicator (`ST-INSTALL-NPM-REMOTE-EXEC`). It used to show only as the
+  `ST-INSTALL-NPM` capability and scored 0. The same download-and-run passed to a shell call in
+  Python or Node is a risky construct.
+- Package-index tooling that reads `~/.pypirc`, the index's own upload config, no longer gets a
+  critical credential-exfiltration finding for combining that read with its network code. This
+  false positive made pip score critical, through its vendored `distlib`.
+- Fewer false positives: a skill's visible install command is no longer called hidden, a shell
+  command kept in a variable that a script only prints is not read as executed, and a
+  `marshal.loads` of data the module itself wrote is not deserialization of untrusted input.
+- SkillTotal's own SARIF report, JSON report and baseline in the scanned folder are recognised
+  by their content and skipped, so a report left behind by an earlier run can no longer turn a
+  clean repository malicious.
+- Several regular expressions took quadratic or exponential time on crafted input, so a file
+  under the 2 MiB cap could stall a scan for hours. They are bounded now.
+
+### Reports
+- A code file that was not read (over 2 MiB, or a minified bundle) makes a low verdict read
+  "Partially analyzed" instead of "No significant risks found"; `verdict.unanalyzed_files` counts
+  them (schema 1.8). Scores do not change.
+- A high or critical score without a malicious indicator is headed "High risk" / "Critical risk"
+  instead of "High-risk capabilities", since capabilities never score.
+- When a `.skilltotal.toml` was applied, the report says so (`Config :` line, stderr with
+  `--json`/`--sarif`, `metadata.config_applied`).
+- The text report counts suppressed findings and says how to accept a false positive.
+- File names are printed with control characters made visible, so a crafted name cannot forge
+  report lines.
+
+### CLI
+- `scan --staged` runs git from an absolute `PATH` entry only. On Windows with Python 3.10 and
+  3.11, it could run a `git.bat` from the scanned folder.
+- `--output`, `--write-baseline` and `diff --output` refuse to write through a symlink or
+  junction.
+- `--no-config` ignores any `.skilltotal.toml`. An unknown rule id in `ignore` or `[policy]` is
+  an error; it used to switch the gate off silently. `baseline` in a config resolves relative to
+  the config file.
+- `--fail-on none` turns off every gate a config sets; `--fail-on-default LEVEL` applies only
+  when nothing else sets a gate.
+- A tripped gate prints why on stderr (`gate: --fail-on high tripped by ST-X (file:line)`).
+- `--write-baseline` exits 0 after writing.
+- `diff --fail-on-new` counts risk the way `scan --fail-on` does: capabilities never trip it.
+- New `--sarif-uri-prefix` and `--sarif-category` options for SARIF uploaded from a subfolder.
+- SIGTERM (a cancelled CI job) removes temporary folders, as Ctrl-C does.
+- Clearer errors for a missing npm or PyPI package, an npm version range and a missing archive.
+
+### GitHub Action
+- `fail-on` defaults to the config's gate when `.skilltotal.toml` sets one, else `high`; it used
+  to override the config. `fail-on: none` also turns off the config's gates.
+- New inputs `config`, `exclude`, `fail-on-score` and `sarif-category`.
+- With a subfolder `source`, SARIF paths are relative to the repository root, so Code Scanning
+  alerts point at real files. npm, PyPI and git-URL sources are not uploaded.
+- The log lists every location of each risk finding, and the PR comment states whether the gate
+  passed and counts risk findings and capabilities separately.
+- Scanned text can no longer inject workflow commands into the log.
+
+### Claude Code plugin and agent tools
+- An install command hidden behind decoding, `eval`, a variable used as the command name or a
+  pipe into a shell is reported as a command SkillTotal could not read: the agent is asked, and
+  CI denies it.
+- `git clone` gets a console line saying the repository was not checked.
+- The plugin warns when the CLI is older than the plugin, and skips the CLI for commands that
+  cannot install anything outside CI.
+- `guard --installed` exits 1 when a component could not be checked or none was found
+  (`--allow-unchecked` exits 0) and names what it could not check.
+- `inventory` finds Claude Code servers in `~/.claude.json`, VS Code `servers` and installed
+  Claude Code plugins, keeps pinned versions, marks a curl-to-shell launcher risky and reports
+  secrets written into an MCP config, redacted.
+- Verdict-cache entries are tied to the engine and ruleset that produced them; echoed names are
+  capped; network failures are named.
+- The npm wrapper warns on stderr when it runs an installed Python engine of another version.
+- MCP tools are annotated read-only; `list_rules` is compact unless `verbose` is set.
+
+## [0.69.0]
+
+Ruleset 72: five new malicious-indicator rules and a score floor. See `RULES_CHANGELOG.md`.
+
+### Scoring
+- A component with a malicious indicator scores at least 50 (high). A single high-severity
+  indicator used to sum to 20/100 (low) under a "malicious indicators found" verdict, so a
+  `--fail-on-score` gate, a badge or a sort by score read it as safe. Reports of other components
+  are unchanged; re-scan stored reports to pick this up.
+
+### Detection
+- New rules for an AI coding CLI driven over a remote connection with its approvals off, a skill
+  that hides a dependency-index redirect, an MCP server launched from a hidden dot-path, a
+  decrypt-and-execute loader, and a PowerShell download-and-execute cradle. Install code writing a
+  VS Code `folderOpen` task counts as config persistence. Each rule has a benign look-alike in
+  the efficacy corpus that stays clean (119 malicious and 84 benign samples, 0 false positives).
+- `ST-SECRET-EXFIL` no longer reads the environment as sent when code gives it to its own URL
+  builder (`fetch(chatCompletionsUrl(process.env), ...)`), starts a child process with it
+  (`env=os.environ`) or stores it on an attribute (`self.env = ...`). In large Python servers
+  the last two spread to hundreds of names, so a queue's `.put(...)` read as an upload. Checking
+  the new score floor against the catalog found these on several open-source projects.
+
+## [0.68.0]
+
+Detection is unchanged (ruleset 71).
+
+### pre-commit
+- The hook scans what the commit will contain: `skilltotal scan --staged` writes git's index to a
+  temporary copy and scans that. It reads the whole repository, not only the changed files, so
+  its verdict matches CI. An untracked or ignored file (a local `.env`, a downloaded script) no
+  longer fails a commit it is not part of. `--staged` outside a git work tree is an error.
+
+### CI (plugin strict mode)
+- A partly analyzed package passes in CI, and its console line names what was not read (a bundle
+  too large to read, code in a language the engine does not analyze). What a package runs at
+  install is read either way, and the dependencies a command pulls in are not checked at all.
+  Denying the named package for its unread rest stopped large packages and made the build little
+  safer. `SKILLTOTAL_STRICT_PARTIAL=1` denies it as before; a value that is neither on nor off
+  reads as on.
+
+### GitHub Action
+- With `source` set to a subfolder, the action still read its own SARIF report and failed a clean
+  repository. The action now gives the report's path relative to `source`, so the scan leaves it
+  out.
+- A `verdict` output: `malicious` whenever a malicious indicator was found, whatever the risk
+  score, else the risk level.
+
+### CLI
+- `scan --output FILE` into the folder being scanned leaves FILE out of the scan. A pipeline
+  running `skilltotal scan . --sarif --output skilltotal.sarif` read the previous run's report and
+  failed a clean repository on its second run.
+- A config on Python 3.10 is as strict as on later versions. The fallback parser Python 3.10 uses
+  dropped what it could not read, such as a policy action without quotes, an unknown table, or
+  `exclude` given as a string, which switched part of the gate off. It now rejects them as tomllib
+  does.
+
+### Tests
+- Customer journeys (`tests/journeys`) drive the installed CLI as a pipeline, a developer machine
+  and a security team do: the gate, SARIF levels, every documented setting with a bad value, a
+  config typo, the README's flags, a baseline, per-rule policy, `diff`, the plugin wrapper without
+  the CLI on `PATH`, and a real pre-commit run. CI builds the wheel, installs it with pipx and runs
+  them on Linux and Windows, and also weekly without a commit.
+
+## [0.67.0]
+
+Fixes from following the documentation as a DevOps engineer would, on a clean Linux machine and in
+a fresh GitHub repository. Ruleset 71.
+
+### GitHub Action
+- With `source: .` the action scanned the SARIF file it had just written into the repository. Its
+  rule descriptions quote detection patterns, so a clean repository failed on its first run. The
+  action now leaves its own SARIF report out of the scan and writes the JSON report the gate reads
+  outside the workspace.
+- A failed SARIF upload no longer fails the job. A private repository has Code Scanning only with
+  GitHub Advanced Security, so every build there failed, clean or not. The upload failure is now a
+  warning that says why, and the gate decides the job.
+- The scan step lists the findings in its log. When Code Scanning is off, the pull request comment
+  and the gate's error point to that log.
+- The README workflow adds `actions: read`, which the SARIF upload needs in a private repository.
+
+### Detection (ruleset 71)
+- Install scripts in nested `package.json` files now count. npm runs them for workspace members and
+  vendored packages when they are installed from the repository. Before, a publishing
+  `postinstall` in `vendor-helper/` scored 0/100. Test, example, documentation, corpus and CI paths
+  keep their folder's rules.
+- `ST-SECRET-EXFIL` (JavaScript) leaves out a process call's options object: `spawn('wget', [url],
+  {env: process.env})` hands the child its environment and sends nothing. pm2 7.0.4 was denied by
+  the hook for it.
+
+### SARIF
+- A capability (what a component can do, such as run a shell) is a SARIF note without
+  `security-severity`. A capability never moves the score or the gate, but it used to reach Code
+  Scanning as a high error.
+
+### CLI
+- A config that cannot be honored is an error with exit code 1: invalid TOML, an unknown key, a
+  value of the wrong kind or out of range, an unknown policy action, a `--config` path that does
+  not exist. Each of these used to give an empty config, exit 0 and a gate that was silently off.
+- `--fail-on-score` accepts 0-100 only. `--json` and `--sarif` together are refused. A
+  `SKILLTOTAL_MAX_*` or `SKILLTOTAL_WORKERS` value that is not a positive whole number is an error,
+  not a traceback. An unwritable `--output` is an error. A reader that closes the pipe is not.
+- With `--output`, the JSON or SARIF report goes to the file and the console gets the readable
+  summary. Printing the SARIF document as well ran to thousands of lines in a CI log.
+- A git repository that does not exist is reported as "not found, or private" instead of git's
+  "could not read Username".
+
+### Plugin
+- The hook says why a source could not be checked (git is not installed, no such package or
+  version, no such repository) instead of "the scan failed".
+- A CLI that is not on `PATH` gets the `pipx ensurepath` hint, and the console line names an
+  unknown `SKILLTOTAL_ALLOW_UNCHECKED` kind or an unusable `SKILLTOTAL_HOOK_BUDGET`.
+
+### Docs
+- README: a table of the environment settings, `pipx ensurepath`, scanning one folder of a GitHub
+  repository, what pre-commit scans, where the hook keeps its verdicts, and that a script on disk
+  is not read as an install. The README used to say such a command was reported and denied in CI.
+
+## [0.66.0]
+
+Detection reads every place an agent takes instructions, settings or MCP metadata from, and a
+large package is scanned in about half the time. Ruleset 70.
+
+### Detection (ruleset 70)
+Details in `RULES_CHANGELOG.md`. Detection-efficacy corpus: 111 malicious and 78 benign samples,
+111/111 flagged, 0 false positives.
+- Tool poisoning and prompt injection are now looked for everywhere an agent reads MCP or skill
+  metadata: nested input-schema fields, prompts, resources, server instructions, `server.json`,
+  Python `Field(description=...)` and `Annotated[...]`, zod's `.describe(...)`, the bodies of
+  subagents and slash commands, and frontmatter descriptions.
+- Agent instructions (skills, subagents, commands, `CLAUDE.md`/`AGENTS.md`/`GEMINI.md`, editor
+  rules) that download a script and run it are a risk. When they say to do it silently or
+  without asking, or fetch from a bare IP address, they are a malicious indicator.
+- Code that writes into an agent's settings, instructions or memory (`.claude/settings.json`,
+  `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, skill folders and more) is a risk, and a malicious
+  indicator when the write runs at install or import time.
+- Agent settings shipped with a component are a risk when they turn approvals off (bypass mode,
+  every shell command allowed, yolo mode, auto-approved tools) or point the model API at another
+  host.
+- npm: install-time code that publishes a package is a malicious indicator. A dependency fetched
+  from a URL or a git repository is a risk.
+- MCP: a server that asks the user for a secret through elicitation is a risk. A server launched
+  at whatever release is current is noted for review. Auto-approve in VS Code's `mcp.json` is
+  now read.
+- New malicious indicators: a `.pth` file that imports a module which starts a process at import
+  time; a fixed crypto address written over the clipboard (clipper); text hidden in variation
+  selectors, invisible operators, Hangul filler identifiers or agent-facing ANSI escapes.
+- `ST-SECRET-EXFIL` (JavaScript) now follows a name only in the block where it holds the
+  environment. A large bundle used to get this finding on one scan and not on the next. Every
+  scan now gives the same answer, and the false positive is gone.
+
+### Engine
+- A large component (200 files or 4 MB of text and up) is scanned by up to four worker
+  processes, one check per process. Results are used in the usual order, so the report is byte
+  for byte the same. Django's sdist went from 170 to 87 seconds, the `openai` package from
+  74 to 39. `SKILLTOTAL_WORKERS` sets the number (1 turns workers off). The CLI uses workers. A
+  program that calls the engine as a library gets one process unless it calls
+  `skilltotal.parallel.enable()`.
+- On Windows, a scan started from a background job no longer flashes console windows: the
+  workers run under `pythonw.exe`, and `git` and the hook's `taskkill` start without a window.
+
+### Plugin
+- The hook reads more install commands: `codex mcp add` and `gemini mcp add`; `npx skills add
+  owner/repo` (the repository's skills are checked, not only the installer) and `gemini
+  extensions install`; `volta install`; Deno's `npm:` packages (a module run from a URL counts as
+  a downloaded script); `pip download` and `pip wheel`, which run a source distribution's build
+  code; `easy_install`; `python setup.py install`/`develop`; `rye add`/`install`; `pixi add`.
+  The hook asks about a `claude plugin install`, a Smithery server, a JSR package and a conda
+  package from pixi, since it has no source to check for them. cmd's `call npm i x` no longer
+  hides the install. `tests/test_hook_conformance.py` pins all of this with a table of real
+  install commands, family by family.
+- Also read now: `pip-sync` (installs what `requirements.txt` lists); `hatch`, `tox` and `nox`,
+  which install what the project lists, and the commands they run; conda, mamba and micromamba
+  (a named conda package is asked about, an environment file is what the project lists, and
+  `conda run`'s command is read); PowerShell's `WebClient.DownloadFile` followed by running the
+  file (a downloaded script); `npm install -g` with no name (installs the project in this
+  folder). In CI each of these is denied unless `SKILLTOTAL_ALLOW_UNCHECKED` names its kind.
+- When an install registers an MCP server without a version (`claude mcp add x -- npx -y pkg`),
+  the console line says the server will run whatever release is current each time it starts,
+  not only the one checked now.
+- In CI the hook waits for the full check of a large package, up to 10 minutes by default and
+  14 at most (`SKILLTOTAL_HOOK_BUDGET`), instead of denying it after 60 seconds. Outside CI the
+  wait is unchanged. The plugin's hook timeout is now 15 minutes.
+
+### CLI
+- A source over a size limit is refused with its size, the limit and the setting that raises it
+  (`SKILLTOTAL_MAX_ARCHIVE_MB`, `_EXTRACT_MB`, `_ARCHIVE_MEMBERS`, `_CLONE_MB`, `_READABLE_MB`).
+  The hook names the same setting instead of saying the scan failed.
+
+## [0.65.0]
+
+Nothing the engine skips is skipped in silence, and agent auto-run commands are read. Ruleset 69.
+
+### Detection (ruleset 69)
+Details in `RULES_CHANGELOG.md`. Detection-efficacy corpus: 90 malicious and 62 benign samples,
+90/90 flagged, 0 false positives.
+- Every command an agent host or editor runs on its own is read with one parser: MCP server
+  launch commands (Claude, VS Code, Codex, Gemini and bundles), hooks (including http hooks),
+  status lines and helper commands, and the hooks, monitors, LSP and MCP servers of plugins,
+  skills and subagents. Reading a key, the whole environment or a CLI token and sending it out
+  from such a command is a malicious indicator (`ST-SECRET-EXFIL`), as is passing the whole
+  `process.env` / `os.environ` to a network call.
+- A JSON string that is a command is no longer read as a deny-list entry, so a credential path
+  inside an agent's launch command is no longer set aside for review.
+- Code in `env/`, `venv/` or `vendor/` is analyzed unless the folder is a real virtual
+  environment, and code loaded by path from a skipped folder is followed; what stays unread
+  gets a note.
+- A name bound to `__import__`, `importlib.import_module` or `getattr(<module>, ...)` and called
+  later is read as the call it resolves to.
+- A composite GitHub Action step that sends a CI token to a host outside GitHub is a malicious
+  indicator (`ST-ACTION-SECRET-EXFIL`).
+- An all-interfaces address inside the text of a warning or log message is no longer read as
+  a server bind.
+
+### Breaking for CI
+- **In CI the Claude Code hook denies what it could not check.** Strict mode is on when `CI` (or
+  `TF_BUILD`, `JENKINS_URL`, `TEAMCITY_VERSION`, `CODEBUILD_BUILD_ID`, `BUILDKITE`, `GITLAB_CI`) is
+  set. `SKILLTOTAL_STRICT=0` turns it off, and `SKILLTOTAL_STRICT=1` turns it on anywhere. In
+  strict mode the hook denies:
+  - everything it would otherwise ask about;
+  - installs that name no package (kind `lockfile`): `npm ci`, `npm install`, `pip install -r`,
+    `uv sync`, `poetry install`, updates, and `uv run` in a project;
+  - `pip install -e .` and other local paths (`local`);
+  - a downloaded script that is run (`script`);
+  - a package only partly analyzed (`partial`).
+
+  To let some of these kinds through, list them in `SKILLTOTAL_ALLOW_UNCHECKED` (any of
+  `lockfile`, `local`, `script`, `partial`), for example
+  `SKILLTOTAL_ALLOW_UNCHECKED=lockfile,local`. Without a working CLI, or with one older than the
+  plugin, every command is denied in CI.
+
+### Added
+- Every install command gets one line in the Claude Code console: what was checked and its score,
+  the decision, or what was not checked and why.
+- `skilltotal scan --fail-on-unanalyzed`, `fail_on_unanalyzed = true` in `.skilltotal.toml` and the
+  Action input `fail-on-unanalyzed`: exit 2 when part of the component could not be analyzed.
+- A text file too large to analyze (over 2 MiB) gets a `needs_review` note.
+- The report names code in C/C++, C#, Swift, Kotlin, Scala, Dart, Lua, Perl, Elixir, Groovy,
+  Haskell, Clojure, Erlang, R and Zig as not analyzed for behavior, as it already did for Go,
+  Rust, Java, Ruby and PHP. Scores do not change. A low verdict reads "Partially analyzed".
+
+### Changed
+- README and docs name exactly what each coverage row checks and what is not checked yet. A
+  skill's `allowed-tools` is described as what it is: it pre-approves tools and does not limit
+  the skill's code (`ST-SKILL-CAP-MISMATCH` text updated).
+
+## [0.64.0]
+
+Found while preparing the launch. Ruleset 68.
+
+### Detection (ruleset 68)
+Five constructs a blind red-team used to get past ruleset 67, each now read the way its plain form
+already was; details in `RULES_CHANGELOG.md`. Detection-efficacy corpus: 73 malicious and 50 benign
+samples, 73/73 flagged, 0 false positives.
+- A credential path joined onto the home directory (`path.join(os.homedir(), '.aws',
+  'credentials')`, `Path.home() / '.aws' / 'credentials'`) is judged like the written path.
+- Agent rule folders (`.clinerules/`, `.cursor/rules/`, `.windsurf/rules/`) are instruction
+  surfaces, and an instruction to send credentials out while keeping it from the user is prompt
+  injection.
+- Hex decoded and executed (`new Function(Buffer.from(h, 'hex').toString())()`, also across two
+  statements) is decode-and-execute, and forms a dropper with an install hook.
+- An all-interfaces address bound through a variable is network exposure.
+- An MCP tool description split across concatenated strings is read whole.
+- A provider SDK reading its own provider's credentials goes to review, and only for a name the
+  registry gives: a repository naming itself after a provider SDK gets no allowance.
+
+### Security
+- **A large package gets a verdict instead of the same question every time.** The hook killed a
+  scan at its deadline and kept nothing, so a package too large to check in the 20 seconds an
+  install command had was asked about on every attempt, downloaded and scanned again each time,
+  and never installed in `claude -p`, where a question becomes a denial. A check the hook stops
+  waiting for now goes on in the background, at most two at once and for up to 20 minutes, and
+  saves its verdict, so the same command run again is answered from it. The background processes
+  hold none of the hook's handles and outlive it; a check whose hook is gone (Esc, a timeout) is
+  adopted within the same two-at-once limit or stopped. All checks of one command share 60 seconds
+  (was 20; `SKILLTOTAL_HOOK_BUDGET` still sets it, up to 100); once a package is downloaded, its
+  size tells whether its check fits in the time left, and if not, the person is asked right away.
+  A package whose check would take more than 20 minutes is not started: the person is told to run
+  `skilltotal scan`. Every wait after the budget is bounded, so the hook answers within its budget
+  plus 5 seconds. The processes that finish a check act only on a check directory the hook created,
+  proved by a one-time secret passed in the environment.
+- **Deep nesting no longer hides what an agent config or a manifest sets up.** Python's json gives
+  up at a depth that depends on the interpreter and the platform (Python 3.14 on Linux read
+  100,000 levels that Python 3.10-3.13, and Windows, could not), so padding beside a hook in
+  `.claude/settings.json` or a server in `mcp.json` made the whole file unreadable on some
+  machines and hid what it configured, and the same component gave different reports by platform.
+  JSON a component ships, and registry documents built from it, are now read with a depth bound: a
+  value nested more than 200 levels deep is read as null, the rest of the file is analyzed, and the
+  report notes "Deeply nested JSON partly analyzed". A `claude mcp add-json` config beside such
+  padding is checked like any other, and a deep npm version document no longer breaks release
+  resolution in the hook.
+- **Many matches on one long line cost linear time.** Each match rebuilt its evidence from the whole
+  line, so a 60 KB line of repeated credential paths or injection phrases took over 100 s, in the
+  hook and in a hosted scan, where it held a scan slot until the timeout. A 2 MB line now scans in
+  about 10 s. Reports are unchanged.
+
+### Changed
+- The engine source carries no invisible or control characters; a test keeps it that way.
+
+## [0.63.0]
+
+Found by pre-launch reviews of 0.62.0. Ruleset 67.
+
+### Security
+- **What npm runs at install time is read and scored wherever it is filed**, including in the
+  package's build output and test folders, and through dependencies the package bundles. A NUL
+  byte no longer hides a JS, `.pth` or shell file from the scan.
+- **Code the scan could not read is never called clean.** A component of which no file could be
+  read gets the headline "Not analyzed - nothing in this component could be read"; files that
+  could not be read and links that were not followed are listed for review. `guard` blocks such
+  a component, and `--fail-on` fails on it, as both do on an install script the scan could not
+  analyze.
+- **Links do not lead out of the component.** Symbolic links and Windows junctions are not
+  followed: a repository could link a file to one elsewhere on the machine and have it quoted in
+  the report. A `package.json` that is a link is not read.
+- **Hostile archives fail cleanly.** A corrupt, truncated or password-protected archive is a
+  collection error instead of a traceback; links, FIFOs and devices inside a tar are never
+  extracted; size and entry limits apply while entries are read, so a compressed bomb stops at
+  the limit. MCP bundles (`.mcpb`, `.dxt`), wheels and `.vsix` files are recognized as zip
+  archives and scanned, not read as one binary file.
+- **Deep nesting degrades, never crashes.** A manifest, agent config or Python file nested
+  thousands of levels deep is reported as unparseable, and the rest of the component is still
+  analyzed.
+- **git:** the scanned repository's Git LFS settings are not followed (`GIT_LFS_SKIP_SMUDGE=1`),
+  and a sparse checkout path is passed after `--end-of-options`.
+- **`guard` blocks a name a letter or two from a popular package**, as the Claude Code hook asks
+  about it.
+- **The Claude Code hook reads a command line the way the shell does.** It split the line at
+  separators before reading quotes, so a quoted `;`, `|` or `&` anywhere in an install command
+  hid the install, and so did a line continuation, a keyword such as `then` or `do`, or a
+  comment. A one-pass lexer now reads quotes and escapes (including `$'...'` and PowerShell's
+  doubled and typographic quotes), line continuations, comments, here-documents, here-strings and
+  substitutions, and drops redirections by each shell's own rules. Installs inside `if`, loops,
+  `case`, functions, and a script piped or fed through a here-document to a shell are read. Each
+  difference found by running the same lines through Git Bash and Windows PowerShell 5.1 with
+  stub installers is a test.
+- **The hook asks when it cannot read what will be installed:** a package name or an install
+  command the line builds at run time (`npm i $P`; `eval "$C"` with `C` set on the same line; a
+  computed command or subcommand; a glob in a command name), an install inside a `node -e`,
+  `python -c` or similar one-liner, and a line it cannot read to the end (an unclosed quote).
+- **Every registry or index override asks**, on every install path: an environment variable
+  (`npm_config_registry`, scoped registries, `npm_config_userconfig`, `PIP_INDEX_URL`,
+  `UV_INDEX_URL` and their kin) and an abbreviated option as well as the full one.
+- **More of what installs is checked:** every `-p`/`--package` of `npx`, `bunx`, `npm exec`,
+  `pnpm dlx` and `yarn dlx`, and the program the runner starts; scaffolders (`npm create x`
+  checks `create-x`; `npm init` alone installs nothing); `python -m pip`, `uv tool install`,
+  `uv run --with`, `pipx run` and `pipx inject`, `poetry add`, `pdm add`, `pipenv install`;
+  `eval` and `trap` with literal text, aliases defined on the line, `xargs` fed by a literal,
+  `find -exec`, and launchers such as `timeout`, `nohup`, `watch` and `systemd-run`; on
+  PowerShell, `$r = npm i x` and `&` or `.` with a literal name.
+- **A failure of the hook's own asks** ("SkillTotal could not check this command") instead of
+  letting the command run with a warning. It never denies because of it.
+- **Parsing takes time linear in the length of the line.** A command naming 20,000 packages took
+  148 s, and a long run of `>` over two minutes: longer than Claude Code waits for the hook,
+  after which the command runs.
+- **A hook cache entry lives as long as its key allows** (a week for one exact release, an hour
+  otherwise), whatever the cache file says.
+- **Windows: no program starts from the current directory.** Windows looks there before PATH, so
+  a `git.exe` or `uvx.exe` committed to a scanned repository could run instead of the real one.
+  The CLI and the npm wrapper set `NoDefaultCurrentDirectoryInExePath`, and the wrapper looks up
+  `uvx`, `pipx` and Python only in PATH's absolute directories (Node before 22 ignores the
+  variable).
+- `guard --installed` escapes control characters in names read from agent configs: an escape
+  sequence in a server name could rewrite what the terminal showed.
+- **The MCP server survives malformed requests.** `params` that is not an object, JSON nested too
+  deep to decode, or a reply UTF-8 cannot carry gets a JSON-RPC error (-32602, -32700, -32603),
+  and the session goes on instead of ending.
+
+### Changed
+- **`--fail-on` counts risk, not capabilities.** The severity gate counted every finding: a shell
+  call or network access, which many tools exist to do, is high severity, so the GitHub Action's
+  default `fail-on: high` failed 21 of 31 popular components that score low. A malicious indicator
+  now trips any level (prompt injection is medium severity), a risky construct or a shipped secret
+  trips at its severity, and a capability never trips it on its own; a `block` policy still
+  forbids a capability rule. What the scan could not read fails it closed (above). Applies to
+  `--fail-on`, `--fail-on-high`, `fail_on` in `.skilltotal.toml` and the Action's `fail-on`.
+- Verdict headlines: "No malicious indicators - secret-like values found" (was "exposed secrets
+  found"); "Name resembles a popular package - check it before installing"; "Low risk - review
+  the findings before installing" where one risky construct read "No significant risks found".
+- The Action's pull request comment shows 🔴 and the verdict headline when malicious indicators
+  fired, finds its earlier comment on any page, and no longer fails a fork's job when the token
+  cannot comment.
+- Rule descriptions no longer name malware campaigns.
+- An `npm:` source fetches the one version document it needs instead of the package's whole
+  history (3 KB instead of 30 MB for a large package).
+- The hook does not check a program the project already has in `node_modules/.bin`, in the
+  working directory or a parent (on Windows also its `.cmd` and `.ps1` shims): `npx tsc` runs it
+  and installs nothing. A version or tag, `-p`, `pnpm dlx`, `yarn dlx` and `pnpx` still fetch, and
+  are checked.
+- The hook's note and questions name the release that was checked (`npm:x@1.2.3`, not
+  `@latest`), also when the answer comes from the cache, and a check that ran out of time says how
+  to allow more (`SKILLTOTAL_HOOK_BUDGET`, up to 100 seconds).
+
+### Added
+- `scan` shows what a long scan is doing, with the elapsed seconds, on one line that is erased
+  before the report, and only when stderr is a terminal. `analyze()` and `analyze_directory()`
+  take an optional `progress` callback.
+
+### Fixed
+- False positives on widely used packages (ruleset 67): a string split at `::`, a loop over literal
+  command names, MCP tool shapes quoted in comments, a dict parameter named like a network
+  library, example keys and public build variables. See `RULES_CHANGELOG.md`.
+- One long line no longer takes minutes to scan.
+- The sdist no longer ships the test suite (it could not run without its fixtures).
+- GitHub Release notes are the CHANGELOG section with wrapped lines joined.
+- Docs: report schema 1.7 documented in full; the registry survey names rulesets 56–59, says what
+  a re-run reads and that its rules were tuned on that population; `python -P -m skilltotal`.
+
+## [0.62.0]
+
+Found by pre-launch security reviews of 0.61.1. Ruleset 66.
+
+### Security
+- **The Claude Code hook no longer runs code from the project the agent works in.** It started its
+  scan with `python -m skilltotal` from the agent's working directory, and `python -m` puts that
+  directory first on `sys.path`: a `json.py` planted in an opened repository ran inside the
+  scanner before anyone approved anything, and the project's `.skilltotal.toml` tuned the scan of
+  someone else's package. The scan now starts in an empty directory of its own, with `-P` on Python
+  3.11+. The npm runner's Python fallback passes `-P` too, so it now needs Python 3.11+.
+- **A package can no longer silence its own findings.** A `skilltotal:ignore` comment suppressed a
+  finding in any scanned component, so one line next to a dropper made it scan clean. Inline
+  markers now count only for `skilltotal scan` of a local directory (your own code, as in CI).
+  `analyze` and `analyze_directory` take `inline_ignores`, off by default, and an honored marker is
+  counted in `metadata.suppressed_count`.
+- **The hook asks about every package it did not check.** A scan that failed or ran out of time,
+  the sixth and later packages of one command, and an install script that could not be read used
+  to let the install through with a note, which made the guard easy to step around: pad a package
+  until its scan times out, or name it sixth. They now need the person's approval. The hook still
+  never denies an install because of its own failure.
+- **The hook checks what will actually be installed.** The version a command names (`npx x@0.1.2`,
+  `pip install x==1.0`) instead of the latest release; the git ref (`github:o/r#v1`,
+  `git+https://github.com/o/r.git@main`) instead of the default branch; the real package behind an
+  npm alias (`x@npm:real`); and `pip install -e git+...`. Other git hosts (`gitlab:`,
+  `bitbucket:`, `gist:`) and refs the scan cannot reproduce exactly are asked about.
+- **The hook's verdict cache is keyed by the artifact.** An unpinned `npm:x` is first resolved to
+  the release the registry serves (`npm:x@1.2.3`), and a PyPI package to the file pip would
+  install, because a published PyPI version can gain files. A clean verdict from the morning no
+  longer vouches for a release published in the afternoon. An exact release is reused for a week,
+  a git repository or an unresolved name for an hour.
+- **The GitHub Action** passes its inputs to the shell only through `env` (a `source` copied from
+  a pull request comment could run commands in the runner), keeps the checked-out repository off
+  `sys.path`, fails on an unknown `fail-on` value instead of silently disabling the gate, and runs
+  the engine that ships with the pinned tag unless `version:` is set.
+- **Text reports escape control characters**, so a path or snippet from a scanned package cannot
+  move the terminal cursor, rewrite earlier lines or set the clipboard.
+
+### Changed
+- **The scripts npm runs at install are always analyzed**, whatever their shape. A minified
+  one-line `setup.js` run by `postinstall` was set aside as a bundle, so a dropper in it scanned
+  clean. An install script that cannot be read at all (larger than 2 MiB, binary) is reported,
+  makes `guard` block and makes the hook ask.
+- **PyPI packages are scanned as pip installs them**: the pure-Python wheel when it is the
+  release's only wheel, else the sdist, else any wheel, named by the registry. The sdist carried tests, docs and build
+  tooling that pip never installs, which slowed the hook (fastapi: 1,215 files, now 65) and
+  produced findings in code no user runs. A wheel's `*.dist-info/` is packaging metadata, like an
+  sdist's `PKG-INFO`.
+- **Source maps that carry no code are skipped.** A `.map` holding only positions and names, as
+  TypeScript writes it, cannot run and has nothing to analyze. A map with `sourcesContent`, or
+  anything else in it, is read like any file.
+- **npm dist-tags resolve.** `npm:x@latest` and `npm:x@next`, the usual way MCP servers are
+  started, scan the tagged version instead of failing.
+- **The text report** leads with the verdict, labels a capability finding as not scored
+  (`[HIGH - capability, not scored]`), shows a one-line location as `file:12`, and lists three
+  locations per finding (`--json` keeps all of them). Verdict reasons list malicious indicators
+  first, then scored risks, then capabilities.
+- **The hook's messages** name the release that was checked, the top finding of a high-risk
+  package and the command to inspect it (`skilltotal scan npm:x` instead of `<package>`).
+- **MITRE ATLAS tactics in the trait crosswalk are real ATLAS tactics.** "Adversarial Perception
+  Attacks" and "Model Poisoning" were labels from the CSA paper. An untrusted-instruction surface
+  now maps to Execution and Persistence (AML.T0051, AML.T0070, AML.T0099), supply-chain provenance
+  to Initial Access (AML.T0010).
+- A usage error (an unknown flag value) exits 1, as documented; 2 means a gate tripped. `guard`
+  names the malicious finding and its location instead of repeating the headline, and
+  `skilltotal scan lodash` suggests `npm:lodash` or `pypi:lodash`.
+
+### Fixed
+- **A redirected report no longer crashes on Windows.** Output goes out as UTF-8 and `--output`
+  is written before anything is printed, so `scan --json > r.json` on a legacy code page neither
+  fails on a snippet nor leaves the file empty.
+- **SkillTotal no longer rates its own repository as malicious.** `RULES_CHANGELOG.md` quotes the
+  attacks its rules detect, and the word "rules" made it read as an instruction file; a file whose
+  name ends in a record word (changelog, history, license) is documentation.
+- **False positives on widely used projects** (ruleset 66): an injection phrase quoted by an
+  issue-triage skill, a threat model's account of what attackers may do, a CLI's sandbox profile
+  that denies its tools the CLI's own login file, a `0.0.0.0` that is not a bind address, JSDoc
+  examples, and popular packages whose names sit a letter away from another popular name no longer
+  score. Each fix is pinned beside a test that the attack it resembles still fires. See
+  `RULES_CHANGELOG.md`.
+
+## [0.61.1]
+
+### Changed
+- **The Claude Code plugin says what it found when it blocks an install.** The deny reason now
+  names the first malicious-indicator finding and where it is (`Decode-and-execute (obfuscated
+  execution) at scripts/setup.js:4`, plus how many more there are) instead of only the verdict, so
+  the agent can tell the person exactly why the package was stopped. The path comes from the
+  scanned package, so it is quoted as data and shown only when it is a plain path: a file name
+  written as an instruction to the agent is left out. `skilltotal scan` still lists every finding.
+  Detection is unchanged (ruleset 65).
+
+### Fixed
+- **CI tests the npm runner against the engine in the same commit.** The runner prefers
+  `uvx`/`pipx`, which fetch the matching release from PyPI, so the end-to-end tests ran the last
+  release on ordinary commits and failed on every release commit, whose version is published only
+  after its tag. The test step now keeps only Python and Node on `PATH`.
+
+## [0.61.0]
+
+### Fixed
+- **The ruleset 64 rules can no longer be sidestepped by rewriting the same code** (ruleset 65).
+  A security review of 0.60.0 found ways around each new rule that change nothing about what
+  runs. A composite action's `run:` command is now read as the runner's shell receives it, so a
+  command written as a quoted or escaped YAML string (`\u007C` for `|`), continued on the next
+  line, placed in a flow mapping (`{ run: … }`), behind an alias or under a quoted key is read
+  like any other, and a `#` inside shell quotes no longer hides the rest of the line. An action
+  under `.github/` is now read too and shown for review instead of being left out. A function
+  looked up by name (`getattr(os, "sys" + "tem")`, `__import__("os").system`) resolves to the
+  function itself, which also closes a known gap in Python shell detection; `os.exec*`,
+  `os.spawn*` and `subprocess.getoutput` now count as process execution. A pickle gadget is
+  caught when the callable is aliased first, set with a lambda, or registered with
+  `copyreg.pickle`. A `dns` or `https` module bound under any name counts as network egress.
+  Each case has an honest look-alike that stays clean: a commented-out command, custom pickling
+  that returns the class, an e-mail validator that looks up MX records.
+
+## [0.60.0]
+
+### Added
+- **Four gaps found by a blind red-team are closed** (ruleset 64). Ten malicious AI components
+  were built without reference to the rules and then scanned; these four went unseen or
+  under-read. A composite GitHub Action's `run:` steps are now scanned as shell: they run on the
+  runner of whoever uses the action, yet were never read, so `curl … | bash` or `… base64 -d |
+  bash` in an `action.yml` produced no finding (the project's own `.github/` CI stays out of
+  scope). DNS lookups (`dns.resolve4`, `dns.lookup`) now count as network egress, so reading a
+  credential and tunnelling it out over DNS is flagged as exfiltration. A pickle `__reduce__` that
+  returns a shell or code-execution callable is flagged as a code-execution gadget
+  (`ST-PICKLE-REDUCE`). A Solana CLI keypair read through `os.homedir()` instead of `~` is now
+  recognized as a credential path. Each sits beside the honest shape it resembles, which stays
+  clean: a DNS health check, custom pickling that returns the class, a security tool that lists
+  wallet paths to protect. An ordinary setup action that installs a CLI with its vendor's script
+  is reported as a risky construct but not escalated to malicious or high risk.
+
+## [0.59.0]
+
+### Added
+- **Four more 2026 attack techniques are detected** (ruleset 63). A wallet private key, seed
+  phrase or mnemonic read from an environment variable is now a sensitivity signal
+  (`ST-SECRET-ENV`), so reading one and sending it off-host is flagged as credential
+  exfiltration. Code that writes a server into another AI client's MCP config
+  (`ST-AGENT-CONFIG-INJECT`) or repoints git's global template/hooks path for persistence
+  (`ST-GIT-HOOK-PERSIST`) is flagged (SANDWORM_MODE). An Agent Skill that auto-runs a `!`
+  dynamic-context command to steal a token or fetch-and-run code is flagged as malicious
+  (`ST-SKILL-DYNAMIC-EXEC`, Clawsights). Each sits beside the honest shape it resembles — a local
+  husky `core.hooksPath`, a tool that only reads a client config, a benign `!`git status``
+  skill command, a plain `API_KEY` from the environment — which stay clean.
+- **Detection now sees through split and aliased literals.** An attacker can hide a known string
+  from a static matcher by splitting it across concatenated string literals
+  (`process.env["WALLET_" + "PRIVATE_KEY"]`, `open("~/." + "ssh/id_rsa")`) or aliasing the object
+  that holds it. A new deterministic normalizer folds adjacent string-literal concatenations back
+  into one literal (and resolves `process.env` aliasing) before matching, so the credential-path,
+  wallet-env and client-config rules catch these without re-leaking evidence — the string-concat
+  analogue of the homoglyph/zero-width folding already in place. It only joins runs of plain
+  literals, so it adds no false positives. A new per-technique evasion-robustness benchmark guards
+  this going forward.
+
+## [0.58.0]
+
+### Added
+- **Reports now say when code was not analyzed for behavior.** Shell execution, network access,
+  file access and dynamic code are detected only in Python and JavaScript/TypeScript. Before this
+  release, a Go server that ran a shell command and posted a credential file could score "low"
+  under "No malicious indicators", and nothing in the report showed that its Go code was never
+  read. Now a component that ships Go, Rust, Java, Ruby or PHP source (test code excluded) gets a
+  `needs_review` note with the file count per language. A low verdict's headline reads "Partially
+  analyzed - Go code not checked for shell, network or file access". The verdict carries the counts
+  in a new optional `unanalyzed_code` field (report schema 1.7, additive). Score and findings do
+  not change.
+- **npm package.** `npx -y skilltotal ...` runs this engine through uvx, pipx or an installed
+  Python. The npm package contains no scanner code and does not install anything itself. It has
+  no install scripts or dependencies. See `npm/README.md`.
+
+## [0.57.0]
+
+### Changed
+- **Review notes are grouped.** Five review-only heuristics used to write one `needs_review`
+  note for every file or line they matched: unparseable Python files, dynamic imports, large
+  base64 blobs, runs of hex escapes, and files with bidi/zero-width characters. One package could
+  carry hundreds of identical notes (352 for one linter's deliberately broken test fixtures).
+  Each heuristic now writes a single note that says how many places matched, names the first
+  five as `file:line`, and says how many of the files are test code. Findings, capabilities and
+  the score are unchanged; the report schema is unchanged.
+
+## [0.56.4]
+
+### Changed
+- **The plugin lives in `plugin/`.** The marketplace now serves only the plugin's own files (the
+  manifest, the hook, the `/skilltotal:scan` command and a listing icon) instead of the whole
+  repository. Install commands stay the same. To update an installed copy, run
+  `/plugin marketplace update skilltotal`, then `/reload-plugins`.
+
+### Docs
+- README: the Claude Code plugin has its own section after Install.
+
+## [0.56.3]
+
+### Fixed
+- **The plugin checks commands the agent runs through PowerShell.** On Windows, Claude Code runs
+  most commands through its PowerShell tool, but the hook only listened to the Bash tool, so
+  installs run through PowerShell went unchecked. The hook now covers both tools. The CLI also
+  reads PowerShell quoting (a backtick escapes, a backslash is part of the path), the `&` call
+  operator, script blocks, `iex`/`Invoke-Expression`, `Start-Process` and
+  `powershell -EncodedCommand`. In Bash, it now also finds commands inside parentheses and
+  braces, such as `(npm i x)`.
+
+### Docs
+- README: after installing the plugin, run `/reload-plugins` or restart Claude Code. Until then,
+  the hook does not check commands in the session that installed it.
+
+## [0.56.2]
+
+### Changed
+- **The plugin warns when it can't check an install.** If the `skilltotal` CLI is not on PATH or
+  fails to run (a stale virtualenv, or an older version without the `hook` command), install
+  commands still run, and Claude Code now shows a warning that names the cause and suggests
+  `pip install -U skilltotal`. Before, the hook stayed silent, which looked the same as a clean
+  check. Other commands get no warning.
+
+## [0.56.1]
+
+### Fixed
+- **The plugin's hook passes every Bash command to the CLI.** The wrapper skipped commands that
+  did not contain a package manager's name as typed, so `NPM install x` (which Windows runs) and
+  quote-split names such as `n''px x` reached the shell unchecked. The CLI's parser already
+  handled both and now sees every command.
+- **Hook reasons read as plain sentences.** The risk score appears once, every part ends with a
+  full stop, and a package from a custom index no longer suggests running `skilltotal scan`,
+  which could not see it either.
+- **The plugin manifest carries the engine version**, so an installed plugin updates with each
+  release, in step with the CLI that answers its hook. `claude plugin validate --strict` passes.
+
+### Docs
+- README: how to check that the plugin works, why a custom registry asks for approval, how GitHub
+  sources are scanned, and what the hook does not cover.
+
+## [0.56.0]
+
+### Added
+- **Claude Code plugin.** The repository is now also a plugin marketplace
+  (`/plugin marketplace add pezhik/skilltotal`). The plugin's hook checks each package the agent
+  is about to install through `npx`, `bunx`, `pnpm dlx`, `npm`, `pnpm`, `yarn`, `bun`, `pip`,
+  `uv`, `uvx`, `pipx` or `claude mcp add`. Packages with malicious indicators are denied, high-
+  and critical-risk ones need approval, and clean ones run with a one-line note showing the
+  score. All checks for one command share a 20-second budget (`SKILLTOTAL_HOOK_BUDGET`). A check
+  that runs out of time or fails never blocks the install. Verdicts are cached for 24 hours per
+  engine version. The plugin also adds `/skilltotal:scan` and registers the SkillTotal MCP
+  server. It needs the CLI (`pip install skilltotal`).
+- **`skilltotal hook claude-code`**, the CLI entry point behind the plugin's hook. It reads the
+  hook event on stdin, prints Claude Code's hook answer and always exits 0.
+
+## [0.55.0]
+
+### Added
+- **A component's `.git/config` is checked for `core.fsmonitor`** (GitSpawn, 2026): git runs that
+  command on ordinary `status`/`diff` calls, which several AI coding agents make at session
+  startup. The file is read for this check only and is not component content for any other rule,
+  so a token in the remote URL of a project being scanned locally is never reported as an embedded
+  secret. Ruleset 62.
+- **A Claude Code plugin's own hook manifest is read** (`hooks/hooks.json`,
+  `.claude-plugin/plugin.json`; HookPry, 2026). A hook that fetches or decodes code and runs it is
+  a malicious indicator; an ordinary hook is listed for review with its commands and is not
+  scored. Ruleset 62.
+- **More credential paths and a scanner-evasion variant**: the Vault CLI token, the Hugging Face
+  CLI token and SSH key paths built from path segments; a decode function looked up through
+  `getattr()`/`__dict__`/`vars()` and executed. Ruleset 62.
+
+### Changed
+- **Strings returned by an MCP tool or prompt function are read as text the model sees**, like
+  its docstring, so a poisoning phrase built at call time is no longer dismissed as a string
+  literal. Ruleset 62.
+
+## [0.54.0]
+
+### Fixed
+- **MCP servers written on the SDK's low-level API were not recognised as MCP servers**,
+  including the official git, time and fetch reference servers, Python SDK 2.0 servers, proxies
+  such as mcp-remote, FastMCP servers that register tools with `add_tool`, and NestJS mcp-nest
+  servers. Ruleset 61.
+- **Running git through GitPython or simple-git now counts as command execution**; the git
+  reference server previously reported no capability at all.
+- **`from .sh import x` / `from .git import x`** (a package's own module) no longer reads as a
+  process-spawning library.
+
+### Added
+- **A note when an MCP package ships no server code the engine can read** (a launcher for a
+  native binary or another package, or a server in a language not analyzed yet), so the report
+  no longer looks empty and clean. It is a `needs_review` entry and never affects the score.
+
+## [0.53.0]
+
+### Changed
+- **Dev-only floor pins on `urllib3` (>=2.8.0) and `virtualenv` (>=21.7.13)**, pulled in
+  transitively by `twine`/`detect-secrets` and `pre-commit`. Fixes CVE-2026-97687/88/89 and
+  PYSEC-2026-4011/4012/4013/4014 in the dev toolchain; the published package stays
+  zero-runtime-dependency and is unaffected.
+
+### Fixed
+- **A provider token made of one repeated character is a placeholder, whatever its prefix.**
+  `ghp_` followed by 36 copies of one letter was reported as a live credential: the
+  "too few distinct characters" test counted the prefix, and `ghp_` alone contributes four of
+  the five. Found in a redaction linter's own sample line, reported by its author. The body
+  behind a provider prefix (`ghp_`, `github_pat_`, `sk-ant-`, `xoxb-`, ...) is now judged on its
+  own as well; a real token's body is random and is unaffected. Ruleset 60.
+
+## [0.52.0]
+
+### Added
+- **A second size limit, on the readable text rather than the checkout**
+  (`SKILLTOTAL_MAX_READABLE_MB`). The existing limit bounds the clone — disk, bandwidth, the
+  time git spends — and the new one bounds the scan, because the two are not the same
+  constraint and one number cannot serve both. A repository of video is expensive to clone and
+  trivial to scan; one of pure source is the reverse, and scan time tracks only the part an
+  index opens.
+
+  It defaults to the clone limit, where it can never fire on its own (readable bytes are a
+  subset of the tree), so the offline CLI is unchanged unless it is set. What it is for is a
+  deployment that kills a scan at a wall clock: without it such a host accepts a repository it
+  has no chance of finishing and times out, which reads as a broken scanner rather than a
+  repository that is too big. The gap is real and not hypothetical — `apache/spark` is a 196 MB
+  checkout, comfortably inside a 200 MB clone limit, holding 169 MB of text, which at the rate a
+  long scan runs is about sixteen minutes.
+
+  The estimate stays conservative in the safe direction: a file whose suffix is not recognised
+  counts as readable, so the limit can refuse a scan that would have run but never admits one
+  that cannot finish.
+
+## [0.51.0]
+
+### Added
+- **`collect()` can report how much work a scan is about to be.** A new optional `on_size`
+  callback is handed a `TreeSize` — the bytes of the checkout, and the subset an index will
+  actually read — once a GitHub repository has passed the size check and before the clone
+  starts. It exists so a caller running scans as jobs can tell someone waiting roughly how long
+  is left; the library still neither prints nor blocks. The callback is not invoked for a local
+  directory, a registry package, a non-GitHub host, a refused repository, or when the API cannot
+  answer, so callers must treat its absence as ordinary.
+
+  Readable bytes are reported because the size of a checkout does not predict how long scanning
+  it takes. Measured over five real repositories: 257 MB scanned in 47 seconds while 104 MB took
+  326, because the first is video and the second is source. Readable bytes predict the same five
+  to within a factor of two. The **size limit is unchanged** and still applies to the whole tree.
+
+## [0.50.2]
+
+### Changed
+- **A repository that is too large now says how large.** `SourceTooLargeError` carries
+  `measured_mb` and `limit_mb` as data rather than only inside its message, so a caller can tell
+  someone they are 2 MB over a 200 MB limit instead of "too large" — which, for the visitor whose
+  repository came to 202 MB, was a dead end with a working answer one folder away.
+
+## [0.50.1]
+
+### Fixed
+- **Cloning a repository that contains a very long path no longer fails on Windows.** Real
+  projects hold file names past Windows' ~260-character limit — one machine-learning repository
+  reaches it with a single result file named after five models — and `git clone` refused them with
+  "unable to create file". The same scan succeeded on Linux and macOS, so the failure read as a
+  broken tool rather than a platform limit. Every git command the collector runs now carries
+  `core.longpaths`, passed per command so the machine's own git configuration is left untouched.
+
+## [0.50.0]
+
+### Fixed
+- **A repository is measured by what will be scanned, not by its history.** The pre-clone size
+  check read GitHub's `size`, which is the whole history: a 24 MB checkout behind a 202 MB history
+  was refused as "too large". The check now sums the blobs of the requested branch (GitHub trees
+  API) and falls back to the history size only when the tree cannot be listed. The mid-clone
+  watchdog no longer counts `.git/` toward the limit either (a shallow clone's pack is a second,
+  compressed copy of the tree); the pack itself stays bounded at twice the limit.
+- **A subfolder link costs that folder.** `/tree/<ref>/<path>` and `/blob/<ref>/<file>` links
+  used to clone the whole repository and measure all of it, so "try a specific subfolder" did not
+  help. The size check now measures the folder, and the clone is a sparse checkout of it — on
+  GitHub and GitLab a partial clone (`--filter=blob:none`) that downloads only its files.
+
+### Performance
+- **Non-ASCII text no longer costs a character at a time.** `normalize_with_map` copies ASCII
+  runs in one piece and loops only over the non-ASCII runs; the hidden-Unicode scanner skips files
+  and lines that hold none of the code points it acts on (one regex search instead of a Python
+  loop per character). Output is identical; on a 24 MB, mostly-CJK repository the two accounted
+  for 200 s of a 500 s scan.
+
+## [0.49.0]
+
+### Fixed
+- **A method named `exec` is not a shell (ruleset 59).** `ST-SHELL-NODE` matched any `exec(` or
+  `spawn(`, so `re.exec(text)` — `RegExp.prototype.exec` — and database calls such as
+  better-sqlite3's `db.exec` and mongoose's `query.exec()` were reported as Node.js shell execution.
+  A call site now counts only where it can be tied to `child_process`: spelled out, or in a file
+  that imports it, as a bare call or through the alias that file bound. `ST-CMDI-NODE` takes the
+  same call sites, so `db.exec(\`CREATE TABLE ${t}\`)` is no longer command injection. `Bun.spawn`
+  is matched explicitly.
+- **Recorded experiment output is data (ruleset 59).** `experiments/` joins the data-corpus
+  directories: its non-code files are demoted to needs_review, as under `eval/` or `fixtures/`. An
+  ASCII-smuggling study was verdicted malicious on the model outputs it had measured. Code in the
+  same tree is still scanned and scored.
+
+### Performance
+- **Scans of non-ASCII text use a fraction of the memory.** The de-obfuscation offset map held a
+  Python int per character and was cached for every non-ASCII file: a 22 MB repository peaked at
+  338 MB and failed the hosted scan's 400 MB cap. The map is now a packed `array('I')`, and ASCII
+  characters skip Unicode normalization. The same repository peaks at about 155 MB, and
+  normalization itself runs 3–4× faster; results are unchanged, which a test pins against the
+  previous implementation.
+
+## [0.48.3]
+
+### Fixed
+- **The high tier of the registry survey, read by hand (ruleset 58).** Five shapes still read as
+  behaviour: a command printed through several arguments (`printf "%s" "$C" "curl … | bash"`), a
+  PowerShell `#` comment, a sentence in Chinese or Japanese around a credential path, a filename
+  compared against a literal (`strcmp(lower, "id_rsa")`), and a log redirected into `/tmp`
+  (`nohup … > /tmp/x.log &`, where the idiom is running FROM /tmp).
+
+## [0.48.2]
+
+### Fixed
+- **A command printed for a person is not a command the line runs (ruleset 57).** An installer that
+  prints `curl … | sh` or `powershell -c "irm … | iex"` as a hint (`echo`, `Write-Host`, `print`,
+  `console.log`) scored as remote pipe-to-shell and as a defense-evasion idiom. A match inside such
+  an argument is demoted for every rule that already treats strings as non-code.
+- **Instance metadata is a credential read only when it asks for credentials (ruleset 57).** A
+  node's own bootstrap script reads its instance id, region or an IMDSv2 session token from
+  169.254.169.254. `ST-SENS-PATH` / `ST-SENS-PATH-PY` now need the request to target the role's
+  credentials (`iam/security-credentials`, a service-account token, the Azure identity endpoint).
+
+## [0.48.1]
+
+### Fixed
+- **Parsing a URL is not network egress (ruleset 56).** `urllib.parse` and `urllib.error` counted
+  as an HTTP client, so a component that only splits URLs read as "can reach the network" and could
+  supply the egress half of `ST-COMBO-EXFIL`. Only `urllib.request` (and aliases of it) counts now.
+- **Writing a credential file is not reading one (ruleset 56).** A release script putting
+  `$NPM_TOKEN` into `~/.npmrc`, or an installer appending to `~/.ssh/authorized_keys`, fed both
+  `ST-COMBO-EXFIL` and the `ST-INSTALL-DROPPER` payload. A write is excluded from both;
+  `ST-SENS-PATH` still reports the line, because writing `~/.ssh/config` is an injection vector.
+
+## [0.48.0]
+
+### Changed
+- **Exposed secrets are their own class and no longer raise the risk score (report schema 1.6,
+  ruleset 55).** A hardcoded key, private key or packed `.env` file is the author's leak, not a risk
+  the component poses to the machine it runs on. `ST-SECRET-EMBEDDED` and `ST-ENV-SHIPPED` now carry
+  `threat_class: "exposure"`: reported with file and line, counted in `verdict.exposed_secrets`,
+  still tripping `--fail-on high`, and contributing nothing to `risk_score`. An embedded secret no
+  longer feeds `ST-COMBO-EXFIL`, which now means what its name says: a credential location read
+  next to network egress. Consumers that switch on `threat_class` must handle the new value.
+
+### Fixed
+- **The high and critical tiers of the registry survey, read by hand (ruleset 54).** Nearly every
+  high or critical component got there through `ST-COMBO-EXFIL`, and its inputs often named a
+  credential without touching one. Credential paths that are installed public keys, a key handed to
+  the SSH client, a sentence of help text, a UI label, a denylist or policy glob, or a line in a
+  manifest no longer feed the combination. Secret-shaped values that are test placeholders, fixture
+  and test-runner values, secret-scanner configuration, variable names, typed words, or client keys
+  vendors publish in pages (Firebase web config, Maps JavaScript loader, Paddle.js, Cloudflare Web
+  Analytics, OpenAI apps domain challenge) are reported for review instead of scored. Hardcoded
+  live keys and shipped private keys still score. Every corpus attack and published-technique probe
+  is still caught.
+- **Evidence is capped after demotion, not before.** Scanners kept only the first 25 matches of a
+  rule, and the engine then moved test, documentation and string matches to review. When those
+  filled the 25 slots, a real match later in the component was never considered, and the finding
+  disappeared. Scanners now collect up to 500 matches (`MAX_EVIDENCE_SCANNED`) and the engine keeps
+  25 after demotion. Reports still show at most 25 per finding.
+
+### Added
+- `IndexedFile.string_span_at()`: the span of the Python or C-family string literal around an
+  offset.
+
+## [0.47.2]
+
+### Fixed
+- **Defensive MCP tools quoting "ignore previous instructions" are not poisoned (ruleset 53).**
+  Ruleset 52 widened the poisoning phrase to "ignore previous/prior/system instructions"; four
+  registry servers that describe the phrases they block were then flagged. The MCP rule is back to
+  the tool's own instructions; "ignore previous instructions" stays with `ST-PROMPT-INJECTION`,
+  which tells a cited example from a directive.
+
+## [0.47.1]
+
+### Fixed
+- **All seven malicious-indicator hits in the ruleset-51 registry survey were false positives;
+  each class is fixed (ruleset 52)**: `re.compile` strings, suffix-less shell scripts, multi-line and
+  raw Rust strings, modal "could exfiltrate", and bare "ignore instructions", in addition to the two below.
+- **Two false positives found by the ruleset-51 registry survey (ruleset 52).** An agent guide
+  saying "pass `authToken` as parameter; use `Authorization: Bearer ${token}` header" matched the
+  environment-secret-in-requests phrase case-insensitively; the secret must now be written as an
+  environment variable (`$FOO_KEY`, or "environment variable FOO_KEY", upper case). A structured
+  tool docstring's `<instructions>` section ("Use this when the user wants...") read as a hidden
+  instruction block; "when" and "make sure" no longer count as the instruction after a marker.
+  Every published attack shape in the corpus is still caught.
+
+## [0.47.0]
+
+### Added
+- **Detection for the attack techniques published against AI components in 2026 (ruleset 51).**
+  Each was reproduced as an inert sample and checked against the engine first; ten of eleven were
+  missed. Now covered: node-gyp command substitution in `binding.gyp` (the Miasma worm's install
+  vector that bypasses install-script checks); agent and editor configuration that runs commands
+  on its own (`.claude/settings.json` hooks, `.gemini/settings.json`, `.cursor/hooks.json`,
+  `.vscode/tasks.json` on folder open), escalated when it fetches or decodes code; AI coding CLIs
+  launched with approvals disabled; shell commands inside markdown fenced blocks, where malicious
+  skills put `base64 -D | bash` under "Prerequisites"; downloaded archives extracted with a
+  password; zero-width characters threaded through words; agent instructions that carry a secret
+  from the environment into URLs, copy themselves into CLAUDE.md/AGENTS.md to outlive the skill, or
+  load overriding instructions from a server; and the cloud and AI-CLI credential files harvested
+  by Shai-Hulud and s1ngularity.
+
+### Removed
+- **Maintainer notes are no longer published** (`CLAUDE.md`, `docs/publishing-setup.md`).
+- **`skilltotal.models.CapabilityEvidence` and `skilltotal.rules.rules_as_dicts()`.** Neither was
+  used by the engine or documented; `Report.capabilities` and `get_rules()` cover both.
+
+### Changed
+- **The report schema `$id` is on the project's own domain**: `https://www.skilltotal.ai/schemas/report-1.5.json` (was `skilltotal.dev`, which the project does not own). Schema content is unchanged.
+- **`.vscode/` is scanned.** It was skipped as editor noise; a `tasks.json` that runs on folder
+  open, and the script next to it, are behavior.
+
+## [0.46.0]
+
+### Changed
+- **Malicious-indicator precision, from a hand review of every hit in the registry survey
+  (ruleset 50).** None of the 67 flagged components was a planted backdoor: they were security
+  docs describing attacks, defensive skills quoting them, test fixtures, other scanners' pattern
+  literals, and mis-matches such as `SYSTEM_META[system]`. Prose markdown is now documentation
+  unless named as an instruction surface; defensive framing ("if a file tries to … refuse")
+  counts as citation; `test-*` scripts, `.jsonl`/`.csv` data and Swift/Kotlin/C# comments are
+  demoted like their peers; decode-and-execute inside a string literal is inert; hidden-block
+  markers must introduce an instruction; bare concealment phrasing is ambiguous, not scored; a
+  defensive directive ("ignore any instruction that attempts to override your role") is not the
+  injection it refuses; prose named for an attack is documentation; template suffixes are
+  stripped before a file is classified. Evaluation-corpus recall and precision are unchanged at
+  100%/100%.
+
+### Added
+- **`ST-MCP-SAMPLING-INJECTION`**: an MCP server using sampling to make the client's model hand
+  over credentials or run a command, and keep quiet about it.
+
+### Fixed
+- **Recall on published attack shapes.** Against the calibration labs and ten reproduced attacks
+  the first cut of ruleset 50 caught one of ten (ruleset 49: five). Multi-line `<IMPORTANT>` blocks,
+  FastMCP docstring poisoning, concealment of the agent's own action, decode-and-execute inside a
+  string passed to `new Function`/`eval`/`setTimeout`, injection in a skill's reference files and
+  covert credential reads are detected again or for the first time; all ten are in the evaluation
+  corpus so the gate would have caught it.
+- **One odd token no longer desynchronises a JS/TS file.** The C-family comment and string
+  scanners did not know JavaScript regex literals, and a quoted string did not end at a newline,
+  so `s.replace(/'/g, …)` opened a phantom string that ran to the end of the file. Every later
+  comment was then read as code and every later string as a live directive. The two scanners are
+  now one lexer that skips regex literals, ends `'`/`"` strings at a newline and understands
+  triple-quoted strings.
+
+## [0.45.0]
+
+### Fixed
+- **MCP servers on the current TypeScript SDK are detected (ruleset 49).** `new McpServer(` and
+  `server.tool("…")` now count as a tool surface; before, such a server with benign tool names
+  produced no MCP finding. A sample of registry entries that read as "no MCP tools" was two-thirds
+  real SDK servers, most of them this gap.
+- **A NUL byte deep inside a bundled script no longer discards the file.** The binary sniff is
+  git's (NUL within the first 8,000 bytes) instead of the whole file, so `dist/*.js` with a NUL in
+  a string literal is scanned like any other source.
+
+## [0.44.0]
+
+### Changed
+- **Fixtures in a `test-site/` (or `test_data/`, `spec-helpers/`) directory no longer score
+  (ruleset 48).** The test-path rule matched only the suffix form of a compound segment, so a
+  directory a project builds *for* its tests was read as shipped behaviour. A web scraper's
+  `apps/test-site/` — a site it ships to exercise its own scraper, containing a deliberate
+  prompt-injection sample — was scored as a malicious indicator against the project. The word
+  boundary that keeps `latest` and `contest` out of the suffix form now guards the prefix form too.
+
+## [0.43.1]
+
+### Fixed
+- **The GitHub Action reported nothing on the builds it failed.** GitHub runs `shell: bash` as
+  `bash -eo pipefail`, so the gated scan aborted its step the moment it found a high-severity
+  finding — before the exit code could be captured. The action still failed the build, but the
+  `risk-score` and `risk-level` outputs came back empty exactly when there was a risk to report,
+  and the gate step ended in `exit: : numeric argument required` instead of naming the finding.
+  The gate now captures its status with `|| GATE_EXIT=$?`, and an unset status is reported as an
+  incomplete scan rather than passed to `exit`.
+
+### Added
+- **CI exercises `action.yml` end to end.** The action is a shipped artifact that pytest cannot
+  reach; it is now run against a clean and a risky fixture, asserting that the gate fails the build
+  *and* still reports the risk, and that `fail-on` changes only the exit status, never the verdict.
+
 ## [0.43.0]
 
 ### Added
@@ -37,7 +1810,7 @@ All notable changes to the SkillTotal engine. Format loosely follows
   kind. PostHog project keys (`phc_`, documented as safe to expose in client code) and base58
   on-chain addresses (a Solana program id or mint — public data, and length-bounded so a keypair
   still counts) now join the Algolia DocSearch and client-telemetry keys the scanner already
-  recognised. `browser-use` went `high` → `low`, `zeta-chain/cli` `high` → `low`.
+  recognised.
 - **A comment mentioning `eval` was read as dynamic execution.** `ST-DYN-NODE` declared no
   code-context policy, so `// guarded string eval (no DOM types)` matched — the same demotion the
   exposure and shell rules already use now applies.
@@ -100,7 +1873,7 @@ All notable changes to the SkillTotal engine. Format loosely follows
 - **Prompt-injection FP: negation-guarded exfil directive (ruleset 42).** "never/cannot/does not
   exfiltrate ... to ..." defensive prose in agent prompts no longer raises `ST-PROMPT-INJECTION`
   (and no longer escalates into `ST-FLOW-TRIFECTA`/a `malicious` verdict). Found by the
-  reputable-corpus tripwire (claude-blog). See `RULES_CHANGELOG.md`.
+  reputable-corpus tripwire. See `RULES_CHANGELOG.md`.
 
 ## [0.38.0]
 
@@ -164,69 +1937,69 @@ All notable changes to the SkillTotal engine. Format loosely follows
 - **Ruleset 39 — two embedded-secret false positives (closes the tripwire secret sub-cluster)**
   (see `RULES_CHANGELOG.md`): (1) a secret next to a client-telemetry ingestion URL
   (`*.client-telemetry.<vendor>/enqueue`) is a publishable key (Sentry-DSN class) →
-  `needs_review`, not scored — snowflake-connector-python's `telemetry_oob.py`; (2) a
+  `needs_review`, not scored — a database connector's `telemetry_oob.py`; (2) a
   `testing_utils.py` / `test_utils.py` module is recognised as test-support code so a hardcoded CI
-  token there is demoted — transformers' `src/transformers/testing_utils.py` `hf_` token. Recall
-  preserved (secret without a telemetry URL, and non-test `*_utils.py`, still score).
+  token there is demoted — a machine-learning library's `hf_` token in its `testing_utils.py`.
+  Recall preserved (secret without a telemetry URL, and non-test `*_utils.py`, still score).
 
 ## [0.34.6]
 
 ### Fixed
 - **Ruleset 38 — sensitive-path precision + provider-SDK credential-domain calibration** (see
   `RULES_CHANGELOG.md`), clearing the `ST-SENS-PATH` → `ST-COMBO-EXFIL` false-positive cluster from
-  the reputable-corpus tripwire (botocore, awscli, docker, dulwich, gcsfs, pyarrow, pyzmq). Three
-  coordinated fixes: (1) `~/.ssh/known_hosts` (public host keys) is no longer treated as a
-  credential; (2) a credential token as a `.json`/`.yaml` string value is inert data, not path
-  access (botocore ships the AWS API models under `botocore/data/*.json`); (3) a provider SDK
-  reading its OWN provider's credentials (botocore→`~/.aws`, docker→`.docker/config`, …; a curated
-  exact-name allowlist) no longer synthesizes the exfil combo. Recall preserved: off-domain access,
-  non-SDK packages reading any credential path, embedded secrets, and SSH-config writes all still
-  fire (efficacy 100% recall / 0 FP).
+  the reputable-corpus tripwire (seven widely used cloud, container, git, data and messaging
+  libraries). Three coordinated fixes: (1) `~/.ssh/known_hosts` (public host keys) is no longer
+  treated as a credential; (2) a credential token as a `.json`/`.yaml` string value is inert data,
+  not path access (an AWS SDK ships its API models as `data/*.json` files); (3) a provider SDK
+  reading its OWN provider's credentials (AWS SDKs→`~/.aws`, Docker clients→`.docker/config`, …; a
+  curated exact-name allowlist) no longer synthesizes the exfil combo. Recall preserved: off-domain
+  access, non-SDK packages reading any credential path, embedded secrets, and SSH-config writes all
+  still fire (efficacy 100% recall / 0 FP).
 
 ## [0.34.5]
 
 ### Fixed
 - **Ruleset 37 — test-certificate private keys no longer scored** (see `RULES_CHANGELOG.md`),
   a false positive from the reputable-corpus tripwire. Packages ship dummy TLS certificate +
-  private-key pairs for their own test HTTPS servers (`urllib3` `dummyserver/certs/*.key`,
-  `grpcio` `src/core/tsi/test_creds/*.key`); a "Private key block" whose directory path carries a
-  test/dummy/fixture marker next to a cert/cred/tls/ssl marker is routed to `needs_review`, not
-  scored. Effect: `urllib3`, `grpcio` high → low. Recall preserved: a private key on a normal
-  path (`id_rsa`, `config/deploy.key`) still scores.
+  private-key pairs for their own test HTTPS servers (an HTTP client's `dummyserver/certs/*.key`,
+  an RPC framework's `src/core/tsi/test_creds/*.key`); a "Private key block" whose directory path
+  carries a test/dummy/fixture marker next to a cert/cred/tls/ssl marker is routed to
+  `needs_review`, not scored. Recall preserved: a private key on a normal path (`id_rsa`,
+  `config/deploy.key`) still scores.
 
 ## [0.34.4]
 
 ### Fixed
 - **Ruleset 36 — precision fixes from the reputable-corpus tripwire** (see `RULES_CHANGELOG.md`).
   `ST-HIDDEN-UNICODE` no longer treats valid emoji tag sequences (UTS #51 subdivision flags,
-  e.g. the England flag in Unicode's own `emoji-test.txt`) as ASCII smuggling — effect:
-  `wcwidth` malicious -> low. `ST-TYPOSQUAT` curated PyPI list gains `pynacl` and `authlib`
-  (popular packages previously flagged as near-misses of `pyyaml`/`oauthlib`); near-miss
-  impersonations of both now fire. Recall preserved: any non-flag tag character still raises
-  the malicious indicator, incl. a smuggle run on the same line as a legitimate flag.
+  e.g. the England flag in Unicode's own `emoji-test.txt`) as ASCII smuggling. `ST-TYPOSQUAT`
+  curated PyPI list gains two popular packages previously flagged as near-misses of
+  `pyyaml`/`oauthlib`; near-miss impersonations of both now fire. Recall preserved: any non-flag
+  tag character still raises the malicious indicator, incl. a smuggle run on the same line as a
+  legitimate flag.
 
 ## [0.34.3]
 
 ### Fixed
 - **Ruleset 35 — the OpenAI `sk-` secret pattern no longer over-matches short `sk-…` tokens**
-  (see `RULES_CHANGELOG.md`). The pattern matched `sk-` + 20 chars, catching litellm proxy
+  (see `RULES_CHANGELOG.md`). The pattern matched `sk-` + 20 chars, catching an LLM proxy's
   virtual keys (`sk-P1zJMds…`), `sk-1234` docstring examples, and `org/sk-model-name` Hugging
   Face model ids. It now requires a real OpenAI key shape: a legacy `sk-` + ≥40-char base62 body,
-  or a `sk-proj-`/`sk-svcacct-`/`sk-admin-` prefixed key. Effect: `litellm` critical → high,
-  not-malicious. Recall preserved: real 48-char legacy and long project keys still match, and an
-  `api_key = "sk-short"` *assignment* is still caught by the generic secret-assignment rule.
+  or a `sk-proj-`/`sk-svcacct-`/`sk-admin-` prefixed key. Recall preserved: real 48-char legacy
+  and long project keys still match, and an `api_key = "sk-short"` *assignment* is still caught
+  by the generic secret-assignment rule.
 
 ## [0.34.2]
 
 ### Fixed
 - **Ruleset 34 — decode-and-execute token in a structured-data file no longer scores** (see
   `RULES_CHANGELOG.md`). `ST-OBF-DECODE-EXEC` matching inside a `.yaml`/`.json`/`.toml` value is
-  a keyword/pattern in a security tool's own detection list (litellm ships a content-filter
-  guardrail YAML listing decode-and-execute tokens as things to *catch*), not code that runs —
-  the same "detection literal, not behavior" class the engine already demotes for its own
-  patterns. Extended the structured-data demotion (previously prompt-injection only) to cover it.
-  Effect: `litellm` malicious/critical → not-malicious. Recall preserved: real decode-exec in
-  executable `.py`/`.js` still fires (only inert data-file values are demoted).
+  a keyword/pattern in a security tool's own detection list (a popular LLM proxy ships a
+  content-filter guardrail YAML listing decode-and-execute tokens as things to *catch*), not code
+  that runs — the same "detection literal, not behavior" class the engine already demotes for its
+  own patterns. Extended the structured-data demotion (previously prompt-injection only) to cover
+  it. Recall preserved: real decode-exec in executable `.py`/`.js` still fires (only inert
+  data-file values are demoted).
 
 ## [0.34.1]
 
@@ -235,25 +2008,25 @@ All notable changes to the SkillTotal engine. Format loosely follows
   injection patterns can greedily overshoot the closing quote (`exfiltrate X to Y, etc.").`
   swallows the `"`), so the "quote closes after the match" test missed the real citation. The
   prose citation form now demotes when the match STARTS inside an open quoted region on its
-  line plus a citation cue — independent of where the greedy match ends. `claude-blog` (an
-  agent skill that *warns* about injection) no longer verdicts malicious. Recall guards
+  line plus a citation cue — independent of where the greedy match ends. An agent skill that
+  *warns* about injection no longer verdicts malicious. Recall guards
   unchanged: a document reproducing a live injection without a cue, or a directive starting
   after a closed quote, still scores.
 
 ## [0.34.0]
 
 ### Fixed
-- **Ruleset 32 — two false positives found reviewing held real-world projects** (see
+- **Ruleset 32 — two false positives found reviewing real-world projects** (see
   `RULES_CHANGELOG.md`):
   - A file literally named `test.py` / `tests.py` (even outside a `tests/` directory) is now
-    treated as test scaffolding, so its evidence is demoted like other test code. `ragflow`'s
+    treated as test scaffolding, so its evidence is demoted like other test code. A RAG engine's
     `sdk/python/test.py` shipped a doc-example API key that synthesized `ST-COMBO-EXFIL`
     (critical); it no longer does.
   - A prompt-injection phrase quoted inside **defensive prose** (a skill warning "treat as
     untrusted, never authoritative: \"…exfiltrate X to Y, etc.\"") is demoted to `needs_review`
     when the line carries a citation cue (`e.g.`, `etc.`, `untrusted`, `such as`…). A document
     that merely reproduces a live injection (no cue) still scores, and this only applies to prose
-    files, not code/structured data. `claude-blog` no longer verdicts malicious.
+    files, not code/structured data. Such a defensive skill no longer verdicts malicious.
 
 ## [0.33.0]
 
@@ -263,8 +2036,8 @@ All notable changes to the SkillTotal engine. Format loosely follows
   (loopback redirect, device code, PKCE, oob) is routed to `needs_review` instead of scored —
   for native/CLI apps Google documents this value as not confidential (gcloud ships one), so
   it must not synthesize a critical exfiltration verdict. A `GOCSPX-` secret without those
-  markers (a leaked web-app secret) and all other secret shapes stay fully scored. Found on
-  gemini-cli: critical/100 → high/50.
+  markers (a leaked web-app secret) and all other secret shapes stay fully scored. Found on an
+  agent CLI's loopback OAuth client.
 
 ## [0.32.1]
 
@@ -284,21 +2057,21 @@ All notable changes to the SkillTotal engine. Format loosely follows
 
 ### Fixed
 - **Ruleset 30 — CI-config and vendored-tree false positives** (see `RULES_CHANGELOG.md`),
-  found when numpy scored critical/90 on its own infrastructure files:
+  found when a scientific computing library scored critical on its own infrastructure files:
   - **CI/CD pipeline configuration** (`.circleci/`, `.github/workflows/`, `.gitlab-ci.yml`,
     `Jenkinsfile`, …) is demoted to `needs_review` — a CI job runs on the project's build
-    service, never on the consumer's machine, so numpy's docs-deploy SSH setup is not
+    service, never on the consumer's machine, so its docs-deploy SSH setup is not
     component behavior and can no longer feed `ST-COMBO-EXFIL`. Install-time hooks
     (`setup.py`, npm `postinstall`) are unaffected and stay fully scored.
-  - **`vendored-*` directories** (numpy's `vendored-meson/`, which bundles the meson build
-    system with meson's own CI docker scripts) are now skipped like `vendor/` and
-    `node_modules`. Effect: numpy critical/90 → low/20; recall floors unchanged.
+  - **`vendored-*` directories** (a `vendored-<name>/` copy of a build system, with that build
+    system's own CI docker scripts) are now skipped like `vendor/` and `node_modules`. Recall
+    floors unchanged.
 
 ## [0.31.0]
 
 ### Fixed
 - **Ruleset 29 — four architectural false-positive fixes from a full audit of production
-  reports** (see `RULES_CHANGELOG.md`). The tandem "critical exfil" verdict was a symptom of
+  reports** (see `RULES_CHANGELOG.md`). One project's "critical exfil" verdict was a symptom of
   broader engine gaps in *where* evidence is trusted; each class is fixed at the demotion layer
   so recall is preserved (efficacy + FP floors stay at 0):
   - **Example/demo/benchmark scaffolding** (`examples/`, `demo/`, `samples/`, `.env.example`
@@ -311,9 +2084,6 @@ All notable changes to the SkillTotal engine. Format loosely follows
   - **Over-broad MCP scope** (`ST-MCP-OVERBROAD-SCOPE`) now only applies in an MCP context and
     ignores file-path globs (`**/*.ts`, `.github/**`) — a build-tool `angular.json` / `greptile.json`
     `scope` key is no longer misread as a permission wildcard.
-  - Net effect on audited projects: `nopua` high→low, `ECC` low/0, `browser-use` scaffold FP
-    removed (real findings kept), and the `tandem` false "critical/malicious" collapses to
-    `medium`/not-malicious.
 
 ## [0.30.0]
 
@@ -327,11 +2097,11 @@ All notable changes to the SkillTotal engine. Format loosely follows
 
 ### Fixed
 - **Two false positives from a report audit of trusted high-cap projects** (see
-  `RULES_CHANGELOG.md`): vendored dependency trees (`vendor/`, like Go cloud SDKs bundled by
-  `wandb`) are now skipped like `node_modules`, and a security tool's own regex-literal denylist
-  (e.g. `/id_rsa/` in a `SENSITIVE_PATHS` pattern array) is demoted to `needs_review` instead of
-  scored. Effect: `wandb` critical→high, `ECC` critical→low, both driven by code that is not the
-  component's own behavior; recall preserved (real path access still fires).
+  `RULES_CHANGELOG.md`): vendored dependency trees (`vendor/`, like Go cloud SDKs bundled by an
+  ML experiment-tracking package) are now skipped like `node_modules`, and a security tool's own
+  regex-literal denylist (e.g. `/id_rsa/` in a `SENSITIVE_PATHS` pattern array) is demoted to
+  `needs_review` instead of scored. Both were driven by code that is not the component's own
+  behavior; recall preserved (real path access still fires).
 
 ## [0.29.0]
 
@@ -390,10 +2160,10 @@ All notable changes to the SkillTotal engine. Format loosely follows
 ## [0.26.0]
 
 ### Changed
-- **Prompt-injection precision (ruleset 27): one FP on a real popular project
-  (firecrawl/firecrawl) closed, recall-preserving.** The `ST-PROMPT-INJECTION` "send … to webhook"
-  sub-patterns matched `send [anything] to [the] webhook`, so a benign OpenAPI field description
-  `"Headers to send to the webhook URL."` flipped firecrawl to `has_malicious_indicators`. They are
+- **Prompt-injection precision (ruleset 27): one FP on a real popular project closed,
+  recall-preserving.** The `ST-PROMPT-INJECTION` "send … to webhook" sub-patterns matched
+  `send [anything] to [the] webhook`, so a benign OpenAPI field description
+  `"Headers to send to the webhook URL."` flipped the project to `has_malicious_indicators`. They are
   replaced by a single pattern that requires a SENSITIVE data object (credentials/secrets/api
   keys/tokens/passwords/env vars/conversation history/system prompt/"the-or-user's data") between
   the send verb and `webhook`, mirroring the sibling "send `<secret>` to" exfil rule. Recall
@@ -405,8 +2175,8 @@ All notable changes to the SkillTotal engine. Format loosely follows
 ## [0.25.0]
 
 ### Changed
-- **Prompt-injection/secret precision (ruleset 26): two FPs on a real popular project
-  (infiniflow/ragflow) closed, recall-preserving.** (1) Prompt-injection phrases held in C-family
+- **Prompt-injection/secret precision (ruleset 26): two FPs on a real popular project closed,
+  recall-preserving.** (1) Prompt-injection phrases held in C-family
   value-strings — a security tool's own pattern table (`Description: "prompt injection: ignore
   previous instructions"`, `"DAN (Do Anything Now) …"` in a Go file) — no longer flag
   `ST-PROMPT-INJECTION`. A new `code_context` policy `strings_and_comments_all` demotes matches inside
@@ -422,10 +2192,10 @@ All notable changes to the SkillTotal engine. Format loosely follows
 ### Changed
 - **Prompt-injection/secret precision (ruleset 25): two more FPs on defensive/security content
   closed, recall-preserving.** (1) A `-----BEGIN PRIVATE KEY-----` format marker held as a string
-  constant (auth code building a PEM, e.g. `@ai-sdk/google-vertex`) no longer flags
+  constant (auth code building a PEM, e.g. in an AI SDK's cloud-provider package) no longer flags
   `ST-SECRET-EMBEDDED` — the pattern now requires actual base64 key material after the marker; a real
   multi-line key still fires. (2) A credential path cited inside a markdown inline-code span in a
-  security guide (`` `write to ~/.ssh` ``, e.g. `claude-blog`) is routed to `needs_review` instead of
+  security guide (`` `write to ~/.ssh` ``) is routed to `needs_review` instead of
   `ST-SENS-PATH` — scoped to markdown, so a JS template literal in code and a bare path in prose still
   fire. Both removed spurious `ST-COMBO-EXFIL` escalations. New unit tests + negative corpus samples;
   FP floor and benign corpus stay at zero.
@@ -435,8 +2205,8 @@ All notable changes to the SkillTotal engine. Format loosely follows
 ### Changed
 - **Prompt-injection precision (ruleset 24): two false positives on defensive/educational content
   closed, recall-preserving.** A security-education skill was wrongly flagged `ST-PROMPT-INJECTION`
-  on its `references/*.md` (an instruction surface, not doc-demoted), holding a legitimate component
-  from publication. Fixed in `scanners/prompt_surface.py`: (1) a negation guard on the safety-disable
+  on its `references/*.md` (an instruction surface, not doc-demoted). Fixed in
+  `scanners/prompt_surface.py`: (1) a negation guard on the safety-disable
   rule so defensive guarantees ("cannot override safety policy", "will not bypass safety filters",
   "can't disable guardrails") no longer match; (2) a phrase wrapped in quotes on both sides is
   treated as a cited example → `needs_review`, never scored (`"Ignore all previous instructions"`).
@@ -476,9 +2246,8 @@ All notable changes to the SkillTotal engine. Format loosely follows
   consumers, so a fake `sk-…` / `xoxb-…` key or `~/.ssh/id_rsa` path there is a test fixture, not
   behavior. The engine now demotes evidence inside inline Rust test blocks to `needs_review`
   exactly as it already demotes path-based test code (`__tests__/`, `*.test.*`). This fixes two
-  known false positives on real projects — **tandem** (`malicious` already cleared, was still
-  `critical`/90 from `ST-SECRET-EMBEDDED` + `ST-COMBO-EXFIL` over `#[test]` fixtures → now
-  `medium`) and **codescene** (`high`/70 from a `#[test]` error-message fixture → now `low`).
+  known false positives on real projects: `ST-SECRET-EMBEDDED` + `ST-COMBO-EXFIL` over `#[test]`
+  fixtures in one, and a `#[test]` error-message fixture in the other.
   Production secrets in non-test Rust code, and `#[cfg(not(test))]` code, still fire.
 
 ### Fixed
@@ -500,7 +2269,7 @@ All notable changes to the SkillTotal engine. Format loosely follows
 - **FP calibration (ruleset 21): cloud metadata endpoints no longer trigger the exfiltration
   combo.** A reference to `169.254.169.254` / `metadata.google.internal` is a network token-fetch
   (legitimate Azure/AWS/GCP managed-identity auth), not a local secret read, so it no longer
-  counts as the sensitive-data side of `ST-COMBO-EXFIL` — fixing the official `openai` npm SDK
+  counts as the sensitive-data side of `ST-COMBO-EXFIL` — fixing an official model-provider npm SDK
   (and similar cloud SDKs) being scored `high` / "credential-exfiltration path". The endpoint is
   still reported as an SSRF/token-theft surface (`ST-SENS-PATH`); a real credential-file read plus
   network still fires the combo.
@@ -520,7 +2289,7 @@ All notable changes to the SkillTotal engine. Format loosely follows
   (4) public **Algolia DocSearch** search keys (read-only, safe to embed); (5) command-injection in
   **compound test trees** (`cli-e2e-tests/`); (6) security prose in **C-family code/JSDoc comments**
   (`.ts`/`.js`/`.go`/`.rs`) plus defensive "refuse to send credentials to …" phrasing — which had
-  mislabeled the official MCP TypeScript SDK as `malicious`. No detection was removed; report schema
+  mislabeled a widely used official SDK as `malicious`. No detection was removed; report schema
   unchanged.
 
 ## [0.18.0]
@@ -610,7 +2379,8 @@ runtime/sandbox, dependency CVEs, prioritization) is delivered by SkillTotal Clo
 
 > 0.15.0 was tagged but never published: CI caught that a test fixture's `package.json` was
 > git-ignored (so absent on a fresh clone), and the `ST-PTH-EXEC` rule's bare-`exec` token gave a
-> benign false positive on coverage.py's `.pth`. Both fixed here; this is the first published cut.
+> benign false positive on a code-coverage tool's `.pth`. Both fixed here; this is the first
+> published cut.
 
 ### Added (ruleset 16 — real supply-chain attack signatures)
 - **`ST-PTH-EXEC`** (malicious) — a `.pth` file carrying code-execution / obfuscation tokens
@@ -779,8 +2549,8 @@ No detection-rule changes (RULESET 11 unchanged); detection on the new sources u
 
 ### Fixed
 - **Prompt-injection false positives on trusted packages.** The `ST-PROMPT-INJECTION`
-  "ignore … above" pattern was too broad and flagged benign text — a minified Jupyter
-  `notebook` bundle (`// IGNORE ABOVE ELSE`) and ruff's own suppression docs ("ignore above a
+  "ignore … above" pattern was too broad and flagged benign text — a notebook application's
+  minified bundle (`// IGNORE ABOVE ELSE`) and a linter's own suppression docs ("ignore above a
   multi-line statement"). It now requires an intent quantifier (`everything`/`all`) or an
   explicit instruction object, surfaced by the expanded calibration corpus. (RULESET 10.)
 
@@ -837,8 +2607,7 @@ No detection-rule changes (RULESET 11 unchanged); detection on the new sources u
 
 ### Fixed
 - **False-positive "malicious" verdicts on real MCP servers** (ruleset 8). A scan of 37 popular
-  MCP servers flagged 6 legitimate ones (awslabs, apify, exa, Figma-Context-MCP,
-  DesktopCommander, serena) as malicious. Recalibrated:
+  MCP servers flagged 6 legitimate ones as malicious. Recalibrated:
   - `ST-MCP-TOOL-SHADOWING` → **needs_review** (no longer a scored malicious indicator): "use X
     instead" / "do not use the Y tool" is indistinguishable from legitimate intra-server routing
     and code comments.
@@ -870,29 +2639,30 @@ No detection-rule changes (RULESET 11 unchanged); detection on the new sources u
 
 ## [0.7.1]
 
-Calibration hardening: a labeled-corpus run (django, numpy, typescript, webpack, the MCP
-SDK, github-mcp-server, …) surfaced false "malicious" verdicts on trusted packages. All were
+Calibration hardening: a labeled-corpus run over popular frameworks, libraries, build tools and MCP
+servers surfaced false "malicious" verdicts on trusted packages. All were
 over-broad `malicious_indicator` rules; this release fixes them and adds regression tests so
 they cannot recur. Net effect: 0 benign false positives on the calibration corpus.
 
 ### Fixed
 - **Removed `ST-PROMPT-EXFIL-MD`** (added in the yanked 0.7.0): it fired on any markdown
   link whose URL contained a literal `$`/`{` (e.g. AngularJS `$http` doc links, dynamic
-  shields badges), wrongly flagging trusted packages (axios, django, numpy, typescript, …)
-  as malicious. Reliable markdown-exfil detection needs prompt-instruction context that
+  shields badges), wrongly flagging trusted packages as malicious. Reliable markdown-exfil
+  detection needs prompt-instruction context that
   pure static regex can't supply — deferred to the runtime/paid layer (see open-core.md).
 - **`ST-HIDDEN-UNICODE` now flags only tag characters (U+E0000+)** as malicious — the
   unambiguous ASCII-smuggling signal. **Bidi overrides and zero-width characters** moved to
   `needs_review` (`ST-HIDDEN-UNICODE-AMBIG`): they appear legitimately in RTL-locale `.po`
-  files, CJK text, HTML-entity tables (webpack), and emoji, so they no longer raise a malware
+  files, CJK text, HTML-entity tables, and emoji, so they no longer raise a malware
   verdict on their own.
 - **`ST-MCP-TOOL-POISONING`**: dropped the over-broad `always/first … before` sub-pattern,
   which fired on benign call-ordering guidance ("Always call list_tables before queries" in
-  the MCP TypeScript SDK examples).
+  an official SDK's examples).
 - **`ST-PROMPT-INJECTION`**: `do not tell the user` / `without telling the user` moved from a
   scored finding to `needs_review` — a genuine concealment marker that also appears in benign
-  UX guardrails (GitHub's official MCP server: "Do NOT tell the user the issue was updated;
-  the user MUST click Submit"). Real concealment still co-occurs with stronger scored signals.
+  UX guardrails (a code-hosting platform's official MCP server: "Do NOT tell the user the issue
+  was updated; the user MUST click Submit"). Real concealment still co-occurs with stronger scored
+  signals.
 - Regression tests added for each of the above (the calibration corpus cases).
 
 ## [0.7.0] — YANKED
@@ -949,7 +2719,7 @@ popular trusted packages. Superseded by 0.7.1.
 - MCP exfiltration-surface signal now treats **browser** as an off-host channel (web
   automation can ingest untrusted content and exfiltrate), so a browser+credential or
   browser+filesystem server is flagged even without a `network` tool. The 0.5.0 logic
-  anchored only on `network` and missed this (e.g. the `mcp` package itself).
+  anchored only on `network` and missed this.
 
 ## [0.5.0]
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from skilltotal.engine import analyze_directory
+from skilltotal.models import Component
 from skilltotal.report import render_json, render_text
 from tests.conftest import analyze_fixture
 
@@ -49,7 +51,102 @@ def test_text_report_contains_key_sections(malicious_npm):
     assert "Evidence:" in text
 
 
+def test_capabilities_are_counted_apart_from_risk(tmp_path):
+    # "5 finding(s)" for five capabilities read as five risks on a 0/100 component.
+    (tmp_path / "tool.py").write_text(
+        "import subprocess\nimport urllib.request\n\n\ndef run(cmd):\n"
+        "    return subprocess.run(cmd, check=True)\n\n\ndef get(url):\n"
+        "    return urllib.request.urlopen(url).read()\n",
+        encoding="utf-8",
+    )
+    report = analyze_directory(tmp_path, Component(name="t", type="directory", source="t"))
+    capabilities = sum(f.threat_class.value == "capability" for f in report.findings)
+    assert capabilities == len(report.findings) >= 2  # a capability-only sample
+    expected = f"0 risk finding(s), {capabilities} capability finding(s) (not scored)"
+    assert expected in report.summary
+    text = render_text(report)
+    assert f"Findings (0 risk, {capabilities} capability, not scored):" in text
+    assert json.loads(render_json(report))["summary"] == report.summary  # the JSON shape is kept
+
+
 def test_clean_text_reports_no_findings(clean_report):
     text = render_text(clean_report)
     assert "Findings (0):" in text
     assert "(none)" in text
+
+
+def test_text_report_leads_with_the_verdict(tmp_path, malicious_npm, clean_report):
+    # An install-time dropper scores only "medium"; the verdict line must say malicious, first.
+    (tmp_path / "package.json").write_text(
+        '{"name": "d", "version": "1.0.0", "scripts": {"postinstall": "node setup.js"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.js").write_text(
+        'eval(Buffer.from("Y29uc29sZS5sb2coMSk=", "base64").toString());\n', encoding="utf-8"
+    )
+    report = analyze_directory(tmp_path, Component(name="d", type="directory", source="d"))
+    lines = render_text(report).splitlines()
+    verdict = next(i for i, line in enumerate(lines) if line.startswith("Verdict   :"))
+    risk = next(i for i, line in enumerate(lines) if line.startswith("Risk      :"))
+    assert verdict < risk
+    assert lines[verdict].startswith("Verdict   : MALICIOUS - Malicious indicators found (")
+    # High risk without malice says so, with no reasons tacked on; a clean report reads low.
+    assert "Verdict   : HIGH - High risk - review before installing" in render_text(malicious_npm)
+    clean = render_text(clean_report)
+    assert "Verdict   : LOW - " in clean and "MALICIOUS" not in clean
+
+
+def test_text_report_labels_capabilities_and_keeps_evidence_short(tmp_path):
+    # Seen in a pre-launch audit: "Risk: LOW (score 0/100)" above "[HIGH] ST-...", and up to 25
+    # locations per capability. A capability is labeled as not scored; --json keeps every location.
+    import re
+
+    (tmp_path / "index.js").write_text(
+        "const cp = require('child_process');\n"
+        + "".join(f"cp.execSync('ls {i}');\n" for i in range(6)),
+        encoding="utf-8",
+    )
+    report = analyze_directory(tmp_path, Component(name="d", type="directory", source="d"))
+    text = render_text(report)
+    shell = next(f for f in report.findings if f.id == "ST-SHELL-NODE")
+    assert shell.threat_class.value == "capability"
+    assert "- capability, not scored] ST-SHELL-NODE" in text
+    assert re.search(r"- index\.js:\d+\n", text)  # one line reads as one line, not "2-2"
+    assert f"... and {len(shell.evidence) - 3} more (all of them in --json)" in text
+
+
+def test_verdict_reasons_lead_with_what_is_scored(tmp_path):
+    # A dropper's reasons once listed two capabilities and dropped the install-time dropper.
+    (tmp_path / "package.json").write_text(
+        '{"name": "d", "version": "1.0.0", "scripts": {"postinstall": "node setup.js"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.js").write_text(
+        "const fs = require('fs'); const https = require('https');\n"
+        "fs.readFileSync(require('os').homedir() + '/.npmrc');\n"
+        'eval(Buffer.from("Y29uc29sZS5sb2coMSk=", "base64").toString());\n',
+        encoding="utf-8",
+    )
+    report = analyze_directory(tmp_path, Component(name="d", type="directory", source="d"))
+    by_title = {f.title: f.threat_class.value for f in report.findings}
+    reasons = report.verdict["reasons"]
+    order = {"malicious_indicator": 0, "risky_construct": 1, "exposure": 2, "capability": 3}
+    ranks = [order[by_title[r]] for r in reasons]
+    assert ranks == sorted(ranks)
+    assert by_title[reasons[0]] == "malicious_indicator"
+    # The text lists only malicious indicators under "Malicious indicators found".
+    verdict_line = next(line for line in render_text(report).splitlines()
+                        if line.startswith("Verdict   :"))
+    for title, threat_class in by_title.items():
+        if threat_class != "malicious_indicator":
+            assert title not in verdict_line, title
+
+
+def test_a_high_score_from_risky_constructs_is_not_called_capabilities():
+    # Capabilities score 0: a high or critical score without malice comes from risky constructs.
+    from skilltotal.engine import _verdict
+    from skilltotal.models import RiskLevel
+
+    assert _verdict([], RiskLevel.HIGH)["headline"] == "High risk - review before installing"
+    assert _verdict([], RiskLevel.CRITICAL)["headline"] == (
+        "Critical risk - review before installing")

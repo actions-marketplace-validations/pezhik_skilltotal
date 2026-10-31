@@ -104,10 +104,52 @@ def test_report_publishes_no_embedded_secret_count():
     assert "published on purpose" in text
 
 
+def test_report_states_the_population_snapshot_when_it_differs_from_the_scan_date():
+    """A re-run over an earlier registry snapshot must say so, or 17,535 will not reconcile
+    against the live registry a reader checks today."""
+    meta = {**_META, "generated": "2026-09-13", "population_snapshot": "2026-08-16"}
+    text = sr.render_markdown(sr.summarize(_rows()), meta)
+    lead = text.splitlines()[2]
+    assert "the public MCP registry as of 2026-08-16:" in lead
+    assert "scanned on 2026-09-13" in lead
+    assert "as of 2026-08-16, deduplicated by source" in text
+    # Same-day runs keep the plain wording.
+    same = sr.render_markdown(sr.summarize(_rows()), _META).splitlines()[2]
+    assert "run on 2026-08-19" in same and "as of" not in same
+
+
+def test_report_leads_with_how_many_were_scanned_not_every_component():
+    """The lead once said "every distinct component" while an eighth was never scanned."""
+    lead = sr.render_markdown(sr.summarize(_rows()), _META).splitlines()[2]
+    assert "3 of its 5 distinct components (60.0%)" in lead
+    assert "every distinct component" not in lead
+
+
 def test_report_states_coverage_and_versions():
     text = sr.render_markdown(sr.summarize(_rows()), _META)
     assert "0.41.0" in text and "ruleset 45" in text
     assert "Not scanned" in text  # coverage is disclosed, never implied
+
+
+def test_partition_shares_sum_to_their_total():
+    """The published risk column summed to 99.9 under independent rounding; it must add up.
+
+    Real counts from the 2026-08-20 survey. The web renderer's tests assert the same vector, so
+    the two implementations cannot drift apart.
+    """
+    assert sr.partition_shares([15109, 143, 256, 30], 15538) == [97.2, 0.9, 1.7, 0.2]
+    assert sr.partition_shares([1593, 194, 146, 60, 4], 17535, 11.4) == [9.1, 1.1, 0.8, 0.4, 0.0]
+    # Each share is the floor or the ceiling of its exact value: never more than 0.1 away.
+    for counts, whole in (([15109, 143, 256, 30], 15538), ([1, 1, 1], 3)):
+        for c, shr in zip(counts, sr.partition_shares(counts, whole), strict=True):
+            assert abs(shr - 100 * c / whole) < 0.1
+    # Tenths summed as floats land at 99.99999999999999; the column is exact in tenths.
+    assert abs(sum(sr.partition_shares([1, 1, 1], 3)) - 100.0) < 1e-9
+
+
+def test_report_discloses_the_rounding_method():
+    text = sr.render_markdown(sr.summarize(_rows()), _META)
+    assert "sums exactly to its total" in text
 
 
 def test_json_and_markdown_come_from_one_dataset(tmp_path):
@@ -124,3 +166,111 @@ def test_json_and_markdown_come_from_one_dataset(tmp_path):
     text = (tmp_path / "out.md").read_text(encoding="utf-8")
     assert data["summary"]["scanned"] == 3
     assert f"{data['summary']['scanned']:,}" in text
+
+
+def test_rerendering_a_dataset_later_keeps_the_scan_date(tmp_path):
+    """The heading says "scanned on <date>"; a re-render must not move it onto the render date."""
+    survey = tmp_path / "survey.jsonl"
+    survey.write_text("\n".join(json.dumps(r) for r in _rows()) + "\n", encoding="utf-8")
+    prefix = tmp_path / "out"
+    sr.main([
+        str(survey), "--out-prefix", str(prefix), "--engine", "0.48.3", "--ruleset", "58",
+        "--registry-entries", "73460", "--scanned", "2026-09-17",
+    ])
+    data = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert data["metadata"]["generated"] == "2026-09-17"
+    assert "2026-09-17" in (tmp_path / "out.md").read_text(encoding="utf-8")
+
+
+def test_report_makes_no_claim_of_absence():
+    """Zero indicators is what the rules matched, not a verdict that the registry is clean."""
+    rows = [r for r in _rows() if not r.get("malicious")]
+    text = sr.render_markdown(sr.summarize(rows), _META)
+    assert "No claim that any component is safe" in text
+    # A capability nobody carries is left out rather than printed as 0.0%.
+    assert "evaluates code dynamically" not in text
+    assert "can reach the network" in text
+
+
+def test_report_discloses_a_mixed_ruleset_run():
+    rows = _rows()
+    for r in rows:
+        if r["status"] == "ok":
+            r["ruleset_version"] = 52
+    rows[1]["ruleset_version"] = 53
+    text = sr.render_markdown(sr.summarize(rows), _META)
+    assert "2 with ruleset 52, 1 with ruleset 53" in text
+    single = [dict(r, ruleset_version=53) if r["status"] == "ok" else r for r in _rows()]
+    assert "Scanned components by ruleset" not in sr.render_markdown(sr.summarize(single), _META)
+
+
+def test_a_mixed_ruleset_run_names_the_range_in_the_lead():
+    """The lead said "ruleset 59" while 11,774 of 15,341 rows came from ruleset 56."""
+    rows = _rows()
+    for r in rows:
+        if r["status"] == "ok":
+            r["ruleset_version"] = 52
+    rows[1]["ruleset_version"] = 53
+    text = sr.render_markdown(sr.summarize(rows), _META)
+    lead = text.splitlines()[2]
+    assert "finished on 2026-08-19 with SkillTotal 0.41.0, rulesets 52–53 (see Method)" in lead
+    assert "ruleset 45" not in lead
+    assert "- Engine 0.41.0, rulesets 52–53 —" in text
+
+
+def test_report_says_what_a_rerun_reads():
+    """"So the run reproduces" did not hold: sources were read unpinned, at their latest."""
+    text = sr.render_markdown(sr.summarize(_rows()), _META)
+    assert "the same code through the same engine gives the same findings" in text
+    assert "so a re-run reads newer code" in text
+    assert "so the run reproduces" not in text
+
+
+def test_a_non_zero_count_never_prints_as_zero_percent():
+    """4 critical of 15,457 rounds to 0.0%, which reads as none; the label says <0.1%."""
+    assert sr.share_label(0.0, 4) == "<0.1%"
+    assert sr.share_label(0.0, 0) == "0.0%"
+    assert sr.share_label(0.21, 33) == "0.2%"
+    assert sr.pct(4, 15457) == "<0.1%"
+
+
+def test_report_says_shipped_secrets_do_not_raise_the_level():
+    text = sr.render_markdown(sr.summarize(_rows()), _META)
+    assert "reports separately as an exposure" in text
+
+
+def test_top_rules_counts_each_component_once_per_rule():
+    """A component tripping one rule in forty files is one component, not forty."""
+    rows = _rows()
+    rows[0]["rules"] = ["ST-NET-PY", "ST-SHELL-PY", "ST-NET-PY"]
+    rows[1]["rules"] = ["ST-NET-PY"]
+    s = sr.summarize(rows)
+    assert s["top_rules"]["ST-NET-PY"] == 2
+    assert s["top_rules"]["ST-SHELL-PY"] == 1
+    # Ordered by frequency, so the markdown can take the head of the list.
+    assert list(s["top_rules"]) == ["ST-NET-PY", "ST-SHELL-PY"]
+    text = sr.render_markdown(s, _META)
+    assert "## Which rules fired" in text
+    assert "`ST-NET-PY` | 2" in text
+    # The reader must not read a rule count as a count of misbehaving components.
+    assert "describes what the code does, not what it intends" in text
+
+
+def test_rule_table_is_absent_when_no_rule_fired():
+    """An empty table would read as a finding of absence, like a 0.0% capability row."""
+    text = sr.render_markdown(sr.summarize(_rows()), _META)
+    assert "Which rules fired" not in text
+
+
+def test_owasp_table_counts_components_not_verdicts():
+    """AST01 is named "Malicious Skills"; the table must not read as a count of malware."""
+    rows = _rows()
+    rows[0]["owasp"] = ["AST01", "AST03"]
+    rows[1]["owasp"] = ["AST03"]
+    s = sr.summarize(rows)
+    assert s["owasp"]["AST03"] == 2 and s["owasp"]["AST01"] == 1
+    text = sr.render_markdown(s, _META)
+    assert "AST03 Over-Privileged Skills" in text
+    assert "not a verdict" in text
+    # A class nobody carries is left out rather than printed as zero.
+    assert "AST05" not in text

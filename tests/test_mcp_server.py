@@ -87,25 +87,57 @@ def test_tools_list_declares_all_tools():
 
 
 def test_scan_component_returns_report(tmp_path: Path):
-    payload = _tool_payload(_call("scan_component", {"source": str(_component(tmp_path))}))
+    root = str(_component(tmp_path))
+    payload = _tool_payload(_call("scan_component", {"source": root}))
     assert payload["risk_score"] > 0
-    assert "ST-SHELL-PIPE-EXEC" in {f["id"] for f in payload["findings"]}
+    assert "ST-SHELL-PIPE-EXEC" in {f["rule"] for f in payload["why"]}
+    full = _tool_payload(_call("scan_component", {"source": root, "detail": "full"}))
+    assert "ST-SHELL-PIPE-EXEC" in {f["id"] for f in full["findings"]}
 
 
 def test_diff_components_returns_delta(tmp_path: Path):
     old = tmp_path / "old"
     old.mkdir()
     (old / "index.js").write_text('console.log("hi");\n', encoding="utf-8")
-    payload = _tool_payload(
-        _call("diff_components", {"old": str(old), "new": str(_component(tmp_path))})
-    )
+    new = str(_component(tmp_path))
+    payload = _tool_payload(_call("diff_components", {"old": str(old), "new": new}))
     assert payload["risk_score_delta"] > 0
-    assert "ST-SHELL-PIPE-EXEC" in {f["id"] for f in payload["new_findings"]}
+    assert "ST-SHELL-PIPE-EXEC" in {f["rule"] for f in payload["new_risk_findings"]}
+    full = _tool_payload(
+        _call("diff_components", {"old": str(old), "new": new, "detail": "full"}))
+    assert "ST-SHELL-PIPE-EXEC" in {f["id"] for f in full["new_findings"]}
 
 
 def test_list_rules_returns_registry():
     payload = _tool_payload(_call("list_rules", {}))
     assert any(r["id"] == "ST-PROMPT-INJECTION" for r in payload)
+
+
+def test_list_rules_is_compact_unless_asked_for_the_texts():
+    """Every rule's description and recommendation made the answer about 54 KB of an agent's
+    context; the fields the tool's description names (and the class each rule scores as) stay."""
+    from skilltotal.rules import get_rules
+
+    compact = _tool_payload(_call("list_rules", {}))
+    assert len(compact) == len(get_rules())
+    assert set(compact[0]) == {"id", "severity", "category", "title", "threat_class",
+                               "capability"}
+    assert len(json.dumps(compact)) < 25_000
+    full = _tool_payload(_call("list_rules", {"verbose": True}))
+    assert full == [r.to_dict() for r in get_rules()]
+
+
+def test_every_tool_says_it_only_reads():
+    """Clients use the annotations to decide what needs a confirmation: a scan reads, downloads
+    into a temp folder at most, and changes nothing."""
+    from skilltotal.mcp_server import TOOLS
+
+    for tool in TOOLS:
+        assert tool["annotations"]["readOnlyHint"] is True, tool["name"]
+        assert tool["annotations"]["destructiveHint"] is False, tool["name"]
+    by_name = {t["name"]: t for t in TOOLS}
+    assert by_name["list_rules"]["annotations"]["openWorldHint"] is False
+    assert by_name["scan_component"]["annotations"]["openWorldHint"] is True
 
 
 def test_collection_error_is_tool_error_not_crash(tmp_path: Path):
@@ -116,7 +148,10 @@ def test_collection_error_is_tool_error_not_crash(tmp_path: Path):
 
 def test_unknown_tool_and_missing_argument():
     assert _call("bogus_tool", {})["error"]["code"] == -32602
-    assert _call("scan_component", {})["error"]["code"] == -32602
+    # A missing argument is the tool's error, which the model reads and can correct.
+    result = _call("scan_component", {})["result"]
+    assert result["isError"] is True
+    assert '"source" is required' in result["content"][0]["text"]
 
 
 # --- stdio loop -----------------------------------------------------------------------
@@ -151,3 +186,68 @@ def test_serve_speaks_newline_delimited_jsonrpc(tmp_path: Path):
     assert responses[1]["error"]["code"] == -32700
     report = json.loads(responses[2]["result"]["content"][0]["text"])
     assert report["risk_score"] > 0
+
+
+# --- malformed requests: an error for the request, never the end of the session -----------------
+
+
+def test_params_that_are_not_an_object_get_an_error_not_a_crash():
+    for params in ("x", [1], 3, True):
+        resp = handle_message(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": params})
+        assert resp["error"]["code"] == -32602
+        resp = handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+        assert resp["error"]["code"] == -32602
+    # No params at all, or an empty list, is no params.
+    empty = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": []}
+    assert handle_message(empty)["result"]["serverInfo"]["name"] == "skilltotal"
+
+
+def test_arguments_that_are_not_an_object_get_an_error():
+    for arguments in ("abc", [1], 5):
+        resp = _call("scan_component", arguments)
+        assert resp["error"]["code"] == -32602
+
+
+def test_the_stdio_loop_survives_malformed_messages():
+    deep = '{"jsonrpc": "2.0", "id": 20, "method": "ping", "params": ' + "[" * 200_000 + (
+        "]" * 200_000) + "}"
+    lines = [
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": "x"}),
+        deep,
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": [1]}),
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+    ]
+    stdout = io.StringIO()
+    serve(io.StringIO("\n".join(lines) + "\n"), stdout)
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert [r.get("id") for r in responses] == [1, None, 2, 3]
+    assert [r["error"]["code"] for r in responses[:3]] == [-32602, -32700, -32602]
+    assert responses[3]["result"] == {}
+
+
+def test_a_failure_while_answering_is_an_internal_error_and_the_loop_goes_on(monkeypatch):
+    import skilltotal.mcp_server as mcp
+
+    def broken(message):
+        raise RuntimeError("a bug in a handler")
+
+    monkeypatch.setattr(mcp, "handle_message", broken)
+    stdout = io.StringIO()
+    lines = [json.dumps({"jsonrpc": "2.0", "id": n, "method": "ping"}) for n in (7, 8)]
+    serve(io.StringIO("\n".join(lines) + "\n"), stdout)
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert [(r["id"], r["error"]["code"]) for r in responses] == [(7, -32603), (8, -32603)]
+
+
+def test_a_reply_utf8_cannot_carry_is_still_sent():
+    """A lone surrogate from the client (`"\\ud800"` is valid JSON) echoed in a reply cannot be
+    encoded as UTF-8; the reply goes out escaped instead of ending the session."""
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="utf-8", newline="\n", write_through=True)
+    lines = '{"jsonrpc": "2.0", "id": 1, "method": "\\ud800"}\n' + json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "method": "ping"}) + "\n"
+    serve(io.StringIO(lines), out)
+    replies = [json.loads(line) for line in raw.getvalue().decode("utf-8").splitlines()]
+    assert [r["id"] for r in replies] == [1, 2]
+    assert replies[0]["error"]["code"] == -32601

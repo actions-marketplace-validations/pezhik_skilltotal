@@ -1,12 +1,12 @@
 """Agent Skill (SKILL.md) analysis.
 
 Parses the leading frontmatter of an Anthropic-style Agent Skill and flags a *declared-vs-actual*
-capability mismatch: the skill declares an ``allowed-tools`` allow-list, but its bundled code
-exercises a dangerous capability those tools do not grant (an undeclared-capability /
-least-privilege violation). Like ``ST-COMBO-EXFIL`` this is synthesized after capabilities are
-computed (see :mod:`skilltotal.engine`), so it is deterministic and evidence-anchored — no LLM,
-no execution. Conservative on purpose: it fires only when the skill makes an explicit,
-non-wildcard tool claim to contradict.
+capability mismatch: the skill declares an ``allowed-tools`` list, but its bundled code exercises
+a dangerous capability those tools do not cover (an undeclared capability; ``allowed-tools``
+pre-approves tools and does not limit the skill's own code). Like ``ST-COMBO-EXFIL`` this is
+synthesized after capabilities are computed (see :mod:`skilltotal.engine`), so it is
+deterministic and evidence-anchored — no LLM, no execution. Conservative on purpose: it fires
+only when the skill makes an explicit, non-wildcard tool claim to contradict.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import re
 
 from skilltotal.file_index import FileIndex, IndexedFile
 from skilltotal.models import Capability, Component, Evidence, Finding, Severity, ThreatClass
-from skilltotal.scanners.base import MAX_EVIDENCE_PER_FINDING
+from skilltotal.scanners.base import MAX_EVIDENCE_SCANNED
 
 SKILL_MISMATCH_FINDING_ID = "ST-SKILL-CAP-MISMATCH"
 
@@ -107,7 +107,7 @@ def skill_capability_mismatch(
 
     Fires only for an ``agent_skill`` component whose root SKILL.md declares a non-empty,
     non-wildcard ``allowed-tools`` list, when a dangerous capability is exhibited that none of the
-    declared tools grant. Evidence pairs the declaration with the offending capability's evidence,
+    declared tools cover. Evidence pairs the declaration with the offending capability's evidence,
     so the "no finding without evidence" invariant holds.
     """
     if component.type != "agent_skill":
@@ -135,18 +135,19 @@ def skill_capability_mismatch(
     evidence: list[Evidence] = [_allowed_tools_evidence(skill)]
     for cap in offending:
         evidence.extend(capabilities.get(cap, [])[:2])
-    evidence = _dedupe(evidence)[:MAX_EVIDENCE_PER_FINDING]
+    evidence = _dedupe(evidence)[:MAX_EVIDENCE_SCANNED]
 
     return Finding(
         id=SKILL_MISMATCH_FINDING_ID,
         severity=Severity.HIGH,
         category="least_privilege",
-        title="Skill does more than its declared tools allow",
+        title="Skill does more than its declared tools cover",
         description=(
             f"The skill's frontmatter declares allowed-tools ({declared_str}), but its bundled "
-            f"code exercises capabilities those tools do not grant: {labels}. This is an "
-            "undeclared-capability / least-privilege violation — over-broad code, or a payload "
-            "hidden behind a narrow declaration."
+            f"code exercises capabilities those tools do not cover: {labels}. The allowed-tools "
+            "field pre-approves tools and does not limit the skill's code, so the narrow "
+            "declaration understates what the skill does: over-broad code, or a payload hidden "
+            "behind the declaration."
         ),
         evidence=evidence,
         recommendation=(

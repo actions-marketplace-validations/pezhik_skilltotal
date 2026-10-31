@@ -10,10 +10,34 @@ from __future__ import annotations
 
 import re
 
-from skilltotal.models import Capability, Severity
-from skilltotal.scanners.base import PatternScanner, RuleSpec, alternation
+from skilltotal import bounded_json
+from skilltotal.file_index import FileIndex, IndexedFile
+from skilltotal.models import Capability, Evidence, Severity, ThreatClass
+from skilltotal.scanners.base import (
+    PatternScanner,
+    RuleSpec,
+    ScanResult,
+    _finding_from_rule,
+    alternation,
+)
+from skilltotal.scanners.obfuscation import _DECODE_EXEC
+from skilltotal.scanners.shell_script import DECODE_EXEC_SH, REMOTE_EXEC
 
 CATEGORY = "install_time_execution"
+R_NPM_REMOTE_EXEC = "ST-INSTALL-NPM-REMOTE-EXEC"
+# The scripts npm runs on its own: on every install of the package (preinstall / install /
+# postinstall), and on a git or local install (prepare).
+_NPM_LIFECYCLE_SCRIPTS = ("preinstall", "install", "postinstall", "prepare")
+
+
+def runs_fetched_or_decoded_code(command: str) -> bool:
+    """True if a command downloads code and runs it, or decodes data and runs it: the shell forms
+    (`curl … | sh`, `sh -c "$(curl …)"`, `… base64 -d | sh`) and inline JavaScript or Python
+    (`node -e "eval(Buffer.from(…, 'base64').toString())"`)."""
+    return bool(
+        REMOTE_EXEC.search(command) or DECODE_EXEC_SH.search(command)
+        or _DECODE_EXEC.search(command)
+    )
 
 
 class InstallScriptsScanner(PatternScanner):
@@ -56,6 +80,61 @@ class InstallScriptsScanner(PatternScanner):
             pattern=re.compile(r'"prepare"\s*:'),
         ),
         RuleSpec(
+            id=R_NPM_REMOTE_EXEC,
+            category=CATEGORY,
+            severity=Severity.HIGH,
+            title="npm install script downloads or decodes code and runs it",
+            description=(
+                "A package.json lifecycle script that npm runs on its own (preinstall / install / "
+                "postinstall, or prepare on a git or local install), or a shell script one of them "
+                "runs (`\"postinstall\": \"bash install.sh\"`), downloads code and pipes it "
+                "into a shell, or decodes data and executes it, for example "
+                "`curl -fsSL https://... | bash` or "
+                "`node -e \"eval(Buffer.from(..., 'base64')...)\"`. "
+                "What runs is whatever the host serves, or the decoded text, on every install; "
+                "neither is in the package for review."
+            ),
+            recommendation=(
+                "Do not install this version. An honest package ships the code its install step "
+                "runs, or downloads a pinned artifact and verifies its checksum before using it."
+            ),
+            capability=Capability.INSTALL_TIME_EXECUTION,
+            threat_class=ThreatClass.MALICIOUS_INDICATOR,
+            # Custom matching (InstallScriptsScanner.scan): the parsed script values of each
+            # package.json, so a JSON escape (`|` for `|`) is read as npm reads it.
+            names=("package.json",),
+        ),
+        RuleSpec(
+            id="ST-INSTALL-GYP",
+            category=CATEGORY,
+            severity=Severity.HIGH,
+            title="binding.gyp runs a hidden command at install time",
+            description=(
+                "binding.gyp uses node-gyp command substitution (`<!(...)`) to run a script with "
+                "its output discarded, fetch from the network, pipe into a shell, or decode "
+                "data. node-gyp evaluates it during `npm install` even when package.json "
+                "declares no install script, so install-script checks never see it, for example "
+                "`<!(node index.js > /dev/null 2>&1 && echo stub.c)`."
+            ),
+            recommendation=(
+                "Do not install this version. Honest bindings use substitution only to print "
+                "include paths (`node -p \"require('node-addon-api').include\"`)."
+            ),
+            capability=Capability.INSTALL_TIME_EXECUTION,
+            threat_class=ThreatClass.MALICIOUS_INDICATOR,
+            names=("binding.gyp",),
+            pattern=re.compile(
+                r"<!@?\(\s*(?:"
+                r"[^)\"']*?\b(?:curl|wget)\b"
+                r"|[^)\"']*?https?://"
+                r"|[^)\"']*?\|\s*(?:ba|z)?sh\b"
+                r"|[^)\"']*?\bbase64\b"
+                r"|node\s+(?!-[pe]\b)[^\s)\"']+\.[cm]?js\b[^)\"']*?(?:>\s*/dev/null|2>&1|>\s*nul\b)"
+                r")",
+                re.IGNORECASE,
+            ),
+        ),
+        RuleSpec(
             id="ST-INSTALL-PY",
             category=CATEGORY,
             severity=Severity.HIGH,
@@ -83,3 +162,57 @@ class InstallScriptsScanner(PatternScanner):
             ),
         ),
     ]
+
+    def scan(self, index: FileIndex) -> ScanResult:
+        result = super().scan(index)
+        evidence = [
+            ev for f in index.select(names=("package.json",)) for ev in _remote_exec_scripts(f)
+        ]
+        evidence += [
+            ev for f in index.files
+            if f.relpath in index.install_scripts and f.is_shell_like
+            for ev in _remote_exec_lines(f)
+        ]
+        if evidence:
+            rule = next(r for r in self.rules if r.id == R_NPM_REMOTE_EXEC)
+            result.findings.append(_finding_from_rule(rule, evidence))
+        return result
+
+
+def _remote_exec_lines(f: IndexedFile) -> list[Evidence]:
+    """Evidence for each line of ``f``, a shell script an npm install script runs
+    (``"postinstall": "bash install.sh"``), that downloads code and pipes it into a shell or decodes
+    data and runs it. A comment, a printed hint or a hint kept in a variable that is only printed
+    is not run, so it does not count."""
+    found: list[Evidence] = []
+    for pattern in (REMOTE_EXEC, DECODE_EXEC_SH):
+        for match in pattern.finditer(f.text):
+            at = match.start()
+            if (f.in_shell_comment(at) or f.in_printed_command(at)
+                    or f.in_shell_assigned_hint(at)):
+                continue
+            found.append(f.evidence_for_span(match.start(), match.end()))
+    return found
+
+
+def _remote_exec_scripts(f: IndexedFile) -> list[Evidence]:
+    """Evidence for each lifecycle script of ``f`` (a package.json) that runs fetched or decoded
+    code. The values are read as npm reads them (JSON-decoded); each evidence points at the line of
+    the script's key, or at the ``scripts`` key when the key itself is written with escapes."""
+    try:
+        data = bounded_json.loads(f.text)
+    except ValueError:
+        return []
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return []
+    found: list[Evidence] = []
+    block = re.search(r'"scripts"\s*:', f.text)
+    for name in _NPM_LIFECYCLE_SCRIPTS:
+        command = scripts.get(name)
+        if not isinstance(command, str) or not runs_fetched_or_decoded_code(command):
+            continue
+        key = re.compile(rf'"{name}"\s*:').search(f.text, block.end() if block else 0) or block
+        start, end = (key.start(), key.end()) if key else (0, 1)
+        found.append(f.evidence_for_span(start, end))
+    return found

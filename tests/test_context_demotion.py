@@ -450,7 +450,7 @@ def test_expose_bind_in_examples_demoted(tmp_path: Path):
 def test_secret_in_benchmark_scaffold_demoted(tmp_path: Path):
     # A demo key in a benchmark project is scaffolding. FP: nopua benchmark/test-project/.
     _write(tmp_path, "benchmark/test-project/src/api.py",
-           'api_key = "sk-abc123def456ghi789jkl012"\n')
+           'api_key = "sk-q7Rm2Xv9Kd4Tz8Wn3Lp6Hb1F"\n')
     assert "ST-SECRET-EMBEDDED" not in _ids(_analyze(tmp_path))
 
 
@@ -467,14 +467,14 @@ def test_testing_utils_module_demoted(tmp_path: Path):
     # shipped runtime behavior. FP: transformers' src/transformers/testing_utils.py ships a
     # hardcoded CI `hf_` token. Its evidence is demoted like other test code.
     _write(tmp_path, "src/pkg/testing_utils.py",
-           'TOKEN = "hf_aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpP12"\n')
+           'TOKEN = "' + "hf_" + 'aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpP12"\n')
     assert "ST-SECRET-EMBEDDED" not in _ids(_analyze(tmp_path))
 
 
 def test_ordinary_utils_module_still_scored(tmp_path: Path):
     # Recall guard: a real utils module (not test-support) with an embedded token still scores.
     _write(tmp_path, "src/pkg/config_utils.py",
-           'TOKEN = "hf_aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpP12"\n')
+           'TOKEN = "' + "hf_" + 'aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpP12"\n')
     assert "ST-SECRET-EMBEDDED" in _ids(_analyze(tmp_path))
 
 
@@ -497,7 +497,7 @@ def test_sens_path_in_code_still_scored(tmp_path: Path):
 def test_production_code_still_scored(tmp_path: Path):
     # Recall guard: the SAME constructs in the component's real code still fire.
     _write(tmp_path, "src/server.py", "import uvicorn\nuvicorn.run(app, host='0.0.0.0')\n")
-    _write(tmp_path, "src/config.py", 'api_key = "sk-abc123def456ghi789jkl012"\n')
+    _write(tmp_path, "src/config.py", 'api_key = "sk-q7Rm2Xv9Kd4Tz8Wn3Lp6Hb1F"\n')
     ids = _ids(_analyze(tmp_path))
     assert "ST-EXPOSE-BIND" in ids
     assert "ST-SECRET-EMBEDDED" in ids

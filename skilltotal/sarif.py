@@ -3,14 +3,20 @@
 Each evidence occurrence becomes one SARIF result so it maps to a specific line; the tool
 driver advertises the full rule registry. Severity maps to SARIF ``level`` plus a numeric
 ``security-severity`` property understood by GitHub.
+
+A location's ``uri`` is the evidence path relative to the scanned folder, percent-encoded as a
+URI reference (a space, ``#``, ``%`` or a newline in a file name must not change what it points
+at). ``uri_prefix`` puts the scanned folder in front of it, so a scan of ``app/`` uploaded from the
+repository root points Code Scanning at ``app/x.py``, which exists, not at ``x.py``.
 """
 
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 
 from skilltotal import __version__
-from skilltotal.models import Report, Severity
+from skilltotal.models import Report, Severity, ThreatClass
 from skilltotal.owasp import OWASP_TAXONOMY, owasp_for
 from skilltotal.rules import get_rules
 
@@ -39,16 +45,42 @@ _SECURITY_SEVERITY = {
 }
 
 
-def render_sarif(report: Report) -> str:
-    return json.dumps(_sarif_doc(report), indent=2, ensure_ascii=False)
+def _level(severity: Severity, threat_class: ThreatClass) -> str:
+    """A capability (what a component can do, such as run a shell) is not a risk: it never moves
+    the score or the gate, so it is a note, never an alert that a clean gate contradicts."""
+    return "note" if threat_class == ThreatClass.CAPABILITY else _LEVEL[severity]
 
 
-def _sarif_doc(report: Report) -> dict:
+def render_sarif(report: Report, *, uri_prefix: str = "", category: str = "") -> str:
+    """``uri_prefix``: the scanned folder relative to the repository root, put in front of every
+    location. ``category``: the run's ``automationDetails.id`` category, which keeps the alerts of
+    two scans uploaded from one job apart."""
+    return json.dumps(_sarif_doc(report, uri_prefix, category), indent=2, ensure_ascii=False)
+
+
+def artifact_uri(path: str, prefix: str = "") -> str:
+    """``prefix/path`` as a relative URI reference: each segment percent-encoded (RFC 3986), with
+    ``:`` encoded too, so a file named ``a:b.js`` cannot read as a URI scheme."""
+    prefix = prefix.replace("\\", "/").strip("/")
+    while prefix.startswith("./"):
+        prefix = prefix[2:]
+    if prefix == ".":
+        prefix = ""
+    joined = f"{prefix}/{path}" if prefix else path
+    return quote(joined, safe="/!$&'()*+,;=@")
+
+
+def _sarif_doc(report: Report, uri_prefix: str = "", category: str = "") -> dict:
+    run: dict = {}
+    if category:
+        # GitHub reads the category as everything before the last '/'.
+        run["automationDetails"] = {"id": category if category.endswith("/") else f"{category}/"}
     return {
         "$schema": SARIF_SCHEMA,
         "version": "2.1.0",
         "runs": [
             {
+                **run,
                 "tool": {
                     "driver": {
                         "name": "SkillTotal",
@@ -58,7 +90,7 @@ def _sarif_doc(report: Report) -> dict:
                     }
                 },
                 "taxonomies": _taxonomies(),
-                "results": _results(report),
+                "results": _results(report, uri_prefix),
                 "properties": {
                     "risk_score": report.risk_score,
                     "risk_level": report.risk_level.value,
@@ -117,13 +149,17 @@ def _rule_descriptors() -> list[dict]:
             "shortDescription": {"text": rule.title},
             "fullDescription": {"text": rule.description},
             "helpUri": INFO_URI,
-            "defaultConfiguration": {"level": _LEVEL[rule.severity]},
+            "defaultConfiguration": {"level": _level(rule.severity, rule.threat_class)},
             "properties": {
-                "security-severity": _SECURITY_SEVERITY[rule.severity],
                 "category": rule.category,
                 "tags": [rule.category, *owasp_ids],
             },
         }
+        if rule.threat_class == ThreatClass.CAPABILITY:
+            # No security-severity: GitHub would rank it as a security alert by that number.
+            descriptor["properties"]["tags"].append("capability")
+        else:
+            descriptor["properties"]["security-severity"] = _SECURITY_SEVERITY[rule.severity]
         relationships = _owasp_relationships(rule.id)
         if relationships:
             descriptor["relationships"] = relationships
@@ -131,19 +167,19 @@ def _rule_descriptors() -> list[dict]:
     return descriptors
 
 
-def _results(report: Report) -> list[dict]:
+def _results(report: Report, uri_prefix: str = "") -> list[dict]:
     results = []
     for finding in report.findings:
         for ev in finding.evidence:
             results.append(
                 {
                     "ruleId": finding.id,
-                    "level": _LEVEL[finding.severity],
+                    "level": _level(finding.severity, finding.threat_class),
                     "message": {"text": f"{finding.title}: {finding.description}"},
                     "locations": [
                         {
                             "physicalLocation": {
-                                "artifactLocation": {"uri": ev.file},
+                                "artifactLocation": {"uri": artifact_uri(ev.file, uri_prefix)},
                                 "region": {
                                     "startLine": ev.line_start,
                                     "endLine": ev.line_end,

@@ -18,13 +18,27 @@ import argparse
 import json
 import re
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 OUT_PREFIX_DEFAULT = str(_REPO_ROOT / "docs" / "mcp-registry-survey")
 _LEVELS = ("low", "medium", "high", "critical")
+# OWASP Agentic Skills classes a static scan can evidence (AST06-AST10 need runtime or registry
+# observation, so no rule maps to them). Names come from docs/owasp-agentic-skills-mapping.md.
+# A component counts once per class, however many of its findings map to it.
+_OWASP_LABEL: dict[str, str] = {
+    "AST01": "AST01 Malicious Skills",
+    "AST02": "AST02 Supply Chain Compromise",
+    "AST03": "AST03 Over-Privileged Skills",
+    "AST04": "AST04 Insecure Metadata",
+    "AST05": "AST05 Unsafe Deserialization",
+}
 _UNREACHABLE = "repository or package no longer reachable"
+# Rules are listed by how many components carry them. The markdown shows the head of the list; the
+# JSON carries every rule, because the point of publishing it is that someone can recompute it.
+_TOP_RULES_SHOWN = 15
 
 # Capability ids in the order a reader cares about: reach first, then local power.
 _CAP_LABEL: dict[str, str] = {
@@ -87,9 +101,19 @@ def summarize(rows: list[dict]) -> dict:
         },
         "risk_level": {lvl: sum(1 for r in ok if r.get("risk_level") == lvl) for lvl in _LEVELS},
         "malicious_indicators": sum(1 for r in ok if r.get("malicious")),
+        "rulesets": dict(sorted(Counter(str(r["ruleset_version"]) for r in ok
+                                        if "ruleset_version" in r).items())),
         "capabilities": {
             cap: sum(1 for r in ok if cap in r.get("capabilities", [])) for cap in _CAP_LABEL
         },
+        "owasp": {
+            cls: sum(1 for r in ok if cls in set(r.get("owasp") or ())) for cls in _OWASP_LABEL
+        },
+        # Components per rule, not matches per rule: a component that trips one rule in forty files
+        # is still one component, and dict.fromkeys collapses any repeat within a row.
+        "top_rules": dict(
+            Counter(rule for r in ok for rule in dict.fromkeys(r.get("rules") or ())).most_common()
+        ),
         "registry_shape": {
             "git_sources": git_total,
             "distinct_owners": len(owners),
@@ -108,23 +132,76 @@ def _share(part: int, whole: int) -> float:
 
 
 def pct(part: int, whole: int) -> str:
-    return f"{100 * part / whole:.1f}%" if whole else "n/a"
+    return share_label(100 * part / whole, part) if whole else "n/a"
+
+
+def share_label(share: float, count: int) -> str:
+    """A share to one decimal, except that a non-zero count never prints as 0.0%.
+
+    Four critical components out of fifteen thousand round to 0.0%, which reads as "none". The
+    count beside it is exact; the label must not contradict it.
+    """
+    if count and round(share, 1) == 0:
+        return "<0.1%"
+    return f"{share:.1f}%"
+
+
+def partition_shares(counts: list[int], whole: int, target: float = 100.0) -> list[float]:
+    """Round shares to one decimal so they sum exactly to ``target`` (largest-remainder method).
+
+    Rounding each share on its own gave a risk column of 97.2 + 0.9 + 1.6 + 0.2 = 99.9, which
+    reads as an error on a page whose argument is rigour. Hamilton's method takes each share's
+    floor and hands the leftover tenths to the largest fractional remainders, so every value is
+    the floor or the ceiling of its exact share -- never more than 0.1 away -- and the column adds
+    up by construction. Ties go to the earlier index. The web renderer implements the same rule,
+    and a shared vector in both test suites keeps the two from drifting.
+    """
+    if not whole or not counts:
+        return [0.0 for _ in counts]
+    exact = [Fraction(1000 * c, whole) for c in counts]  # tenths of a percent, exact
+    floors = [int(x) for x in exact]
+    units = round(target * 10) - sum(floors)
+    if units < 0:
+        raise ValueError("target is below the sum of floors; pass the rounded true total")
+    order = sorted(range(len(counts)), key=lambda i: (-(exact[i] - floors[i]), i))
+    for i in order[:units]:
+        floors[i] += 1
+    return [f / 10 for f in floors]
 
 
 def render_markdown(s: dict, meta: dict) -> str:
     n = s["scanned"]
     shape = s["registry_shape"]
     entries = meta["registry_entries"]
-    unreachable = s["skip_reasons"].get(_UNREACHABLE, 0)
     out: list[str] = []
     add = out.append
 
+    # The population can be an earlier snapshot than the scan: re-running a better engine over
+    # the SAME 17,535 entries is what makes two reports comparable, so say both dates when they
+    # differ rather than let a reader reconcile the count against today's registry.
+    snapshot = meta.get("population_snapshot") or meta["generated"]
+    rerun = snapshot != meta["generated"]
     add("# The MCP registry, measured")
     add("")
+    # How many were scanned leads, not "every component": an eighth of the population could not
+    # be scanned, and the coverage table below says why.
+    as_of = f" as of {snapshot}" if rerun else ""
+    # A run that re-scanned part of the population with later rulesets finished on the date
+    # given, under several rulesets: one version in the lead would mislabel most of the rows.
+    used = sorted(int(rs) for rs in s.get("rulesets", {})) or [meta["ruleset"]]
+    if len(used) > 1:
+        when = "finished on"
+        versions = f"rulesets {used[0]}–{used[-1]}"
+        lead_versions = f", {versions} (see Method)"
+    else:
+        when = "scanned on" if rerun else "run on"
+        versions = f"ruleset {meta['ruleset']}"
+        lead_versions = f" ({versions})"
     add(
-        f"A deterministic static scan of every distinct component in the public MCP registry — "
-        f"{s['population']:,} of them — run on {meta['generated']} with SkillTotal "
-        f"{meta['engine']} (ruleset {meta['ruleset']})."
+        f"A deterministic static scan of the public MCP registry{as_of}: "
+        f"{s['scanned']:,} of its {s['population']:,} distinct components "
+        f"({pct(s['scanned'], s['population'])}), {when} "
+        f"{meta['generated']} with SkillTotal {meta['engine']}{lead_versions}."
     )
     add("")
     add("## How to read this")
@@ -154,8 +231,15 @@ def render_markdown(s: dict, meta: dict) -> str:
     add("")
     add("| Why a component was not scanned | Components | Share of population |")
     add("|---|---:|---:|")
-    for label, count in sorted(s["skip_reasons"].items(), key=lambda kv: -kv[1]):
-        add(f"| {label} | {count:,} | {pct(count, s['population'])} |")
+    skip_rows = sorted(s["skip_reasons"].items(), key=lambda kv: -kv[1])
+    skip_target = round(100 * s["skipped"] / s["population"], 1) if s["population"] else 0.0
+    skip_shares = dict(zip(
+        [label for label, _ in skip_rows],
+        partition_shares([count for _, count in skip_rows], s["population"], skip_target),
+        strict=True,
+    ))
+    for label, count in skip_rows:
+        add(f"| {label} | {count:,} | {skip_shares[label]:.1f}% |")
     add("")
     add("| Ecosystem | Scanned | Listed | Coverage |")
     add("|---|---:|---:|---:|")
@@ -171,28 +255,70 @@ def render_markdown(s: dict, meta: dict) -> str:
     add("|---|---:|---:|")
     for cap, label in _CAP_LABEL.items():
         count = s["capabilities"].get(cap, 0)
+        if not count:
+            continue  # a 0.0% row would read as a finding of absence, which a scan cannot make
         add(f"| {label} | {count:,} | **{pct(count, n)}** |")
     add("")
+    owasp = {k: v for k, v in s.get("owasp", {}).items() if v}
+    if owasp:
+        add("## OWASP Agentic Skills Top 10")
+        add("")
+        add(
+            "Every rule that has an honest static fit carries its OWASP class, so the same scan "
+            "answers which classes this population actually exhibits. A class appears here when a "
+            "component carries at least one finding mapped to it; a component can appear in "
+            "several. Classes with no evidence in this population are left out rather than printed "
+            "as zero. A class counts the rules mapped to it, not a verdict: the rules under "
+            "*Malicious Skills* include exfiltration paths and evasion idioms that a legitimate "
+            "tool can carry, and no component in this population carries a malicious indicator."
+        )
+        add("")
+        add("| Class | Components | Share |")
+        add("|---|---:|---:|")
+        for cls, count in sorted(owasp.items(), key=lambda kv: -kv[1]):
+            add(f"| {_OWASP_LABEL[cls]} | {count:,} | {pct(count, n)} |")
+        add("")
+    top_rules = s.get("top_rules") or {}
+    if top_rules:
+        shown = min(_TOP_RULES_SHOWN, len(top_rules))
+        add("## Which rules fired")
+        add("")
+        add(
+            f"{len(top_rules)} rules matched something in this population; the {shown} most "
+            f"frequent are below, and the count for every rule is in the JSON beside this file. "
+            f"A rule firing describes what the code does, not what it intends — most of the "
+            f"traffic here is capability rules, which add nothing to the risk score. That is "
+            f"precisely why the risk table below is so much flatter than the capability table "
+            f"above. `skilltotal rules list` documents every id."
+        )
+        add("")
+        add("| Rule | Components | Share |")
+        add("|---|---:|---:|")
+        for rule, count in list(top_rules.items())[:shown]:
+            add(f"| `{rule}` | {count:,} | {pct(count, n)} |")
+        add("")
     add("## Risk levels")
     add("")
     add(
         "SkillTotal scores risky constructs and malicious indicators; a capability on its own "
-        "contributes zero to the score. The risk distribution is therefore far flatter than the "
-        "capability table above, and that difference is the point."
+        "contributes zero to the score, and so does a secret the component ships, which the "
+        "engine reports separately as an exposure. The risk distribution is therefore far flatter "
+        "than the capability table above, and that difference is the point."
     )
     add("")
     add("| Level | Components | Share |")
     add("|---|---:|---:|")
-    for lvl in _LEVELS:
-        add(f"| {lvl} | {s['risk_level'][lvl]:,} | {pct(s['risk_level'][lvl], n)} |")
+    risk_shares = partition_shares([s["risk_level"][lvl] for lvl in _LEVELS], n)
+    for lvl, shr in zip(_LEVELS, risk_shares, strict=True):
+        add(f"| {lvl} | {s['risk_level'][lvl]:,} | {share_label(shr, s['risk_level'][lvl])} |")
     add(f"| carrying a malicious indicator | {s['malicious_indicators']:,} | "
         f"{pct(s['malicious_indicators'], n)} |")
     add("")
     add("## The registry itself")
     add("")
     add(f"- {entries:,} entries resolve to {s['population']:,} distinct components.")
-    add(f"- {pct(unreachable, s['population'])} of the population points at a repository or "
-        f"package that is gone or private.")
+    add(f"- {skip_shares.get(_UNREACHABLE, 0.0):.1f}% of the population points at a repository "
+        f"or package that is gone or private.")
     add(f"- {shape['git_sources']:,} components are hosted on GitHub across "
         f"{shape['distinct_owners']:,} owners — yet one owner accounts for "
         f"**{shape['largest_owner_share']}%** of them, and the ten largest for "
@@ -210,18 +336,40 @@ def render_markdown(s: dict, meta: dict) -> str:
         "precision estimate from a labelled sample."
     )
     add("")
+    add(
+        "**No claim that any component is safe.** A malicious indicator is a match against a "
+        "published rule for a known attack shape: decode-and-execute, hidden Unicode, "
+        "instructions planted for the agent, auto-run hooks, credentials sent out. A count of "
+        "zero means no component matched one, not that none is harmful: code fetched at run time "
+        "is out of a static scan's sight, and so is an attack no rule describes yet."
+    )
+    add("")
     add("**No component is named.** These are population statistics.")
     add("")
     add("## Method")
     add("")
-    add(f"- Engine {meta['engine']}, ruleset {meta['ruleset']} — deterministic regex and AST "
-        f"analysis. The component is never executed and no LLM is involved, so the run "
-        f"reproduces.")
-    add(f"- Population fetched from `{meta['registry_url']}` and deduplicated by source.")
+    add(f"- Engine {meta['engine']}, {versions} — deterministic regex and AST analysis. The "
+        f"component is never executed and no LLM is involved, so the same code through the "
+        f"same engine gives the same findings. The survey read each component's latest release "
+        f"or default branch when it ran, so a re-run reads newer code.")
+    rulesets = s.get("rulesets", {})
+    if len(rulesets) > 1:
+        # Say which rows came from which ruleset rather than let one version label a mixed run.
+        parts = ", ".join(f"{n:,} with ruleset {rs}" for rs, n in rulesets.items())
+        add(f"- Scanned components by ruleset: {parts}. The later ruleset re-scanned only the "
+            f"components whose result its changes could affect, plus those that exceeded a bound "
+            f"on the first pass.")
+    add(f"- Population: `{meta['registry_url']}` as of {snapshot}, deduplicated by source.")
     add(f"- Two bounds, both disclosed above: {meta['clone_mb']} MB per fetch and "
         f"{meta['timeout']}s of wall clock per component.")
     add("- Harness: `tests/manual_eval/survey_registry.py`. This report: "
         "`tests/manual_eval/survey_report.py`. Both ship in this repository.")
+    # Partition tables (risk levels, skip reasons) use partition_shares so each column sums to its
+    # total by construction; the convention is stated because one figure per table may sit a tenth
+    # from its independently-rounded value.
+    add("- Shares are rounded to one decimal place so that each table sums exactly to its total "
+        "(largest-remainder method); a share can therefore sit up to 0.1 point from its "
+        "unrounded value. The counts beside them are exact.")
     return "\n".join(out) + "\n"
 
 
@@ -234,11 +382,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--registry-entries", required=True, type=int)
     ap.add_argument("--clone-mb", type=int, default=50)
     ap.add_argument("--timeout", type=int, default=60)
+    ap.add_argument(
+        "--population-snapshot", default="",
+        help="date (YYYY-MM-DD) the registry population was captured; defaults to the run date",
+    )
+    ap.add_argument(
+        "--scanned", default="",
+        help="date (YYYY-MM-DD) the survey itself ran; defaults to today. The report says "
+             "'scanned on <date>', so re-rendering an existing dataset the next day must not "
+             "move that date onto the render.",
+    )
     args = ap.parse_args(argv)
 
     summary = summarize(load(Path(args.survey)))
+    generated = args.scanned or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     meta = {
-        "generated": datetime.now(UTC).strftime("%Y-%m-%d"),
+        "generated": generated,
+        "population_snapshot": args.population_snapshot or generated,
         "engine": args.engine,
         "ruleset": args.ruleset,
         "registry_entries": args.registry_entries,
